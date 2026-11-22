@@ -1,0 +1,128 @@
+import XCTest
+import Foundation
+@testable import SSHKit
+
+final class SSHConnectionIntegrationTests: XCTestCase {
+    private struct Env { let host: String; let port: UInt16; let user: String; let password: String?; let keyPath: String? }
+
+    private func env(needPassword: Bool = false, needKey: Bool = false) throws -> Env {
+        let e = ProcessInfo.processInfo.environment
+        guard let host = e["TERMAPP_TEST_HOST"], !host.isEmpty, let user = e["TERMAPP_TEST_USER"], !user.isEmpty else {
+            throw XCTSkip("TERMAPP_TEST_HOST / TERMAPP_TEST_USER not set")
+        }
+        let pw = e["TERMAPP_TEST_PASSWORD"].flatMap { $0.isEmpty ? nil : $0 }
+        let key = e["TERMAPP_TEST_KEY_PATH"].flatMap { $0.isEmpty ? nil : $0 }
+        if needPassword && pw == nil { throw XCTSkip("TERMAPP_TEST_PASSWORD not set") }
+        if needKey && key == nil { throw XCTSkip("TERMAPP_TEST_KEY_PATH not set") }
+        let port = e["TERMAPP_TEST_PORT"].flatMap { UInt16($0) } ?? 22
+        return Env(host: host, port: port, user: user, password: pw, keyPath: key)
+    }
+
+    private func connect(_ conn: SSHConnection) async throws {
+        try await conn.connect { hostKey in
+            XCTAssertTrue(hostKey.fingerprint.hasPrefix("SHA256:"))
+            return .trust
+        }
+    }
+
+    private func collect(_ conn: SSHConnection, until marker: String, timeout: Double = 15) async -> String {
+        let stream = conn.output
+        return await withTaskGroup(of: String.self) { group in
+            group.addTask {
+                var text = ""
+                for await chunk in stream {
+                    text += String(decoding: chunk, as: UTF8.self)
+                    if text.contains(marker) { break }
+                }
+                return text
+            }
+            group.addTask { try? await Task.sleep(for: .seconds(timeout)); return "" }
+            let first = await group.next() ?? ""
+            group.cancelAll()
+            return first
+        }
+    }
+
+    func testPasswordLogin() async throws {
+        let e = try env(needPassword: true)
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(conn)
+        await conn.close()
+    }
+
+    func testKeyLogin() async throws {
+        let e = try env(needKey: true)
+        let pem = try Data(contentsOf: URL(fileURLWithPath: e.keyPath!))
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .privateKey(pem: pem, passphrase: nil))
+        try await connect(conn)
+        await conn.close()
+    }
+
+    func testEchoRoundTrip() async throws {
+        let e = try env(needPassword: true)
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(conn)
+        try await conn.write(Data("echo $((20+22))ok\n".utf8))
+        let text = await collect(conn, until: "42ok\r\n")
+        XCTAssertTrue(text.contains("42ok"), "output: \(text)")
+        await conn.close()
+    }
+
+    func testResize() async throws {
+        let e = try env(needPassword: true)
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(conn)
+        try await conn.resize(cols: 120, rows: 40)
+        try await conn.write(Data("stty size\n".utf8))
+        let text = await collect(conn, until: "40 120")
+        XCTAssertTrue(text.contains("40 120"), "output: \(text)")
+        await conn.close()
+    }
+
+    /// A healthy idle connection passes repeated probes: an immediate second probe is answered from
+    /// the recent proof of life, and a third after that window really sends a keepalive and needs the reply.
+    func testProbeIdleConnectionTwice() async throws {
+        let e = try env(needPassword: true)
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(conn)
+        try await Task.sleep(for: .seconds(3))  // let the login banner and prompt finish
+        let first = await conn.probe(timeout: .seconds(5))
+        let second = await conn.probe(timeout: .seconds(5))
+        XCTAssertTrue(first, "first probe")
+        XCTAssertTrue(second, "second probe within the recent-proof window")
+        try await Task.sleep(for: .seconds(3.5))  // past the recent-proof window: this one must really send
+        let third = await conn.probe(timeout: .seconds(8))
+        XCTAssertTrue(third, "third probe after the window")
+        await conn.close()
+    }
+
+    func testProbeHealthy() async throws {
+        let e = try env(needPassword: true)
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(conn)
+        // Let the login output settle first, so only the keepalive reply can pass the probe.
+        try await Task.sleep(for: .seconds(3.5))
+        let alive = await conn.probe(timeout: .seconds(3))
+        XCTAssertTrue(alive)
+        await conn.close()
+    }
+
+    func testProbeDeadConnection() async throws {
+        let e = try env(needPassword: true)
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(conn)
+        let states = conn.state
+        let ended = Task { () -> SSHError?? in
+            for await s in states { if case .disconnected(let err) = s { return .some(err) } }
+            return nil
+        }
+        await conn.closeSocketForTesting()
+        let alive = await conn.probe(timeout: .seconds(3))
+        XCTAssertFalse(alive)
+        let watchdog = Task { try? await Task.sleep(for: .seconds(5)); ended.cancel() }
+        let result = await ended.value
+        watchdog.cancel()
+        guard case .some(let err) = result else { return XCTFail("no .disconnected within 5 s") }
+        XCTAssertNotNil(err, "a dead connection ends with a transport error")
+    }
+}

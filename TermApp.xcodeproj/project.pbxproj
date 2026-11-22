@@ -1,0 +1,457 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* SSHKit in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000041 /* SSHKit */; };
+		A10000000000000000000002 /* Store in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000042 /* Store */; };
+		A10000000000000000000003 /* TermUI in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000043 /* TermUI */; };
+		A10000000000000000000101 /* SSHKit in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000141 /* SSHKit */; };
+		A10000000000000000000102 /* Store in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000142 /* Store */; };
+		A10000000000000000000103 /* TermUI in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000143 /* TermUI */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		A10000000000000000000110 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000080 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A10000000000000000000060;
+			remoteInfo = TermApp;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		A10000000000000000000010 /* TermApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TermApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A10000000000000000000011 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000012 /* TermApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = TermApp.entitlements; sourceTree = "<group>"; };
+		A10000000000000000000013 /* SSHKit */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = SSHKit; path = Packages/SSHKit; sourceTree = "<group>"; };
+		A10000000000000000000014 /* Store */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = Store; path = Packages/Store; sourceTree = "<group>"; };
+		A10000000000000000000015 /* TermUI */ = {isa = PBXFileReference; lastKnownFileType = wrapper; name = TermUI; path = Packages/TermUI; sourceTree = "<group>"; };
+		A10000000000000000000111 /* TermAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = TermAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		A10000000000000000000020 /* App */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = App;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000120 /* AppTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = AppTests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A10000000000000000000030 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000001 /* SSHKit in Frameworks */,
+				A10000000000000000000002 /* Store in Frameworks */,
+				A10000000000000000000003 /* TermUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000130 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000000000000000000101 /* SSHKit in Frameworks */,
+				A10000000000000000000102 /* Store in Frameworks */,
+				A10000000000000000000103 /* TermUI in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A10000000000000000000050 = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000020 /* App */,
+				A10000000000000000000120 /* AppTests */,
+				A10000000000000000000051 /* Config */,
+				A10000000000000000000052 /* Packages */,
+				A10000000000000000000053 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A10000000000000000000051 /* Config */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000011 /* Info.plist */,
+				A10000000000000000000012 /* TermApp.entitlements */,
+			);
+			path = Config;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000052 /* Packages */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000013 /* SSHKit */,
+				A10000000000000000000014 /* Store */,
+				A10000000000000000000015 /* TermUI */,
+			);
+			name = Packages;
+			sourceTree = "<group>";
+		};
+		A10000000000000000000053 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A10000000000000000000010 /* TermApp.app */,
+				A10000000000000000000111 /* TermAppTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A10000000000000000000060 /* TermApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000070 /* Build configuration list for PBXNativeTarget "TermApp" */;
+			buildPhases = (
+				A10000000000000000000031 /* Sources */,
+				A10000000000000000000030 /* Frameworks */,
+				A10000000000000000000032 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				A10000000000000000000020 /* App */,
+			);
+			name = TermApp;
+			packageProductDependencies = (
+				A10000000000000000000041 /* SSHKit */,
+				A10000000000000000000042 /* Store */,
+				A10000000000000000000043 /* TermUI */,
+			);
+			productName = TermApp;
+			productReference = A10000000000000000000010 /* TermApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+		A10000000000000000000160 /* TermAppTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A10000000000000000000170 /* Build configuration list for PBXNativeTarget "TermAppTests" */;
+			buildPhases = (
+				A10000000000000000000131 /* Sources */,
+				A10000000000000000000130 /* Frameworks */,
+				A10000000000000000000132 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A10000000000000000000112 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				A10000000000000000000120 /* AppTests */,
+			);
+			name = TermAppTests;
+			packageProductDependencies = (
+				A10000000000000000000141 /* SSHKit */,
+				A10000000000000000000142 /* Store */,
+				A10000000000000000000143 /* TermUI */,
+			);
+			productName = TermAppTests;
+			productReference = A10000000000000000000111 /* TermAppTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A10000000000000000000080 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2630;
+				LastUpgradeCheck = 2630;
+				TargetAttributes = {
+					A10000000000000000000060 = {
+						CreatedOnToolsVersion = 26.3;
+					};
+					A10000000000000000000160 = {
+						CreatedOnToolsVersion = 26.3;
+						TestTargetID = A10000000000000000000060;
+					};
+				};
+			};
+			buildConfigurationList = A10000000000000000000071 /* Build configuration list for PBXProject "TermApp" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A10000000000000000000050;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A10000000000000000000044 /* XCLocalSwiftPackageReference "Packages/SSHKit" */,
+				A10000000000000000000045 /* XCLocalSwiftPackageReference "Packages/Store" */,
+				A10000000000000000000046 /* XCLocalSwiftPackageReference "Packages/TermUI" */,
+			);
+			productRefGroup = A10000000000000000000053 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A10000000000000000000060 /* TermApp */,
+				A10000000000000000000160 /* TermAppTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A10000000000000000000032 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000132 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		A10000000000000000000112 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A10000000000000000000060 /* TermApp */;
+			targetProxy = A10000000000000000000110 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A10000000000000000000031 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A10000000000000000000131 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A10000000000000000000072 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A10000000000000000000073 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A10000000000000000000074 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Config/TermApp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8L5QF87Y6G;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Config/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = TermApp;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.peculiarengineer.termapp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A10000000000000000000075 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = Config/TermApp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8L5QF87Y6G;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Config/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = TermApp;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.peculiarengineer.termapp;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A10000000000000000000174 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8L5QF87Y6G;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.peculiarengineer.termapp.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/TermApp.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/TermApp";
+			};
+			name = Debug;
+		};
+		A10000000000000000000175 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 8L5QF87Y6G;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.peculiarengineer.termapp.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/TermApp.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/TermApp";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A10000000000000000000070 /* Build configuration list for PBXNativeTarget "TermApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000074 /* Debug */,
+				A10000000000000000000075 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000000000000000000071 /* Build configuration list for PBXProject "TermApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000072 /* Debug */,
+				A10000000000000000000073 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A10000000000000000000170 /* Build configuration list for PBXNativeTarget "TermAppTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A10000000000000000000174 /* Debug */,
+				A10000000000000000000175 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		A10000000000000000000044 /* XCLocalSwiftPackageReference "Packages/SSHKit" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/SSHKit;
+		};
+		A10000000000000000000045 /* XCLocalSwiftPackageReference "Packages/Store" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/Store;
+		};
+		A10000000000000000000046 /* XCLocalSwiftPackageReference "Packages/TermUI" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/TermUI;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000041 /* SSHKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = SSHKit;
+		};
+		A10000000000000000000042 /* Store */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Store;
+		};
+		A10000000000000000000043 /* TermUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TermUI;
+		};
+		A10000000000000000000141 /* SSHKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = SSHKit;
+		};
+		A10000000000000000000142 /* Store */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = Store;
+		};
+		A10000000000000000000143 /* TermUI */ = {
+			isa = XCSwiftPackageProductDependency;
+			productName = TermUI;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = A10000000000000000000080 /* Project object */;
+}

@@ -1,0 +1,8 @@
+Packages/SSHKit/Vendor/
+DerivedData/
+.DS_Store
+xcuserdata/
+.plan-gate/
+.build-libssh2/
+.build/
+.swiftpm/
