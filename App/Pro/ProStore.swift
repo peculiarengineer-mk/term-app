@@ -1,0 +1,164 @@
+import Foundation
+import Observation
+import StoreKit
+import UIKit
+
+/// Manages StoreKit 2 entitlements and purchases for the one-time TermApp Pro unlock.
+@MainActor @Observable
+final class ProStore {
+    static let productID = "com.peculiarengineer.termapp.pro"
+
+    private(set) var product: Product?
+    private(set) var isPurchased = false
+    private(set) var isLoading = false
+    private(set) var errorMessage: String?
+
+    @ObservationIgnored
+    nonisolated(unsafe) private var updatesTask: Task<Void, Never>?
+
+    var isTestFlight: Bool {
+        Bundle.main.appStoreReceiptURL?.lastPathComponent == "sandboxReceipt"
+    }
+
+    var isProUnlocked: Bool {
+        if isPurchased { return true }
+        #if DEBUG
+        return true
+        #else
+        return isTestFlight
+        #endif
+    }
+
+    init() {
+        updatesTask = observeTransactionUpdates()
+        Task { [weak self] in
+            await self?.loadInitialState()
+        }
+    }
+
+    deinit {
+        updatesTask?.cancel()
+    }
+
+    func loadProducts(reportErrors: Bool = true) async {
+        guard !isLoading else { return }
+        isLoading = true
+        if reportErrors { errorMessage = nil }
+        defer { isLoading = false }
+
+        do {
+            let products = try await Product.products(for: [Self.productID])
+            product = products.first
+        } catch {
+            if reportErrors {
+                errorMessage = "Could not load App Store product: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func refreshEntitlements() async {
+        var entitled = false
+        for await result in Transaction.currentEntitlements {
+            guard case .verified(let transaction) = result else { continue }
+            if transaction.productID == Self.productID && transaction.revocationDate == nil {
+                entitled = true
+                break
+            }
+        }
+        isPurchased = entitled
+    }
+
+    func purchase() async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+
+        do {
+            let targetProduct: Product
+            if let existing = product {
+                targetProduct = existing
+            } else {
+                let loaded = try await Product.products(for: [Self.productID])
+                product = loaded.first
+                guard let first = loaded.first else {
+                    errorMessage = "TermApp Pro is currently unavailable. Please try again later."
+                    return
+                }
+                targetProduct = first
+            }
+
+            let result = try await targetProduct.purchase()
+            switch result {
+            case .success(let verification):
+                await handle(verificationResult: verification, reportUnverifiedError: true)
+                if isPurchased {
+                    AppHaptics.notify(.success)
+                }
+            case .userCancelled:
+                break
+            case .pending:
+                errorMessage = "Purchase is pending approval."
+            @unknown default:
+                break
+            }
+        } catch {
+            errorMessage = "Purchase failed: \(error.localizedDescription)"
+            AppHaptics.notify(.error)
+        }
+    }
+
+    func restorePurchases() async {
+        guard !isLoading else { return }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+
+        do {
+            try await AppStore.sync()
+            await refreshEntitlements()
+            if isPurchased {
+                AppHaptics.notify(.success)
+            } else {
+                errorMessage = "No previous TermApp Pro purchase was found."
+            }
+        } catch {
+            errorMessage = "Could not restore purchases: \(error.localizedDescription)"
+            AppHaptics.notify(.error)
+        }
+    }
+
+    func clearError() {
+        errorMessage = nil
+    }
+
+    private func loadInitialState() async {
+        await refreshEntitlements()
+        await loadProducts(reportErrors: false)
+    }
+
+    private func observeTransactionUpdates() -> Task<Void, Never> {
+        Task.detached(priority: .background) { [weak self] in
+            for await result in Transaction.updates {
+                guard !Task.isCancelled else { return }
+                guard let self else { return }
+                await self.handle(verificationResult: result, reportUnverifiedError: false)
+            }
+        }
+    }
+
+    private func handle(
+        verificationResult: VerificationResult<StoreKit.Transaction>,
+        reportUnverifiedError: Bool
+    ) async {
+        switch verificationResult {
+        case .verified(let transaction):
+            await transaction.finish()
+            await refreshEntitlements()
+        case .unverified(_, let error):
+            if reportUnverifiedError {
+                errorMessage = "Purchase could not be verified: \(error.localizedDescription)"
+            }
+        }
+    }
+}

@@ -202,13 +202,14 @@ struct SessionSceneView: View {
     let id: UUID?
     @Environment(\.modelContext) private var modelContext
     @Environment(SessionManager.self) private var manager
+    @Environment(ProStore.self) private var proStore
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @State private var windowID = UUID()
     @State private var scene: UIWindowScene?
     /// Set once this window has asked to close; it then never claims a session again.
     @State private var dismissing = false
     @State private var inspectingSecurity = false
-    @State private var showingSnippets = false
+    @State private var activeToolSheet: SessionToolSheet?
     @State private var confirmingClose = false
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
@@ -269,6 +270,7 @@ struct SessionSceneView: View {
         .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
         .tint(theme.accentColor)
         .modifier(PrivacyBlurModifier())
+        .sessionToolSheets(item: $activeToolSheet, theme: theme)
         .background(SceneReader(scene: $scene))
         .onChange(of: scene) { _, s in
             if dismissing, let s { UIApplication.shared.requestSceneSessionDestruction(s.session, options: nil) }
@@ -307,22 +309,12 @@ struct SessionSceneView: View {
                 Spacer(minLength: 8)
 
                 HStack(spacing: 4) {
-                    Button {
-                        AppHaptics.impact(.light)
-                        showingSnippets = true
-                    } label: {
-                        Image(systemName: "bolt.fill")
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(theme.foregroundColor)
-                            .frame(width: 40, height: 40)
-                            .contentShape(Rectangle())
-                    }
-                    .accessibilityLabel("Command Snippets")
-                    .sheet(isPresented: $showingSnippets) {
-                        SnippetDrawerView { snippet in
-                            live.controller.send(snippet.payloadBytes)
-                        }
-                        .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                    SessionToolsMenu(
+                        live: live,
+                        isProUnlocked: proStore.isProUnlocked,
+                        foregroundColor: theme.foregroundColor
+                    ) { tool in
+                        activeToolSheet = tool
                     }
 
                     if let algorithms = live.algorithms {

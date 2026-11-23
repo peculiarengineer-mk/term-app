@@ -141,6 +141,7 @@ struct SessionTabsView<HostList: View>: View {
     @ViewBuilder let hostList: (ActiveSessionPill?) -> HostList
     @Environment(\.modelContext) private var modelContext
     @Environment(SessionManager.self) private var manager
+    @Environment(ProStore.self) private var proStore
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
@@ -155,7 +156,7 @@ struct SessionTabsView<HostList: View>: View {
     @State private var scene: UIWindowScene?
     @State private var switching = false
     @State private var inspectingSecurity: SecurityInspection?
-    @State private var snippetTarget: LiveSession?
+    @State private var activeToolSheet: SessionToolSheet?
     @State private var closingTab: LiveSession?
 
     private struct SecurityInspection: Identifiable {
@@ -298,12 +299,7 @@ struct SessionTabsView<HostList: View>: View {
                 onOpenInWindow: { moveToWindow($0) }
             )
         }
-        .sheet(item: $snippetTarget) { live in
-            SnippetDrawerView { snippet in
-                live.controller.send(snippet.payloadBytes)
-            }
-            .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-        }
+        .sessionToolSheets(item: $activeToolSheet, theme: theme)
         .confirmationDialog(
             "Close active session?",
             isPresented: Binding(get: { closingTab != nil }, set: { if !$0 { closingTab = nil } }),
@@ -362,17 +358,13 @@ struct SessionTabsView<HostList: View>: View {
 
                 HStack(spacing: 4) {
                     if let selectedLive {
-                        Button {
-                            AppHaptics.impact(.light)
-                            snippetTarget = selectedLive
-                        } label: {
-                            Image(systemName: "bolt.fill")
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(theme.foregroundColor)
-                                .frame(width: 40, height: 40)
-                                .contentShape(Rectangle())
+                        SessionToolsMenu(
+                            live: selectedLive,
+                            isProUnlocked: proStore.isProUnlocked,
+                            foregroundColor: theme.foregroundColor
+                        ) { tool in
+                            activeToolSheet = tool
                         }
-                        .accessibilityLabel("Command Snippets")
                     }
 
                     if let selectedLive, let algorithms = selectedLive.algorithms {
@@ -774,4 +766,105 @@ struct SceneReader: UIViewRepresentable {
         return v
     }
     func updateUIView(_ uiView: Probe, context: Context) {}
+}
+
+enum SessionToolSheet: Identifiable {
+    case snippets(LiveSession)
+    case sftp(LiveSession, SSHConnection)
+    case portForwards(LiveSession, SSHConnection)
+    case paywall
+
+    var id: String {
+        switch self {
+        case .snippets(let live): "snippets-\(live.id)"
+        case .sftp(let live, _): "sftp-\(live.id)"
+        case .portForwards(let live, _): "forwards-\(live.id)"
+        case .paywall: "paywall"
+        }
+    }
+}
+
+/// Shared 40x40 tools menu for Snippets, SFTP Files, and Port Forwards across tab and window bars.
+struct SessionToolsMenu: View {
+    let live: LiveSession
+    let isProUnlocked: Bool
+    let foregroundColor: Color
+    let onSelect: (SessionToolSheet) -> Void
+
+    private var sshConnection: SSHConnection? {
+        live.session as? SSHConnection
+    }
+
+    var body: some View {
+        Menu {
+            Button("Command Snippets", systemImage: "bolt.fill") {
+                AppHaptics.impact(.light)
+                onSelect(.snippets(live))
+            }
+
+            Button("SFTP Files", systemImage: "folder.fill") {
+                AppHaptics.impact(.light)
+                guard isProUnlocked else {
+                    onSelect(.paywall)
+                    return
+                }
+                if let sshConnection {
+                    onSelect(.sftp(live, sshConnection))
+                }
+            }
+            .disabled(isProUnlocked && sshConnection == nil)
+
+            Button("Port Forwards", systemImage: "arrow.left.arrow.right") {
+                AppHaptics.impact(.light)
+                guard isProUnlocked else {
+                    onSelect(.paywall)
+                    return
+                }
+                if let sshConnection {
+                    onSelect(.portForwards(live, sshConnection))
+                }
+            }
+            .disabled(isProUnlocked && sshConnection == nil)
+        } label: {
+            Image(systemName: "square.grid.2x2")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(foregroundColor)
+                .frame(width: 40, height: 40)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("Session Tools")
+    }
+}
+
+private struct SessionToolSheetsModifier: ViewModifier {
+    @Binding var item: SessionToolSheet?
+    let theme: TerminalTheme
+
+    func body(content: Content) -> some View {
+        content
+            .sheet(item: $item) { sheet in
+                Group {
+                    switch sheet {
+                    case .snippets(let live):
+                        SnippetDrawerView { snippet in
+                            live.controller.send(snippet.payloadBytes)
+                        }
+                    case .sftp(let live, let conn):
+                        SFTPBrowserView(connection: conn, hostTitle: live.title)
+                    case .portForwards(let live, let conn):
+                        PortForwardsView(connection: conn, hostID: live.hostID, hostTitle: live.title)
+                    case .paywall:
+                        ProPaywallView()
+                    }
+                }
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+            }
+    }
+}
+
+extension View {
+    func sessionToolSheets(item: Binding<SessionToolSheet?>, theme: TerminalTheme) -> some View {
+        modifier(SessionToolSheetsModifier(item: item, theme: theme))
+    }
 }

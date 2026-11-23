@@ -3,7 +3,10 @@ import CoreText
 import TermUI
 
 struct SettingsView: View {
+    private static let appleProAmber = TerminalTheme.appleProDark.accentColor
+
     @Environment(AppLockManager.self) private var appLock
+    @Environment(ProStore.self) private var proStore
     @AppStorage("sync.enabled") private var syncEnabled = false
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
@@ -11,6 +14,7 @@ struct SettingsView: View {
     @AppStorage(AppearanceSettings.cursorStyleKey) private var cursorStyleRaw = AppearanceSettings.defaultCursorStyleRaw
     @AppStorage(AppearanceSettings.hapticsKey) private var hapticsEnabled = AppearanceSettings.defaultHapticsEnabled
     @State private var securityError: String?
+    @State private var showingPaywall = false
 
     private var currentTheme: TerminalTheme { TerminalTheme.preset(named: themeName) }
     private var fontFamily: TerminalFontFamily { TerminalFontFamily(rawValue: fontFamilyRaw) ?? .sfMono }
@@ -20,8 +24,24 @@ struct SettingsView: View {
         Font(fontFamily.uiFont(ofSize: CGFloat(fontSize)) as CTFont)
     }
 
+    private var proStatusTitle: String {
+        if proStore.isPurchased {
+            return "Pro Unlocked"
+        }
+        if proStore.isTestFlight {
+            return "Pro Unlocked (TestFlight)"
+        }
+        #if DEBUG
+        return "Pro Unlocked (Debug)"
+        #else
+        return "Upgrade to Pro"
+        #endif
+    }
+
     var body: some View {
         Form {
+            proSection
+
             Section("Appearance") {
                 NavigationLink {
                     ThemePickerView()
@@ -173,6 +193,55 @@ struct SettingsView: View {
             Button("OK") {}
         } message: {
             Text(securityError ?? "")
+        }
+        .sheet(isPresented: $showingPaywall) {
+            ProPaywallView()
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: currentTheme))
+                .tint(currentTheme.accentColor)
+        }
+    }
+
+    private var proSection: some View {
+        Section("TermApp Pro") {
+            Button {
+                AppHaptics.impact(.light)
+                showingPaywall = true
+            } label: {
+                HStack(spacing: 12) {
+                    SquircleIcon(
+                        symbolName: proStore.isProUnlocked ? "checkmark.seal.fill" : "sparkles",
+                        tint: proStore.isProUnlocked ? .green : Self.appleProAmber,
+                        fillOpacity: currentTheme.isDark ? 0.20 : 0.14,
+                        rimOpacity: 0.36
+                    )
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(proStatusTitle)
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+
+                        Text("SFTP File Browser, Port Forwarding & more")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 8)
+
+                    if !proStore.isProUnlocked, let price = proStore.product?.displayPrice {
+                        Text(price)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Self.appleProAmber)
+                    }
+
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+                .padding(.vertical, 2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
         }
     }
 

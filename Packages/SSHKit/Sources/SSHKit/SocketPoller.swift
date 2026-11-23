@@ -32,19 +32,35 @@ enum SocketPoller {
 
     /// Suspends until the socket is ready for `interest`, `timeoutMs` elapses, or the wait is cancelled.
     static func wait(fd: Int32, interest: Interest, timeoutMs: Int32, cancelFlag: CancelFlag? = nil) async {
+        guard fd >= 0 else { return }
+        await waitAny([(fd: fd, interest: interest)], timeoutMs: timeoutMs, cancelFlag: cancelFlag, sliceMs: pollSliceMs)
+    }
+
+    /// Suspends until any target socket is ready for its interest, `timeoutMs` elapses, or the wait is cancelled.
+    static func waitAny(
+        _ targets: [(fd: Int32, interest: Interest)],
+        timeoutMs: Int32,
+        cancelFlag: CancelFlag? = nil,
+        sliceMs: Int64 = pollSliceMs
+    ) async {
         let flag = cancelFlag ?? CancelFlag()
-        if Task.isCancelled || flag.isCancelled || fd < 0 { return }
-        var events: Int16 = 0
-        if interest.contains(.read) { events |= Int16(POLLIN) }
-        if interest.contains(.write) { events |= Int16(POLLOUT) }
-        guard events != 0 else { return }
-        let pollEvents = events
+        if Task.isCancelled || flag.isCancelled { return }
+        let pollTargets: [(fd: Int32, events: Int16)] = targets.compactMap { target in
+            guard target.fd >= 0 else { return nil }
+            var events: Int16 = 0
+            if target.interest.contains(.read) { events |= Int16(POLLIN) }
+            if target.interest.contains(.write) { events |= Int16(POLLOUT) }
+            guard events != 0 else { return nil }
+            return (fd: target.fd, events: events)
+        }
+        guard !pollTargets.isEmpty else { return }
         let deadline = ContinuousClock.now + .milliseconds(max(0, Int(timeoutMs)))
+        let effectiveSlice = max(1, sliceMs)
         await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 queue.async {
                     if !flag.isCancelled {
-                        _ = pollUntilReady(fd: fd, events: pollEvents, deadline: deadline, cancelFlag: flag)
+                        _ = pollUntilAnyReady(targets: pollTargets, deadline: deadline, cancelFlag: flag, sliceMs: effectiveSlice)
                     }
                     cont.resume()
                 }
@@ -86,13 +102,26 @@ enum SocketPoller {
         deadline: ContinuousClock.Instant,
         cancelFlag: CancelFlag
     ) -> Int32 {
+        pollUntilAnyReady(targets: [(fd: fd, events: events)], deadline: deadline, cancelFlag: cancelFlag, sliceMs: pollSliceMs)
+    }
+
+    private static func pollUntilAnyReady(
+        targets: [(fd: Int32, events: Int16)],
+        deadline: ContinuousClock.Instant,
+        cancelFlag: CancelFlag,
+        sliceMs: Int64
+    ) -> Int32 {
+        guard !targets.isEmpty else { return 0 }
+        var pfds = targets.map { pollfd(fd: $0.fd, events: $0.events, revents: 0) }
         while true {
             if cancelFlag.isCancelled { return -2 }
             let remMs = remainingMilliseconds(until: deadline)
             if remMs <= 0 { return 0 }
-            let slice = Int32(min(remMs, pollSliceMs))
-            var p = pollfd(fd: fd, events: events, revents: 0)
-            let pr = poll(&p, 1, slice)
+            let slice = Int32(min(remMs, sliceMs))
+            for i in pfds.indices { pfds[i].revents = 0 }
+            let pr = pfds.withUnsafeMutableBufferPointer { buf in
+                poll(buf.baseAddress, nfds_t(buf.count), slice)
+            }
             if pr > 0 { return 1 }
             if pr < 0 {
                 if errno == EINTR { continue }

@@ -493,6 +493,7 @@ struct HostListView: View {
         do {
             try context.save()
             HostSecrets.deletePassword(for: hostID)
+            PortForwardStore.deleteAll(for: hostID)
         } catch {
             context.rollback()
             deleteError = "Could not delete host: \(error.localizedDescription)"

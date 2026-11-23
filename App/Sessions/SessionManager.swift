@@ -81,8 +81,28 @@ final class SessionManager {
         )
         sessions.append(live)
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
+        startAutoPortForwards(for: hostID, on: session)
         onSessionsChanged?()
         return live
+    }
+
+    private func startAutoPortForwards(for hostID: UUID, on session: any Session) {
+        guard let conn = session as? SSHConnection else { return }
+        let rules = PortForwardStore.list(for: hostID).filter(\.autoStart)
+        guard !rules.isEmpty else { return }
+        Task.detached {
+            for rule in rules {
+                _ = try? await conn.startLocalForward(
+                    PortForwardRule(
+                        id: rule.id,
+                        name: rule.name,
+                        localPort: rule.localPort,
+                        remoteHost: rule.remoteHost,
+                        remotePort: rule.remotePort
+                    )
+                )
+            }
+        }
     }
 
     /// Inserts an ephemeral Quick-Connect host into SwiftData and marks the session saved.
@@ -122,6 +142,7 @@ final class SessionManager {
         let old = live.session
         live.replace(session: session, bridge: bridge, algorithms: algorithms)
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
+        startAutoPortForwards(for: live.hostID, on: session)
         onSessionsChanged?()
         Task { await old.close() }
     }
