@@ -17,13 +17,14 @@ final class ReconnectCoordinator {
 
     @MainActor private final class Entry {
         let model: HostConnectionModel
+        var tmuxCommand: String?
         var started: Bool
         /// True when started by the became-active pass (not by a session ending while active).
         let auto: Bool
         var retries = 0
         var retryTask: Task<Void, Never>?
-        init(model: HostConnectionModel, started: Bool, auto: Bool) {
-            self.model = model; self.started = started; self.auto = auto
+        init(model: HostConnectionModel, tmuxCommand: String?, started: Bool, auto: Bool) {
+            self.model = model; self.tmuxCommand = tmuxCommand; self.started = started; self.auto = auto
         }
         var isConnecting: Bool { if case .connecting = model.phase { return true } else { return false } }
         func cancel() {
@@ -59,8 +60,12 @@ final class ReconnectCoordinator {
     }
 
     func start() {
-        monitor.onBecameActive = { [weak self] in self?.appBecameActive() }
+        monitor.onBecameActive = { [weak self] fromBackground in
+            guard fromBackground else { return }
+            self?.appBecameActive()
+        }
         monitor.onBecameBackground = { [weak self] in self?.appBecameBackground() }
+        manager.onSessionsChanged = { [weak self] in self?.watchSessions() }
         monitor.start()
         watchSessions()
     }
@@ -117,7 +122,12 @@ final class ReconnectCoordinator {
         // manager does not lose the prompt.
         for (id, entry) in entries where entry.auto && (entry.retryTask != nil || (entry.started && entry.isConnecting)) {
             dropEntry(id)
-            manager.session(id: id)?.overlay = nil
+            if let live = manager.session(id: id) {
+                live.overlay = nil
+                if case .disconnected = latest[id] {
+                    live.connectionStatus = .disconnected
+                }
+            }
         }
     }
 
@@ -128,8 +138,11 @@ final class ReconnectCoordinator {
         let ids = Set(manager.sessions.map(\.id))
         for id in Array(watchers.keys) where !ids.contains(id) {
             watchers[id]?.cancel(); watchers[id] = nil; watched[id] = nil; latest[id] = nil
-            probes[id]?.cancel(); probes[id] = nil; autoPending.remove(id)
         }
+        for id in Array(probes.keys) where !ids.contains(id) {
+            probes[id]?.cancel(); probes[id] = nil
+        }
+        autoPending.formIntersection(ids)
         for id in Array(entries.keys) where !ids.contains(id) { dropEntry(id) }
         for live in manager.sessions {
             let bridgeID = ObjectIdentifier(live.bridge)
@@ -154,6 +167,15 @@ final class ReconnectCoordinator {
     private func recordState(_ id: UUID, bridge: ObjectIdentifier, _ state: SessionState) {
         guard watched[id] == bridge else { return }
         latest[id] = state
+        guard let live = manager.session(id: id), ObjectIdentifier(live.bridge) == bridge else { return }
+        switch state {
+        case .connected:
+            live.connectionStatus = .connected
+        case .connecting, .awaitingHostKeyDecision, .authenticating:
+            live.connectionStatus = .reconnecting
+        case .disconnected:
+            live.connectionStatus = .disconnected
+        }
     }
 
     private func markDead(_ id: UUID, bridge: ObjectIdentifier, error: SSHError?) {
@@ -172,11 +194,15 @@ final class ReconnectCoordinator {
         let needsUser: Bool
     }
 
-    private func snapshot(_ id: UUID) -> HostSnapshot? {
+    private func fetchHost(_ id: UUID) -> Host? {
         let context = container.mainContext
         var d = FetchDescriptor<Host>(predicate: #Predicate { $0.id == id })
         d.fetchLimit = 1
-        guard let host = (try? context.fetch(d))?.first else { return nil }
+        return (try? context.fetch(d))?.first
+    }
+
+    private func snapshot(_ id: UUID) -> HostSnapshot? {
+        guard let host = fetchHost(id) else { return nil }
         var needsUser = host.authMethod == "keyboardInteractive"
             || (host.authMethod == "password" && HostSecrets.password(for: host.id) == nil)
         if host.authMethod == "key" {
@@ -198,9 +224,8 @@ final class ReconnectCoordinator {
             return
         }
         let autoStart = auto && !snap.needsUser
-        let entry = Entry(model: snap.model, started: autoStart, auto: auto)
+        let entry = Entry(model: snap.model, tmuxCommand: snap.tmuxCommand, started: autoStart, auto: auto)
         entries[id] = entry
-        let tmux = snap.tmuxCommand
         snap.model.onConnected = { [weak self, weak entry] conn, bridge in
             guard let self else { Task { await conn.close() }; return }
             // The tab may have been closed (or the entry dropped) while connecting: don't leak the connection.
@@ -208,6 +233,7 @@ final class ReconnectCoordinator {
                 Task { await conn.close() }
                 return
             }
+            let tmux = entry.tmuxCommand
             self.entries[id] = nil
             entry.cancel()
             self.manager.replace(id, session: conn, bridge: bridge)
@@ -215,10 +241,9 @@ final class ReconnectCoordinator {
             TmuxAttach.send(tmux, via: bridge)
             self.watchSessions()
         }
-        if auto {
-            snap.model.onFailed = { [weak self, weak entry] network in
-                guard let self, let entry, self.entries[id] === entry, network,
-                      entry.retries < Self.maxRetries, self.monitor.phase != .background else { return }
+        snap.model.onFailed = { [weak self, weak entry] network in
+            guard let self, let entry, self.entries[id] === entry else { return }
+            if auto, network, entry.retries < Self.maxRetries, self.monitor.phase != .background {
                 entry.retries += 1
                 let delay = 1 << (entry.retries - 1)  // 1 s, 2 s, 4 s
                 entry.retryTask = Task { [weak entry] in
@@ -227,26 +252,44 @@ final class ReconnectCoordinator {
                     entry?.retryTask = nil  // fired: no longer a pending retry
                     entry?.model.retry()
                 }
+            } else {
+                self.manager.session(id: id)?.connectionStatus = .disconnected
             }
         }
         showOverlay(live)
-        if autoStart { snap.model.start() }
+        if autoStart {
+            live.connectionStatus = .reconnecting
+            snap.model.start()
+        }
     }
 
     private func showOverlay(_ live: LiveSession) {
         let id = live.id
         guard let entry = entries[id] else { return }
-        live.overlay = AnyView(ReconnectOverlay(model: entry.model, title: live.title,
+        live.overlay = AnyView(ReconnectOverlay(model: entry.model, title: entry.model.title,
                                                 started: entry.started,
-                                                onReconnect: { [weak self] in self?.userStarted(id) },
+                                                onReconnect: { [weak self] in self?.userReconnect(id) },
                                                 onClose: { [weak self] in self?.close(id) }))
     }
 
-    private func userStarted(_ id: UUID) {
+    private func userReconnect(_ id: UUID) {
         guard let entry = entries[id], let live = manager.session(id: id) else { return }
+        entry.retryTask?.cancel()
+        entry.retryTask = nil
+        entry.retries = 0
+        guard let host = fetchHost(live.hostID) else {
+            dropEntry(id)
+            live.overlay = AnyView(HostGoneView(onClose: { [weak self] in self?.close(id) }))
+            return
+        }
+        let previousTitle = entry.model.title
+        entry.tmuxCommand = host.tmuxCommand
+        entry.model.refresh(from: host)
+        let wasStarted = entry.started
         entry.started = true
-        showOverlay(live)
-        entry.model.start()
+        if !wasStarted || entry.model.title != previousTitle { showOverlay(live) }
+        live.connectionStatus = .reconnecting
+        entry.model.retry()
     }
 
     private func dropEntry(_ id: UUID) {

@@ -6,15 +6,20 @@ set -euo pipefail
 OPENSSL_VERSION="3.5.9"
 OPENSSL_SHA256="603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
-LIBSSH2_VERSION="1.11.1"
-LIBSSH2_SHA256="d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7"
-LIBSSH2_URL="https://github.com/libssh2/libssh2/releases/download/libssh2-${LIBSSH2_VERSION}/libssh2-${LIBSSH2_VERSION}.tar.gz"
+# libssh2 master at a pinned commit (CVE fixes, ML-KEM); the source archive has no configure, so CMake builds it.
+LIBSSH2_COMMIT="dd1546700d0ed8ff7138bc1ccc288286fb3ab2b4"
+LIBSSH2_SHA256="67d20d434055faef76439c6829ab253c892fcdd68d9a9c86cf5824bd8366e6eb"
+LIBSSH2_URL="https://github.com/libssh2/libssh2/archive/${LIBSSH2_COMMIT}.tar.gz"
+CMAKE="${CMAKE:-$(command -v cmake || echo /usr/local/bin/cmake)}"
 MIN_IOS="18.0"
+# Keep host settings out of the cross build: no macOS deployment target, no pkg-config probing of Homebrew.
+unset MACOSX_DEPLOYMENT_TARGET
+export PKG_CONFIG_LIBDIR=""
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/Packages/SSHKit/Vendor"
-# Keyed by version so a version bump never reuses stale archives.
-WORK="${BUILD_LIBSSH2_WORK:-$ROOT/.build-libssh2/openssl-$OPENSSL_VERSION-libssh2-$LIBSSH2_VERSION}"
+# Keyed by version and deployment target so a bump never reuses stale archives.
+WORK="${BUILD_LIBSSH2_WORK:-$ROOT/.build-libssh2/openssl-$OPENSSL_VERSION-libssh2-${LIBSSH2_COMMIT:0:7}-ios$MIN_IOS}"
 NCPU="$(sysctl -n hw.ncpu)"
 
 mkdir -p "$WORK/src" "$OUT"
@@ -47,15 +52,23 @@ build_one() {
 
   tar -xzf "$WORK/src/libssh2.tar.gz" -C "$dir/src-ssh2" --strip-components=1
   ( cd "$dir/src-ssh2"
-    ./configure --host="$arch-apple-darwin" --prefix="$prefix" \
-      CC="$cc" CFLAGS="$cflags" LDFLAGS="-arch $arch -isysroot $sysroot" \
-      --disable-shared --enable-static --with-crypto=openssl \
-      --with-libssl-prefix="$prefix" --without-libz \
-      --disable-examples-build --disable-docker-tests --disable-sshd-tests --disable-tests --disable-debug >/dev/null
-    make -j"$NCPU" >/dev/null
-    make install >/dev/null )
+    "$CMAKE" -S . -B build -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER="$cc" -DCMAKE_C_FLAGS="$cflags" \
+      -DCMAKE_OSX_SYSROOT="$sysroot" -DCMAKE_OSX_ARCHITECTURES="$arch" \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+      -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DCRYPTO_BACKEND=OpenSSL \
+      -DOPENSSL_ROOT_DIR="$prefix" -DOPENSSL_USE_STATIC_LIBS=ON \
+      -DCMAKE_DISABLE_FIND_PACKAGE_PkgConfig=ON \
+      -DENABLE_ZLIB_COMPRESSION=OFF -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF \
+      -DLIBSSH2_NO_DEPRECATED=OFF >/dev/null
+    "$CMAKE" --build build -j"$NCPU" >/dev/null
+    "$CMAKE" --install build >/dev/null )
 
-  libtool -static -o "$dir/libssh2-all.a" "$prefix/lib/libssh2.a" "$prefix/lib/libssl.a" "$prefix/lib/libcrypto.a" 2>/dev/null
+  local lt_log="$dir/libtool.log"
+  if ! libtool -static -o "$dir/libssh2-all.a" "$prefix/lib/libssh2.a" "$prefix/lib/libssl.a" "$prefix/lib/libcrypto.a" 2>"$lt_log"; then
+    cat "$lt_log" >&2
+    return 1
+  fi
 }
 
 build_one ios-arm64        iphoneos        arm64  "arm64-apple-ios${MIN_IOS}"

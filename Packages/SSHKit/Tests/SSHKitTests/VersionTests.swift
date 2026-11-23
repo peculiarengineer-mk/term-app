@@ -11,4 +11,8 @@ final class VersionTests: XCTestCase {
         }
         XCTAssertTrue(parts[0] > 1 || (parts[0] == 1 && parts[1] >= 11), "libssh2 \(v) is older than 1.11")
     }
+
+    func testLibraryIsNotTheOldRelease() {
+        XCTAssertNotEqual(SSHKit.libraryVersion(), "1.11.1")
+    }
 }

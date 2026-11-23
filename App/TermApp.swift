@@ -13,6 +13,7 @@ struct TermApp: App {
     }
 
     @State private var sessions = SessionManager() // wiring: T8
+    @State private var appLock = AppLockManager()
 
     var body: some Scene {
         WindowGroup {
@@ -21,10 +22,12 @@ struct TermApp: App {
         }
         .modelContainer(container) // wiring: T3
         .environment(sessions) // wiring: T8
+        .environment(appLock)
 
         WindowGroup(id: SessionSceneView.windowGroupID, for: UUID.self) { $id in // wiring: T8
             SessionSceneView(id: id) // wiring: T8
                 .environment(sessions) // wiring: T8
+                .environment(appLock)
         } // wiring: T8
         .modelContainer(container) // wiring: T8
     }

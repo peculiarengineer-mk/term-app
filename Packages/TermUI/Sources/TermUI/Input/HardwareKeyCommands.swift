@@ -20,14 +20,16 @@ public enum HardwareKeyCommands {
 
     /// Builds the commands with `action` (use `TerminalHostView.keyCommandAction`).
     public static func commands(action: Selector) -> [UIKeyCommand] {
-        func cmd(_ title: String, _ input: String) -> UIKeyCommand {
-            let c = UIKeyCommand(title: title, action: action, input: input, modifierFlags: .command)
+        func cmd(_ title: String, _ input: String, modifiers: UIKeyModifierFlags = .command) -> UIKeyCommand {
+            let c = UIKeyCommand(title: title, action: action, input: input, modifierFlags: modifiers)
             c.wantsPriorityOverSystemBehavior = true
             return c
         }
         var list = [
             cmd("New Tab", "t"), cmd("Close Tab", "w"), cmd("Clear", "k"),
-            cmd("Increase Font Size", "="), cmd("Decrease Font Size", "-"),
+            cmd("Increase Font Size", "="),
+            cmd("Increase Font Size", "+", modifiers: [.command, .shift]),
+            cmd("Decrease Font Size", "-"),
         ]
         list += (1...9).map { cmd("Tab \($0)", String($0)) }
         return list
@@ -37,16 +39,16 @@ public enum HardwareKeyCommands {
     /// `controller`'s terminal view, so each window observes only its own (`object: scene`).
     /// `scope` overrides that object (tests). Cmd+K and font size call `controller`.
     public static func handle(_ command: UIKeyCommand, controller: TerminalController?, scope: AnyObject? = nil, center: NotificationCenter = .default) {
-        guard let input = command.input, command.modifierFlags == .command else { return }
+        guard let input = command.input else { return }
         let windowScene: AnyObject? = scope ?? controller?.view?.window?.windowScene
-        switch input {
-        case "t": center.post(name: .termNewTab, object: windowScene)
-        case "w": center.post(name: .termCloseTab, object: windowScene)
-        case "k": controller?.clear()
-        case "=": controller?.increaseFont()
-        case "-": controller?.decreaseFont()
+        switch (input, command.modifierFlags) {
+        case ("t", .command): center.post(name: .termNewTab, object: windowScene)
+        case ("w", .command): center.post(name: .termCloseTab, object: windowScene)
+        case ("k", .command): controller?.clear()
+        case ("=", .command), ("+", [.command, .shift]): controller?.increaseFont()
+        case ("-", .command): controller?.decreaseFont()
         default:
-            if let n = Int(input), (1...9).contains(n) {
+            if command.modifierFlags == .command, let n = Int(input), (1...9).contains(n) {
                 center.post(name: .termSwitchTab, object: windowScene, userInfo: [tabIndexKey: n - 1])
             }
         }

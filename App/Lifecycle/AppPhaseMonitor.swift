@@ -9,18 +9,40 @@ final class AppPhaseMonitor {
 
     private(set) var phase: Phase = .inactive
     /// Called on the transition into `.active` (not on repeated activations).
-    var onBecameActive: (() -> Void)?
+    /// The argument is `true` only when returning from `.background`, not transient `.inactive`.
+    var onBecameActive: ((_ fromBackground: Bool) -> Void)?
     /// Called when every scene is in the background.
     var onBecameBackground: (() -> Void)?
-    private var tokens: [NSObjectProtocol] = []
+    private var wasBackground = false
+    private let observers = ObserverBag()
+
+    // @unchecked Sendable: guarded by lock; tokens are added on MainActor in start() and removed in deinit.
+    private final class ObserverBag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var tokens: [NSObjectProtocol] = []
+        var isEmpty: Bool { lock.lock(); defer { lock.unlock() }; return tokens.isEmpty }
+        func append(_ token: NSObjectProtocol) { lock.lock(); tokens.append(token); lock.unlock() }
+        func removeAll() {
+            lock.lock()
+            let current = tokens
+            tokens = []
+            lock.unlock()
+            let center = NotificationCenter.default
+            for token in current { center.removeObserver(token) }
+        }
+    }
+
+    deinit {
+        observers.removeAll()
+    }
 
     func start() {
-        guard tokens.isEmpty else { return }
+        guard observers.isEmpty else { return }
         let center = NotificationCenter.default
         for name in [UIScene.didActivateNotification, UIScene.willDeactivateNotification,
                      UIScene.didEnterBackgroundNotification, UIScene.willEnterForegroundNotification,
                      UIScene.didDisconnectNotification] {
-            tokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.refresh() }
             })
         }
@@ -35,7 +57,13 @@ final class AppPhaseMonitor {
         else { new = .background }
         let old = phase
         phase = new
-        if new == .active, old != .active { onBecameActive?() }
-        if new == .background, old != .background { onBecameBackground?() }
+        if new == .background {
+            wasBackground = true
+            if old != .background { onBecameBackground?() }
+        } else if new == .active {
+            let fromBackground = wasBackground
+            wasBackground = false
+            if old != .active { onBecameActive?(fromBackground) }
+        }
     }
 }

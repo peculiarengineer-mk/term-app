@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import CryptoKit
 @testable import SSHKit
 
 final class SSHConnectionIntegrationTests: XCTestCase {
@@ -124,5 +125,66 @@ final class SSHConnectionIntegrationTests: XCTestCase {
         watchdog.cancel()
         guard case .some(let err) = result else { return XCTFail("no .disconnected within 5 s") }
         XCTAssertNotNil(err, "a dead connection ends with a transport error")
+    }
+
+    func testNegotiatesPostQuantumKex() async throws {
+        let e = try env(needPassword: true)
+        let conn = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(conn)
+        let negotiated = await conn.negotiatedAlgorithms()
+        XCTAssertEqual(negotiated?.kex, "mlkem768x25519-sha256")
+        XCTAssertEqual(negotiated?.isPostQuantum, true)
+        XCTAssertEqual(negotiated?.cipher, "chacha20-poly1305@openssh.com")
+        await conn.close()
+    }
+
+    private static func sshString(_ d: Data) -> Data {
+        var n = UInt32(d.count).bigEndian
+        return Data(bytes: &n, count: 4) + d
+    }
+
+    private static func mpint(_ d: Data) -> Data {
+        var v = Data(d.drop(while: { $0 == 0 }))
+        if let f = v.first, f & 0x80 != 0 { v.insert(0, at: 0) }
+        return sshString(v)
+    }
+
+    func testSignerLogin() async throws {
+        let e = try env(needPassword: true)
+        let key = P256.Signing.PrivateKey()
+        let point = key.publicKey.x963Representation
+        let blob = Self.sshString(Data("ecdsa-sha2-nistp256".utf8)) + Self.sshString(Data("nistp256".utf8)) + Self.sshString(point)
+        let line = "ecdsa-sha2-nistp256 \(blob.base64EncodedString()) termapp-signer-test"
+
+        let admin = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .password(e.password!))
+        try await connect(admin)
+        try await admin.write(Data("mkdir -p ~/.ssh && echo '\(line)' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && echo added$((1+1))\n".utf8))
+        let added = await collect(admin, until: "added2\r\n")
+        XCTAssertTrue(added.contains("added2"), "output: \(added)")
+
+        let cleanupCmd = "sed '/termapp-signer-test/d' ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp && chmod 600 ~/.ssh/authorized_keys.tmp && mv ~/.ssh/authorized_keys.tmp ~/.ssh/authorized_keys && echo removed$((1+1))\n"
+        var signerConn: SSHConnection?
+        do {
+            let signer = SSHConnection(host: e.host, port: e.port, username: e.user, auth: .signer(publicKeyBlob: blob, sign: { data in
+                guard let sig = try? key.signature(for: data) else { return nil }
+                let raw = sig.rawRepresentation
+                return Self.mpint(raw.prefix(32)) + Self.mpint(raw.suffix(32))
+            }))
+            signerConn = signer
+            try await connect(signer)
+            try await signer.write(Data("echo o''k\n".utf8))
+            let text = await collect(signer, until: "ok\r\n")
+            XCTAssertTrue(text.contains("ok\r\n"), "output: \(text)")
+            await signer.close()
+        } catch {
+            await signerConn?.close()
+            try? await admin.write(Data(cleanupCmd.utf8))
+            _ = await collect(admin, until: "removed2\r\n")
+            await admin.close()
+            throw error
+        }
+        try await admin.write(Data(cleanupCmd.utf8))
+        _ = await collect(admin, until: "removed2\r\n")
+        await admin.close()
     }
 }

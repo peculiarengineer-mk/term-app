@@ -28,7 +28,10 @@ public enum OpenSSHKeyFormat {
 
     public static func publicLine(blob: Data, type: String, comment: String) -> String {
         let base = "\(type) \(blob.base64EncodedString())"
-        return comment.isEmpty ? base : base + " " + comment
+        let sanitized = comment
+            .split(whereSeparator: { $0.isNewline || $0.unicodeScalars.contains { $0 == "\r" || $0 == "\n" } })
+            .joined(separator: " ")
+        return sanitized.isEmpty ? base : base + " " + sanitized
     }
 
     public static func ed25519PublicLine(publicKey: Data, comment: String) -> String {
@@ -76,18 +79,26 @@ public enum OpenSSHKeyFormat {
         throw KeyFormatError.malformed("not a private key")
     }
 
-    private static func body(_ t: String) -> (headers: [String], data: Data?) {
-        var headers: [String] = []; var b64 = ""
-        for line in t.split(whereSeparator: \.isNewline).dropFirst() {
+    private static func body(_ t: String, begin: String, end: String) -> (headers: [String], data: Data?) {
+        let lines = t.split(whereSeparator: \.isNewline)
+        guard let first = lines.first, first.trimmingCharacters(in: .whitespaces) == begin else {
+            return ([], nil)
+        }
+        var headers: [String] = []; var b64 = ""; var sawEnd = false
+        for line in lines.dropFirst() {
             let l = line.trimmingCharacters(in: .whitespaces)
-            if l.hasPrefix("-----END") { break }
+            if l == end { sawEnd = true; break }
+            if l.hasPrefix("-----") { return (headers, nil) }
             if l.contains(":") { headers.append(l) } else { b64 += l }
         }
+        guard sawEnd, !b64.isEmpty else { return (headers, nil) }
         return (headers, Data(base64Encoded: b64))
     }
 
     private static func parseOpenSSH(_ t: String) throws -> ParsedKey {
-        guard let raw = body(t).data, raw.starts(with: magic) else { throw KeyFormatError.malformed("bad openssh-key-v1 body") }
+        guard let raw = body(t, begin: begin, end: end).data, raw.starts(with: magic) else {
+            throw KeyFormatError.malformed("bad openssh-key-v1 body")
+        }
         var r = Reader(data: raw, pos: magic.count)
         do {
             let cipher = String(decoding: try r.string(), as: UTF8.self)
@@ -100,13 +111,16 @@ public enum OpenSSHKeyFormat {
             switch typeName {
             case "ssh-ed25519": type = .ed25519
             case "ssh-rsa": type = .rsa
-            case let n where n.hasPrefix("ecdsa-sha2-"): type = .ecdsa
+            case "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521": type = .ecdsa
             default: throw KeyFormatError.unsupported("key type \(typeName)")
             }
             let encrypted = cipher != "none"
+            let privData = try r.string()
             var comment = ""
-            if !encrypted {
-                var pr = Reader(data: try r.string(), pos: 0)
+            if encrypted {
+                guard !privData.isEmpty else { throw KeyFormatError.malformed("empty encrypted private key") }
+            } else {
+                var pr = Reader(data: privData, pos: 0)
                 let a = try pr.uint32(), b = try pr.uint32()
                 guard a == b else { throw KeyFormatError.malformed("check integers differ") }
                 _ = try pr.string()
@@ -114,6 +128,7 @@ public enum OpenSSHKeyFormat {
                 case .ed25519: _ = try pr.string(); _ = try pr.string()
                 case .ecdsa: _ = try pr.string(); _ = try pr.string(); _ = try pr.string()
                 case .rsa: for _ in 0..<6 { _ = try pr.string() }
+                case .secureEnclaveP256: throw KeyFormatError.unsupported("Secure Enclave keys cannot be imported")
                 }
                 comment = String(decoding: try pr.string(), as: UTF8.self)
             }
@@ -124,12 +139,14 @@ public enum OpenSSHKeyFormat {
     }
 
     private static func parsePEM(_ t: String, rsa: Bool) throws -> ParsedKey {
-        let (headers, data) = body(t)
+        let beginLine = rsa ? "-----BEGIN RSA PRIVATE KEY-----" : "-----BEGIN EC PRIVATE KEY-----"
+        let endLine = rsa ? "-----END RSA PRIVATE KEY-----" : "-----END EC PRIVATE KEY-----"
+        let (headers, data) = body(t, begin: beginLine, end: endLine)
         let type: KeyType = rsa ? .rsa : .ecdsa
+        guard let der = data, !der.isEmpty else { throw KeyFormatError.malformed("bad base64") }
         if headers.contains(where: { $0.hasPrefix("Proc-Type") && $0.contains("ENCRYPTED") }) {
             return ParsedKey(type: type, isEncrypted: true, publicKeyLine: nil, comment: "")
         }
-        guard let der = data else { throw KeyFormatError.malformed("bad base64") }
         var seq = try DER.read(der, expect: 0x30)
         let version = try DER.next(&seq, expect: 0x02)
         _ = version
@@ -141,24 +158,28 @@ public enum OpenSSHKeyFormat {
         }
         _ = try DER.next(&seq, expect: 0x04)
         let params = try DER.next(&seq, expect: 0xA0)
-        // Named curve: identified by OID. Explicit parameters (SEQUENCE): identified by point size.
+        guard params.first == 0x06 else {
+            throw KeyFormatError.unsupported("explicit EC curve parameters are not supported")
+        }
         let oidCurves: [[UInt8]: String] = [
             [0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]: "nistp256",  // 1.2.840.10045.3.1.7
             [0x2B, 0x81, 0x04, 0x00, 0x22]: "nistp384",                      // 1.3.132.0.34
             [0x2B, 0x81, 0x04, 0x00, 0x23]: "nistp521",                      // 1.3.132.0.35
         ]
-        var namedCurve: String?
-        if params.first == 0x06 {
-            let oid = try DER.read(params, expect: 0x06)
-            guard let c = oidCurves[Array(oid)] else { throw KeyFormatError.unsupported("EC curve") }
-            namedCurve = c
-        }
+        var paramsContent = params
+        let oid = try DER.next(&paramsContent, expect: 0x06)
+        guard paramsContent.isEmpty else { throw KeyFormatError.malformed("trailing EC curve parameters") }
+        guard let curve = oidCurves[Array(oid)] else { throw KeyFormatError.unsupported("EC curve") }
         var pubWrap = try DER.next(&seq, expect: 0xA1)
         let bits = try DER.next(&pubWrap, expect: 0x03)
-        let point = bits.dropFirst()  // unused-bits byte
-        let curves: [Int: String] = [65: "nistp256", 97: "nistp384", 133: "nistp521"]
-        guard let curve = namedCurve ?? curves[point.count] else { throw KeyFormatError.unsupported("EC curve") }
-        guard curves[point.count] == curve else { throw KeyFormatError.malformed("EC point size does not match curve") }
+        guard pubWrap.isEmpty else { throw KeyFormatError.malformed("trailing EC public key") }
+        guard bits.first == 0x00 else { throw KeyFormatError.malformed("invalid EC public key bit string") }
+        let point = bits.dropFirst()
+        guard point.first == 0x04 else { throw KeyFormatError.malformed("expected uncompressed EC point") }
+        let expectedPointSizes = ["nistp256": 65, "nistp384": 97, "nistp521": 133]
+        guard point.count == expectedPointSizes[curve] else {
+            throw KeyFormatError.malformed("EC point size does not match curve")
+        }
         var w = Writer()
         w.string(Data("ecdsa-sha2-\(curve)".utf8)); w.string(Data(curve.utf8)); w.string(Data(point))
         return ParsedKey(type: .ecdsa, isEncrypted: false,

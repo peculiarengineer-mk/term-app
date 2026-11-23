@@ -27,6 +27,7 @@ final class HostConnectionModel {
     var phase: Phase = .connecting
     private var pendingAnswers: CheckedContinuation<[String], Never>?
     private var kiGeneration = 0
+    private var trustGeneration = 0
     /// Bumped by every connect(); a prompt from an older connection is ignored.
     private var attempt = 0
     private var kiRound = 0
@@ -40,6 +41,9 @@ final class HostConnectionModel {
     /// Called when a connect attempt fails; the flag is true for network-level errors worth retrying (T9).
     var onFailed: ((Bool) -> Void)?
     private var handedOff = false
+    private var hostUpdatedAt: Date
+    private var lastFailedWithAuth = false
+    private var bypassSavedSecrets = false
 
     // One per line: @Observable's tracking accessor cannot attach to a multi-variable declaration.
     private(set) var hostname: String
@@ -57,10 +61,16 @@ final class HostConnectionModel {
         hostname = host.hostname; port = host.port; username = host.username
         authMethod = host.authMethod; keyID = host.keyID; tmux = host.tmuxCommand; hostID = host.id
         title = host.label.isEmpty ? host.hostname : host.label
+        hostUpdatedAt = host.updatedAt
     }
 
     /// Re-reads the host's fields, e.g. after the user edited it from the key-missing screen.
     func refresh(from host: Host) {
+        if host.updatedAt != hostUpdatedAt {
+            hostUpdatedAt = host.updatedAt
+            lastFailedWithAuth = false
+            bypassSavedSecrets = false
+        }
         hostname = host.hostname; port = host.port; username = host.username
         authMethod = host.authMethod; keyID = host.keyID; tmux = host.tmuxCommand
         title = host.label.isEmpty ? host.hostname : host.label
@@ -74,23 +84,26 @@ final class HostConnectionModel {
                 phase = .keyMissing(keyName: key?.name)
                 return
             }
+            if key.isEncrypted, typedPassphrase == nil,
+               bypassSavedSecrets || ((try? store.passphrase(for: key)) ?? nil) == nil {
+                phase = .input(InputRequest(purpose: .passphrase, title: "Passphrase for \(key.name)",
+                                            instruction: "", items: [.init(text: "Passphrase", echo: false)], prefill: [""]))
+                return
+            }
         }
-        if authMethod == "password", HostSecrets.password(for: hostID) == nil, typedPassword == nil {
+        if authMethod == "password", typedPassword == nil,
+           bypassSavedSecrets || HostSecrets.password(for: hostID) == nil {
             phase = .input(InputRequest(purpose: .password, title: "Password for \(username)@\(hostname)",
                                         instruction: "", items: [.init(text: "Password", echo: false)], prefill: [""]))
-            return
-        }
-        if authMethod == "key", let key = try? KeyStore().list().first(where: { $0.id == keyID }),
-           key.isEncrypted, ((try? KeyStore().passphrase(for: key)) ?? nil) == nil, typedPassphrase == nil {
-            phase = .input(InputRequest(purpose: .passphrase, title: "Passphrase for \(key.name)",
-                                        instruction: "", items: [.init(text: "Passphrase", echo: false)], prefill: [""]))
             return
         }
         connect()
     }
 
-    /// Clears anything typed earlier, so a failed login asks again.
+    /// Clears anything typed earlier, so a failed login asks again (bypassing wrong saved secrets).
     func retry() {
+        if lastFailedWithAuth { bypassSavedSecrets = true }
+        lastFailedWithAuth = false
         typedPassword = nil
         typedPassphrase = nil
         savePassphraseOnSuccess = false
@@ -130,7 +143,7 @@ final class HostConnectionModel {
     private func askPrompt(_ prompt: Prompt, attempt promptAttempt: Int) async -> [String] {
         // A round from a superseded or cancelled connection must not touch the current one's state.
         if Task.isCancelled || promptAttempt != attempt { return [] }
-        let saved = HostSecrets.password(for: hostID)
+        let saved = bypassSavedSecrets ? nil : HostSecrets.password(for: hostID)
         let first = kiRound == 0
         kiRound += 1
         let prefill = prompt.items.map { item -> String in
@@ -176,17 +189,24 @@ final class HostConnectionModel {
     }
 
     private func buildAuth() throws -> SSHAuth {
-        let saved = HostSecrets.password(for: hostID) ?? typedPassword ?? ""
+        let saved = typedPassword ?? (bypassSavedSecrets ? nil : HostSecrets.password(for: hostID)) ?? ""
         kiRound = 0
         switch authMethod {
         case "key":
             let store = KeyStore()
             guard let key = try store.list().first(where: { $0.id == keyID }),
                   let pem = try store.privateKey(for: key) else {
-                throw NSError(domain: "HostConnection", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "The selected key is missing from the Keychain."])
+                throw KeyStoreError.keyMissing
             }
-            let phrase = try store.passphrase(for: key) ?? typedPassphrase
+            if key.type == .secureEnclaveP256 {
+                let s = try SecureEnclaveKey.signer(for: key, store: store)
+                return .signer(publicKeyBlob: s.publicKeyBlob, sign: s.sign)
+            }
+            let phrase = if let typedPassphrase {
+                typedPassphrase
+            } else {
+                bypassSavedSecrets ? nil : try store.passphrase(for: key)
+            }
             return .privateKey(pem: pem, passphrase: phrase)
         case "keyboardInteractive":
             let current = attempt
@@ -201,15 +221,28 @@ final class HostConnectionModel {
 
     func connect() {
         attempt += 1
-        handedOff = false
+        lastFailedWithAuth = false
+        resolve(.reject)
         resolveInput([])
         task?.cancel()
+        let old = handedOff ? nil : connection
+        connection = nil
+        handedOff = false
+        Task { await old?.close() }
         phase = .connecting
         let auth: SSHAuth
-        do { auth = try buildAuth() } catch { phase = .failed("\(error.localizedDescription)"); return }
+        do { auth = try buildAuth() }
+        catch KeyStoreError.keyMissing {
+            let name = (try? KeyStore().list())?.first(where: { $0.id == keyID })?.name
+            phase = .keyMissing(keyName: name); return
+        }
+        catch KeyStoreError.secureEnclaveUnavailable {
+            phase = .failed("This device has no Secure Enclave, so it can't use this key."); return
+        }
+        catch { phase = .failed("\(error.localizedDescription)"); return }
         let conn = SSHConnection(host: hostname, port: UInt16(clamping: port), username: username, auth: auth)
         connection = conn
-        let known = self.known, host = hostname, port = self.port
+        let known = self.known, host = hostname, port = self.port, currentAttempt = attempt
         task = Task {
             do {
                 try await conn.connect { [weak self] key in
@@ -217,11 +250,11 @@ final class HostConnectionModel {
                     do { stored = try known.fingerprint(host: host, port: port) } catch { return .reject }
                     if let stored {
                         if stored == key.fingerprint { return .trust }
-                        await self?.showMismatch(stored: stored, presented: key)
+                        await self?.showMismatch(stored: stored, presented: key, attempt: currentAttempt)
                         return .reject  // blocked: never continue on a changed key
                     }
                     guard let self else { return .reject }
-                    return await self.askTrust(key)
+                    return await self.askTrust(key, attempt: currentAttempt)
                 }
                 if Task.isCancelled { await conn.close(); return }
                 let bridge = SessionBridge(session: conn)
@@ -235,6 +268,7 @@ final class HostConnectionModel {
                 if case .mismatch = phase { return }  // the mismatch screen is already showing
                 if case .failed = phase { return }  // keep the original message
                 if case .prompt = phase { phase = .failed("Cancelled") ; return }
+                if let e = error as? SSHError, case .authenticationFailed = e { lastFailedWithAuth = true }
                 phase = .failed(Self.describe(error))
                 var network = false
                 if let e = error as? SSHError {
@@ -260,12 +294,31 @@ final class HostConnectionModel {
         try? store.savePassphrase(phrase, for: key)
     }
 
-    private func showMismatch(stored: String, presented: HostKey) { phase = .mismatch(stored: stored, presented: presented) }
+    private func showMismatch(stored: String, presented: HostKey, attempt mismatchAttempt: Int) {
+        guard !Task.isCancelled, mismatchAttempt == attempt else { return }
+        phase = .mismatch(stored: stored, presented: presented)
+    }
 
-    private func askTrust(_ key: HostKey) async -> HostKeyDecision {
-        await withCheckedContinuation { c in
-            decision = c
-            phase = .prompt(key)
+    private func askTrust(_ key: HostKey, attempt trustAttempt: Int) async -> HostKeyDecision {
+        if Task.isCancelled || trustAttempt != attempt { return .reject }
+        resolve(.reject)  // never leave an earlier continuation pending
+        trustGeneration += 1
+        let generation = trustGeneration
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { c in
+                if Task.isCancelled || trustAttempt != attempt {
+                    c.resume(returning: .reject)
+                    return
+                }
+                decision = c
+                phase = .prompt(key)
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self, self.trustGeneration == generation, self.decision != nil else { return }
+                if case .prompt = self.phase { self.phase = .failed("Cancelled") }
+                self.resolve(.reject)
+            }
         }
     }
 

@@ -5,106 +5,243 @@ import TermUI
 
 struct HostConnectionView: View {
     let host: Host
-    @State private var model: HostConnectionModel
+    private let externalModel: HostConnectionModel?
+    private let onConnected: ((UUID) -> Void)?
+    private let onCancel: (() -> Void)?
+
+    @State private var ownedModel: HostConnectionModel?
+    @State private var didStart = false
     @Environment(\.dismiss) private var dismiss
     @Environment(SessionManager.self) private var manager
     @Environment(\.openSessionTab) private var openTab
+    @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
 
-    init(host: Host) {
+    private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+
+    private var activeModel: HostConnectionModel {
+        externalModel ?? ownedModel!
+    }
+
+    private var hostTitle: String {
+        let modelTitle = activeModel.title
+        if !modelTitle.isEmpty { return modelTitle }
+        return host.label.isEmpty ? host.hostname : host.label
+    }
+
+    private var addressSubtitle: String {
+        let userPart = activeModel.username.isEmpty ? "" : "\(activeModel.username)@"
+        let portPart = activeModel.port == 22 ? "" : ":\(activeModel.port)"
+        return "\(userPart)\(activeModel.hostname)\(portPart)"
+    }
+
+    init(
+        host: Host,
+        model: HostConnectionModel? = nil,
+        onConnected: ((UUID) -> Void)? = nil,
+        onCancel: (() -> Void)? = nil
+    ) {
         self.host = host
-        _model = State(initialValue: HostConnectionModel(host: host))
+        self.externalModel = model
+        self.onConnected = onConnected
+        self.onCancel = onCancel
+        _ownedModel = State(initialValue: model == nil ? HostConnectionModel(host: host) : nil)
     }
 
     var body: some View {
         Group {
-            switch model.phase {
+            switch activeModel.phase {
             case .input(let request):
-                AuthPromptForm(request: request,
-                               onSubmit: { model.submitInput(request, answers: $0, savePassphrase: $1) },
-                               onCancel: { model.cancelInput(request) })
-                    .id(request.id)
+                AuthPromptView(
+                    request: request,
+                    subtitle: addressSubtitle,
+                    onSubmit: { activeModel.submitInput(request, answers: $0, savePassphrase: $1) },
+                    onCancel: { activeModel.cancelInput(request) }
+                )
+                .id(request.id)
+
             case .connecting:
-                ProgressView("Connecting…")
+                statusCard {
+                    ProgressView()
+                        .controlSize(.large)
+                    VStack(spacing: 4) {
+                        Text(hostTitle)
+                            .font(.title3.bold())
+                            .multilineTextAlignment(.center)
+                        Text(addressSubtitle)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("Connecting…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Button(role: .cancel) {
+                        closeConnection()
+                    } label: {
+                        Text("Cancel")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                }
+
             case .prompt(let key):
-                HostKeyPromptView(hostname: model.hostname, port: model.port, key: key,
-                                  onTrust: { model.trust(key) }, onCancel: { model.cancelPrompt() })
+                HostKeyPromptView(
+                    hostname: activeModel.hostname,
+                    port: activeModel.port,
+                    key: key,
+                    onTrust: { activeModel.trust(key) },
+                    onCancel: { activeModel.cancelPrompt() }
+                )
+
             case .mismatch(let stored, let presented):
-                HostKeyMismatchView(hostname: model.hostname, port: model.port, stored: stored, presented: presented,
-                                    onReplace: { model.replaceStoredKey(with: presented) },
-                                    onClose: { model.teardown(); dismiss() })
+                HostKeyMismatchView(
+                    hostname: activeModel.hostname,
+                    port: activeModel.port,
+                    stored: stored,
+                    presented: presented,
+                    onReplace: { activeModel.replaceStoredKey(with: presented) },
+                    onClose: { closeConnection() }
+                )
+
             case .connected:
-                ProgressView("Opening…")
-            case .keyMissing:
-                KeyMissingView(host: host, onRetry: { model.refresh(from: host); model.start() })
+                statusCard {
+                    ProgressView()
+                        .controlSize(.large)
+                    VStack(spacing: 4) {
+                        Text(hostTitle)
+                            .font(.title3.bold())
+                            .multilineTextAlignment(.center)
+                        Text(addressSubtitle)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("Opening session…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+            case .keyMissing(let keyName):
+                KeyMissingView(
+                    host: host,
+                    keyName: keyName,
+                    onRetry: {
+                        activeModel.refresh(from: host)
+                        activeModel.start()
+                    },
+                    onClose: { closeConnection() }
+                )
+
             case .failed(let message):
-                VStack(spacing: 12) {
-                    Text(message).foregroundStyle(.red)
-                    Button("Retry") { model.retry() }
-                }.padding()
+                statusCard {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 36, weight: .semibold))
+                        .foregroundStyle(.red)
+                        .accessibilityHidden(true)
+
+                    VStack(spacing: 4) {
+                        Text(hostTitle)
+                            .font(.title3.bold())
+                            .multilineTextAlignment(.center)
+                        Text(addressSubtitle)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Text(message)
+                        .font(.subheadline)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.center)
+
+                    VStack(spacing: 10) {
+                        Button {
+                            AppHaptics.impact(.light)
+                            activeModel.retry()
+                        } label: {
+                            Text("Retry")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+
+                        Button(role: .cancel) {
+                            closeConnection()
+                        } label: {
+                            Text(onCancel == nil ? "Close" : "Close Tab")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                    }
+                }
             }
         }
-        .navigationTitle(host.label.isEmpty ? host.hostname : host.label)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(theme.backgroundColor.ignoresSafeArea())
+        .navigationTitle(hostTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button("Close") { model.teardown(); dismiss() }
+            if onCancel == nil {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Close") { closeConnection() }
+                }
             }
         }
         .onAppear {
+            guard externalModel == nil, !didStart else { return }
+            didStart = true
+            let currentModel = activeModel
             // Title and tmux are read when the connection lands, so an edit made from the key-missing screen applies.
-            model.onConnected = { [manager, openTab, hostID = host.id, weak model] conn, bridge in
-                let title = model?.title ?? "", tmux = model?.tmux
-                let live = manager.open(hostID: hostID, title: title, session: conn, bridge: bridge)  // wiring: T8
-                TmuxAttach.send(tmux, via: bridge)  // wiring: T9
-                openTab(live.id)
-                dismiss()
-            }
-            model.start()
-        }
-        .onDisappear { model.teardown() }
-    }
-}
-
-private struct AuthPromptForm: View {
-    let request: HostConnectionModel.InputRequest
-    let onSubmit: ([String], Bool) -> Void
-    let onCancel: () -> Void
-    @State private var answers: [String]
-    @State private var savePassphrase = false
-
-    init(request: HostConnectionModel.InputRequest,
-         onSubmit: @escaping ([String], Bool) -> Void, onCancel: @escaping () -> Void) {
-        self.request = request; self.onSubmit = onSubmit; self.onCancel = onCancel
-        _answers = State(initialValue: request.prefill)
-    }
-
-    var body: some View {
-        Form {
-            Section {
-                ForEach(request.items.indices, id: \.self) { i in
-                    let item = request.items[i]
-                    let binding = Binding(get: { i < answers.count ? answers[i] : "" },
-                                          set: { if i < answers.count { answers[i] = $0 } })
-                    if item.echo {
-                        TextField(item.text, text: binding)
-                            .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    } else {
-                        SecureField(item.text, text: binding)
-                    }
+            currentModel.onConnected = { [manager, openTab, hostID = host.id, onConnected, dismiss, weak currentModel] conn, bridge in
+                let title = currentModel?.title ?? ""
+                let tmux = currentModel?.tmux
+                let live = manager.open(
+                    hostID: hostID,
+                    title: title,
+                    session: conn,
+                    bridge: bridge,
+                    ephemeralHost: host.modelContext == nil ? host : nil
+                ) // wiring: T8
+                TmuxAttach.send(tmux, via: bridge) // wiring: T9
+                if let onConnected {
+                    onConnected(live.id)
+                } else {
+                    openTab(live.id)
+                    dismiss()
                 }
-            } header: {
-                Text(request.title)
-            } footer: {
-                if !request.instruction.isEmpty { Text(request.instruction) }
             }
-            if request.purpose == .passphrase {
-                Section { Toggle("Save passphrase", isOn: $savePassphrase) }
-            }
-            Section {
-                Button("Continue") { onSubmit(answers, savePassphrase) }
-                    .disabled(request.purpose != .keyboardInteractive && (answers.first ?? "").isEmpty)
-                Button("Cancel", role: .cancel, action: onCancel)
+            currentModel.start()
+        }
+        .onDisappear {
+            if externalModel == nil {
+                activeModel.teardown()
             }
         }
+    }
+
+    private func closeConnection() {
+        AppHaptics.impact(.light)
+        activeModel.teardown()
+        if let onCancel {
+            onCancel()
+        } else {
+            dismiss()
+        }
+    }
+
+    private func statusCard<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        VStack(spacing: 18) {
+            content()
+        }
+        .frame(maxWidth: 380)
+        .padding(24)
+        .background(
+            theme.isDark ? Color.white.opacity(0.05) : Color.black.opacity(0.03),
+            in: RoundedRectangle(cornerRadius: 16)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(theme.isDark ? Color.white.opacity(0.10) : Color.black.opacity(0.08), lineWidth: 1)
+        )
+        .padding(24)
     }
 }

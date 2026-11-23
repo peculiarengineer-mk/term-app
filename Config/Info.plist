@@ -4,8 +4,10 @@
 <dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>TermApp connects to SSH servers on your local network.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>TermApp uses Face ID to lock access to your SSH sessions and keys.</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
-	<true/>
+	<false/>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

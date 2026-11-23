@@ -1,8 +1,12 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 import Store
 
 struct KeyImportView: View {
+    let onCreated: (() -> Void)?
+    let onCreatedKey: ((StoredKey) -> Void)?
+
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var text = ""
@@ -12,41 +16,133 @@ struct KeyImportView: View {
     @State private var showPicker = false
     @State private var error: String?
 
-    private var parsed: ParsedKey? { try? KeyImporter.inspect(text) }
+    init(
+        onCreated: (() -> Void)? = nil,
+        onCreatedKey: ((StoredKey) -> Void)? = nil
+    ) {
+        self.onCreated = onCreated
+        self.onCreatedKey = onCreatedKey
+    }
+
+    private var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var inspection: Result<ParsedKey, Error>? {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return Result { try KeyImporter.inspect(text) }
+    }
+
+    private var parsed: ParsedKey? {
+        if case .success(let key) = inspection { return key }
+        return nil
+    }
+
+    private static func describe(_ error: Error) -> String {
+        switch error as? KeyFormatError {
+        case .malformed(let reason): return "Invalid key: \(reason)."
+        case .unsupported(let reason): return "Unsupported key: \(reason)."
+        case nil: return error.localizedDescription
+        }
+    }
 
     var body: some View {
         NavigationStack {
             Form {
-                TextField("Name", text: $name)
-                Section("Private key") {
-                    TextEditor(text: $text)
-                        .font(.system(.footnote, design: .monospaced))
-                        .frame(minHeight: 140)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                    Button("Choose file…", systemImage: "folder") { showPicker = true }
-                }
-                if let p = parsed {
-                    Text("Detected: \(p.type.rawValue)\(p.isEncrypted ? ", passphrase-protected" : "")")
-                        .font(.footnote).foregroundStyle(.secondary)
-                    if p.isEncrypted {
-                        SecureField("Passphrase", text: $passphrase)
-                        Toggle("Save passphrase in Keychain", isOn: $savePassphrase)
+                Section {
+                    TextField("Name", text: $name)
+                } footer: {
+                    if trimmedName.isEmpty {
+                        Text(parsed != nil ? "Enter a name above to enable Import." : "Give this key a name to identify it.")
+                            .foregroundStyle(parsed != nil ? .orange : .secondary)
                     }
                 }
+
+                Section("Private key") {
+                    ZStack(alignment: .topLeading) {
+                        if text.isEmpty {
+                            Text("-----BEGIN OPENSSH PRIVATE KEY-----")
+                                .font(.system(.footnote, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                                .padding(.top, 8)
+                                .padding(.leading, 5)
+                                .allowsHitTesting(false)
+                        }
+                        TextEditor(text: $text)
+                            .font(.system(.footnote, design: .monospaced))
+                            .frame(minHeight: 140)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+
+                    HStack(spacing: 16) {
+                        Button("Choose file…", systemImage: "folder") {
+                            showPicker = true
+                        }
+                        .buttonStyle(.borderless)
+
+                        Spacer()
+
+                        Button("Paste", systemImage: "doc.on.clipboard") {
+                            pasteFromClipboard()
+                        }
+                        .buttonStyle(.borderless)
+                    }
+                }
+
+                switch inspection {
+                case .success(let p):
+                    Text("Detected: \(p.type.rawValue)\(p.isEncrypted ? ", passphrase-protected" : "")")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    if p.isEncrypted {
+                        Toggle("Save passphrase in Keychain", isOn: $savePassphrase)
+                        if savePassphrase {
+                            SecureField("Passphrase", text: $passphrase)
+                        }
+                    }
+                case .failure(let parseError):
+                    Text(Self.describe(parseError))
+                        .font(.footnote)
+                        .foregroundStyle(.red)
+                case nil:
+                    EmptyView()
+                }
+
                 Toggle("Sync via iCloud Keychain", isOn: $sync)
-                if let error { Text(error).foregroundStyle(.red) }
+
+                if let error {
+                    Text(error)
+                        .foregroundStyle(.red)
+                }
             }
+            .onChange(of: savePassphrase) { _, on in if !on { passphrase = "" } }
+            .onChange(of: text) { _, _ in error = nil }
             .navigationTitle("Import Key")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Import") {
                         do {
-                            try KeyImporter.importKey(name: name, text: text, passphrase: passphrase.isEmpty ? nil : passphrase,
-                                                      savePassphrase: savePassphrase, syncsViaICloud: sync)
+                            let imported = try KeyImporter.importKey(
+                                name: trimmedName,
+                                text: text,
+                                passphrase: savePassphrase && !passphrase.isEmpty ? passphrase : nil,
+                                savePassphrase: savePassphrase,
+                                syncsViaICloud: sync
+                            )
+                            AppHaptics.notify(.success)
+                            onCreated?()
+                            onCreatedKey?(imported)
                             dismiss()
-                        } catch { self.error = "\(error)" }
-                    }.disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || parsed == nil)
+                        } catch {
+                            self.error = Self.describe(error)
+                        }
+                    }
+                    .disabled(trimmedName.isEmpty || parsed == nil)
                 }
             }
             .fileImporter(isPresented: $showPicker, allowedContentTypes: [.data, .text]) { result in
@@ -55,9 +151,21 @@ struct KeyImportView: View {
                     let scoped = url.startAccessingSecurityScopedResource()
                     defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                     do { text = try String(contentsOf: url, encoding: .utf8) } catch { self.error = "\(error)" }
-                case .failure(let e): error = "\(e)"
+                case .failure(let e):
+                    error = "\(e)"
                 }
             }
         }
+    }
+
+    private func pasteFromClipboard() {
+        guard let pasted = UIPasteboard.general.string, !pasted.isEmpty else {
+            AppHaptics.notify(.warning)
+            error = "Clipboard is empty."
+            return
+        }
+        AppHaptics.impact(.light)
+        text = pasted
+        error = nil
     }
 }

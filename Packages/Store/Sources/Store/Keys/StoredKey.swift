@@ -2,6 +2,13 @@ import Foundation
 
 public enum KeyType: String, Codable, Sendable, CaseIterable {
     case ed25519, ecdsa, rsa
+    case secureEnclaveP256
+}
+
+public enum KeyStoreError: Error, Equatable, Sendable {
+    case secureEnclaveKeyCannotSync
+    case secureEnclaveUnavailable
+    case keyMissing
 }
 
 /// Key metadata. The private key bytes live in Keychain under `KeyStore.privateService`, never here.
@@ -29,8 +36,9 @@ public struct KeyStore: Sendable {
     public static let passphraseService = "app.termapp.key.passphrase"
     public static let metaService = "app.termapp.key.meta"
 
-    private let keychain: KeychainStore
+    private let keychain: any KeychainStoring
     public init(keychain: KeychainStore = KeychainStore()) { self.keychain = keychain }
+    internal init(storage: any KeychainStoring) { self.keychain = storage }
 
     public func list() throws -> [StoredKey] {
         let decoder = JSONDecoder()
@@ -46,6 +54,9 @@ public struct KeyStore: Sendable {
     }
 
     public func add(_ key: StoredKey, privateKey: Data, passphrase: String? = nil) throws {
+        var key = key
+        // Enclave-wrapped blobs only work on this device; never sync them.
+        if key.type == .secureEnclaveP256 { key.syncsViaICloud = false }
         let acct = key.id.uuidString
         let sync = key.syncsViaICloud
         try keychain.save(privateKey, service: Self.privateService, account: acct, synchronizable: sync)
@@ -81,16 +92,44 @@ public struct KeyStore: Sendable {
     }
 
     public func setSynchronizable(_ on: Bool, for key: StoredKey) throws {
-        let acct = key.id.uuidString
-        try keychain.setSynchronizable(on, service: Self.privateService, account: acct)
-        if try keychain.read(service: Self.passphraseService, account: acct) != nil {
-            try keychain.setSynchronizable(on, service: Self.passphraseService, account: acct)
+        if key.type == .secureEnclaveP256 {
+            if on { throw KeyStoreError.secureEnclaveKeyCannotSync }
+            return
         }
-        // Start from the stored metadata, not the caller's possibly stale snapshot.
-        var updated = (try keychain.read(service: Self.metaService, account: acct))
-            .flatMap { try? JSONDecoder().decode(StoredKey.self, from: $0) } ?? key
-        updated.syncsViaICloud = on
-        try keychain.save(JSONEncoder().encode(updated), service: Self.metaService, account: acct, synchronizable: on)
+        let acct = key.id.uuidString
+        // Fail closed when metadata is missing or unreadable, and verify the stored type too.
+        guard let meta = try keychain.read(service: Self.metaService, account: acct) else {
+            throw KeyStoreError.keyMissing
+        }
+        let storedMeta = try JSONDecoder().decode(StoredKey.self, from: meta)
+        if storedMeta.type == .secureEnclaveP256 {
+            if on { throw KeyStoreError.secureEnclaveKeyCannotSync }
+            return
+        }
+        let hadOppositePrivate = try keychain.read(service: Self.privateService, account: acct, synchronizable: !on) != nil
+        let hadTargetPrivate = try keychain.read(service: Self.privateService, account: acct, synchronizable: on) != nil
+        try keychain.setSynchronizable(on, service: Self.privateService, account: acct)
+        let flippedPrivate = hadOppositePrivate && !hadTargetPrivate
+        var flippedPassphrase = false
+        do {
+            let hadOppositePassphrase = try keychain.read(service: Self.passphraseService, account: acct, synchronizable: !on) != nil
+            let hadTargetPassphrase = try keychain.read(service: Self.passphraseService, account: acct, synchronizable: on) != nil
+            if hadOppositePassphrase || hadTargetPassphrase {
+                try keychain.setSynchronizable(on, service: Self.passphraseService, account: acct)
+                flippedPassphrase = hadOppositePassphrase && !hadTargetPassphrase
+            }
+            var updated = storedMeta
+            updated.syncsViaICloud = on
+            try keychain.save(JSONEncoder().encode(updated), service: Self.metaService, account: acct, synchronizable: on)
+        } catch {
+            if flippedPassphrase {
+                try? keychain.setSynchronizable(!on, service: Self.passphraseService, account: acct)
+            }
+            if flippedPrivate {
+                try? keychain.setSynchronizable(!on, service: Self.privateService, account: acct)
+            }
+            throw error
+        }
     }
 
     public func delete(_ key: StoredKey) throws {

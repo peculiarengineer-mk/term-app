@@ -59,4 +59,36 @@ final class KeychainStoreTests: XCTestCase {
             XCTAssertEqual(all.first?.synchronizable, false)
         }
     }
+
+    func testAccessibilityMatchesSynchronizableFlag() throws {
+        try skippingMissingEntitlement {
+            try store.save(Data("local".utf8), service: service, account: account, synchronizable: false)
+            XCTAssertEqual(try accessibleAttribute(synchronizable: false), kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
+
+            do {
+                try store.setSynchronizable(true, service: service, account: account)
+            } catch let e as KeychainError where e.status == errSecMissingEntitlement || e.status == errSecNotAvailable {
+                throw XCTSkip("synchronizable items unavailable (\(e.status))")
+            }
+            XCTAssertEqual(try accessibleAttribute(synchronizable: true), kSecAttrAccessibleAfterFirstUnlock as String)
+
+            try store.setSynchronizable(false, service: service, account: account)
+            XCTAssertEqual(try accessibleAttribute(synchronizable: false), kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
+        }
+    }
+
+    private func accessibleAttribute(synchronizable: Bool) throws -> String? {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrSynchronizable as String: synchronizable ? kCFBooleanTrue! : kCFBooleanFalse!,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &result)
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        return (result as? [String: Any])?[kSecAttrAccessible as String] as? String
+    }
 }

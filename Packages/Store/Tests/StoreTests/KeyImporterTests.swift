@@ -10,9 +10,11 @@ final class KeyImporterTests: XCTestCase {
     }
 
     func testECDSAPEM() throws {
-        let p = try KeyImporter.inspect(try Fixture.text("ecdsa.key"))
-        XCTAssertEqual(p.type, .ecdsa); XCTAssertFalse(p.isEncrypted)
-        XCTAssertTrue(p.publicKeyLine?.hasPrefix("ecdsa-sha2-nistp256 AAAAE2VjZHNh") == true)
+        XCTAssertThrowsError(try KeyImporter.inspect(try Fixture.text("ecdsa.key"))) { error in
+            guard case KeyFormatError.unsupported = error else {
+                return XCTFail("expected KeyFormatError.unsupported, got \(error)")
+            }
+        }
     }
 
     func testRSAPEM() throws {

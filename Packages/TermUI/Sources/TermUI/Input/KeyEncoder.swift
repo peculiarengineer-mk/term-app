@@ -11,13 +11,14 @@ public enum KeyEncoder {
     public static let escape: [UInt8] = [0x1b]
     public static let tab: [UInt8] = [0x09]
 
-    /// Ctrl+key: letters (either case) map to 0x01…0x1A; `@ [ \ ] ^ _ ?` and space to their C0 codes.
+    /// Ctrl+key: letters (either case) map to 0x01…0x1A; `@ [ \ ] ^ _ / ?` and space to their C0 codes.
     public static func ctrl(_ ch: Character) -> [UInt8]? {
         guard ch.isASCII, let a = ch.asciiValue else { return nil }
         switch a {
         case 0x61...0x7a: return [a - 0x60]
         case 0x40...0x5f: return [a - 0x40]
         case 0x20: return [0x00]
+        case 0x2f: return [0x1f]
         case 0x3f: return [0x7f]
         default: return nil
         }

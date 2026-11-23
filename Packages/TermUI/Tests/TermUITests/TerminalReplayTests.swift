@@ -36,4 +36,21 @@ final class TerminalReplayTests: XCTestCase {
         XCTAssertEqual(TerminalTheme.dark.ansi.count, 16)
         XCTAssertEqual(TerminalTheme.light.ansi.count, 16)
     }
+
+    func testThemeEquatable() {
+        XCTAssertEqual(TerminalTheme.RGB(1, 2, 3), TerminalTheme.RGB(1, 2, 3))
+        XCTAssertNotEqual(TerminalTheme.RGB(1, 2, 3), TerminalTheme.RGB(1, 2, 4))
+
+        XCTAssertEqual(TerminalTheme.dark, TerminalTheme.dark)
+        XCTAssertNotEqual(TerminalTheme.dark, TerminalTheme.light)
+
+        let modifiedDark = TerminalTheme(
+            name: TerminalTheme.dark.name,
+            foreground: .init(0xFF, 0xFF, 0xFF),
+            background: TerminalTheme.dark.background,
+            cursor: TerminalTheme.dark.cursor,
+            ansi: TerminalTheme.dark.ansi
+        )
+        XCTAssertNotEqual(TerminalTheme.dark, modifiedDark)
+    }
 }

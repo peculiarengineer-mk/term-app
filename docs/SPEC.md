@@ -23,8 +23,8 @@ data.
 | Licence | GPLv3, open source | Needed to ship Mosh. GPL alone does not settle the App Store conflict (see Risks) |
 | Business model | Free core + one-time Pro in-app purchase | No server costs to cover; SSH users dislike subscriptions |
 | Pro tier | SFTP, port forwarding, DigitalOcean integration | Power features; the core terminal stays free |
-| Key storage | Keychain only (no Secure Enclave) | Simple; Ed25519 + RSA + ECDSA keys stored as Keychain items |
-| Sync | iCloud: hosts in CloudKit, keys as syncable Keychain items (opt in) | Apple-native, no backend |
+| Key storage | Secure Enclave P-256 (this device only) by default on capable devices; Ed25519 + imported keys in Keychain | Hardware-backed keys stay non-exportable in the Secure Enclave; software Ed25519, ECDSA, and RSA keys live in Keychain and can opt in to iCloud sync |
+| Sync | iCloud: hosts in CloudKit, software keys as syncable Keychain items (opt in) | Apple-native, no backend |
 | Tailscale / LAN | Use the Tailscale iOS app; connect to 100.x or MagicDNS names | No extra work for us |
 | Host keys | Trust on first use (TOFU) with a fingerprint prompt; block on mismatch; forget a droplet's key when it is destroyed | Safe default that suits short-lived boxes |
 | DigitalOcean auth | Personal access token stored in Keychain | No OAuth app or backend needed |
@@ -86,14 +86,17 @@ between the two.
 Keys and secrets never leave Apple's Keychain except through iCloud Keychain sync, which the user
 opts in to.
 
-- **Private keys.** Ed25519 is the default when a key is generated. The app also imports
-  OpenSSH-format and PEM keys (Ed25519, ECDSA, RSA). Passphrase-protected keys are handed to
-  `libssh2_userauth_publickey_frommemory` with the passphrase, because CryptoKit cannot decrypt
-  OpenSSH's bcrypt-pbkdf format. Each key is a `kSecClassGenericPassword` item with
-  `kSecAttrAccessibleAfterFirstUnlock`, so items stay readable while the device is locked after its
-  first unlock (`WhenUnlocked` would be stricter and also syncs). Searches, updates and deletes use
-  `kSecAttrSynchronizableAny`. Turning sync on or off for a key deletes the item and
-  re-adds it.
+- **Private keys.** Secure Enclave P-256 is the default when generating a key on capable
+  devices, with Ed25519 available as an option (and used as the fallback where Secure Enclave is
+  unavailable). Secure Enclave keys wrap their private material inside the device's Secure Enclave
+  (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`) and can never be exported or synced via iCloud
+  Keychain. The app also generates Ed25519 keys and imports OpenSSH-format and PEM keys (Ed25519,
+  ECDSA, RSA). Passphrase-protected keys are handed to `libssh2_userauth_publickey_frommemory` with
+  the passphrase, because CryptoKit cannot decrypt OpenSSH's bcrypt-pbkdf format. Keychain-backed
+  key items use `kSecAttrAccessibleAfterFirstUnlock`, so items stay readable while the device is
+  locked after its first unlock (`WhenUnlocked` would be stricter and also syncs). Searches, updates
+  and deletes use `kSecAttrSynchronizableAny`. Turning sync on or off for a software key deletes the
+  item and re-adds it.
 - **Public key export.** Copy or share the `authorized_keys` line. M3 adds pushing the key to
   DigitalOcean as an account SSH key.
 - **Passwords.** Saving one is optional; it is stored in Keychain under the host's ID. Saved
