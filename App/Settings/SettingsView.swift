@@ -16,7 +16,17 @@ struct SettingsView: View {
     @State private var securityError: String?
     @State private var showingPaywall = false
 
+    private var authState: CloudAuthState { CloudAuthState.shared }
     private var currentTheme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+
+    private var cloudTokensSummary: String {
+        switch (authState.hasDigitalOceanToken, authState.hasCloudflareToken) {
+        case (true, true): "DigitalOcean · Cloudflare"
+        case (true, false): "DigitalOcean"
+        case (false, true): "Cloudflare"
+        case (false, false): "Not configured"
+        }
+    }
     private var fontFamily: TerminalFontFamily { TerminalFontFamily(rawValue: fontFamilyRaw) ?? .sfMono }
     private var cursorStyle: TerminalCursorStyle { TerminalCursorStyle(rawValue: cursorStyleRaw) ?? .block }
 
@@ -140,6 +150,20 @@ struct SettingsView: View {
                 NavigationLink("Command Snippets", destination: SnippetDrawerView(onRun: nil))
             }
 
+            Section("Cloud") {
+                NavigationLink {
+                    CloudTokensView(showsDoneButton: false)
+                } label: {
+                    HStack {
+                        Text("Cloud Tokens")
+                        Spacer()
+                        Text(cloudTokensSummary)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
             Section {
                 Toggle("Face ID / Passcode Lock", isOn: Binding(
                     get: { appLock.appLockEnabled },
@@ -186,6 +210,9 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .onAppear {
+            authState.refresh()
+        }
         .alert(
             "App Lock Unavailable",
             isPresented: Binding(get: { securityError != nil }, set: { if !$0 { securityError = nil } })
@@ -220,7 +247,7 @@ struct SettingsView: View {
                             .font(.headline)
                             .foregroundStyle(.primary)
 
-                        Text("SFTP File Browser, Port Forwarding & more")
+                        Text("SFTP, Port Forwarding, DigitalOcean & Cloudflare")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

@@ -107,9 +107,8 @@ struct ProPaywallView: View {
             featureRow(
                 icon: "cloud.fill",
                 tint: .cyan,
-                title: "DigitalOcean Integration",
-                subtitle: "Discover and connect directly to your Droplets.",
-                badge: "Coming Soon"
+                title: "DigitalOcean & Cloudflare",
+                subtitle: "Manage Droplets, 1-tap SSH, sync hosts, edit DNS records, and inspect Zero Trust Tunnels."
             )
         }
         .padding(18)

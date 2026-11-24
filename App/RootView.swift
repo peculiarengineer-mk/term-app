@@ -4,6 +4,7 @@ import TermUI
 struct RootView: View {
     private enum AppTab: Hashable {
         case hosts
+        case cloud
         case keys
         case settings
     }
@@ -28,6 +29,12 @@ struct RootView: View {
                 }
                 .tabItem { Label("Hosts", systemImage: "server.rack") }
                 .tag(AppTab.hosts)
+
+                tabContent(activeSessionPill: activeSessionPill) {
+                    CloudTabView()
+                }
+                .tabItem { Label("Cloud", systemImage: "cloud.fill") }
+                .tag(AppTab.cloud)
 
                 tabContent(activeSessionPill: activeSessionPill) {
                     KeyListView()

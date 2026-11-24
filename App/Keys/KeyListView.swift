@@ -2,8 +2,11 @@ import SwiftUI
 import SwiftData
 import UIKit
 import Store
+import TermUI
 
 struct KeyListView: View {
+    @Environment(ProStore.self) private var proStore
+    @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
     @State private var keys: [StoredKey] = []
     @State private var keysWithSavedPassphrase: Set<UUID> = []
@@ -15,47 +18,86 @@ struct KeyListView: View {
     @State private var confirmOff: StoredKey?
     @State private var confirmDelete: StoredKey?
     @State private var confirmClearPassphrase: StoredKey?
+    @State private var pushingKeyID: UUID?
+    @State private var pushSuccessMessage: String?
+    @State private var showingPaywall = false
     private let store = KeyStore()
+    private var authState: CloudAuthState { CloudAuthState.shared }
+    private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
 
     var body: some View {
+        keysList
+            .sheet(isPresented: $showGenerate, onDismiss: reload) {
+                KeyGenerateView()
+            }
+            .sheet(isPresented: $showImport, onDismiss: reload) {
+                KeyImportView()
+            }
+            .sheet(isPresented: $showingPaywall) {
+                ProPaywallView()
+                    .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                    .tint(theme.accentColor)
+            }
+            .alert("Error", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+                Button("OK") {}
+            } message: {
+                Text(error ?? "")
+            }
+            .alert(
+                "Pushed to DigitalOcean",
+                isPresented: Binding(get: { pushSuccessMessage != nil }, set: { if !$0 { pushSuccessMessage = nil } })
+            ) {
+                Button("OK") {}
+            } message: {
+                Text(pushSuccessMessage ?? "")
+            }
+            .confirmationDialog(
+                "Turn off iCloud sync?",
+                isPresented: Binding(get: { confirmOff != nil }, set: { if !$0 { confirmOff = nil } }),
+                titleVisibility: .visible,
+                presenting: confirmOff
+            ) { key in
+                Button("Turn Off Sync", role: .destructive) { setSync(false, key) }
+                Button("Cancel", role: .cancel) {}
+            } message: { _ in
+                Text("This removes the key from your other devices. It stays on this one.")
+            }
+            .confirmationDialog(
+                confirmDeleteTitle,
+                isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
+                titleVisibility: .visible,
+                presenting: confirmDelete
+            ) { key in
+                Button("Delete Key", role: .destructive) { deleteKey(key) }
+                Button("Cancel", role: .cancel) {}
+            } message: { key in
+                Text(deleteWarningMessage(for: key))
+            }
+            .confirmationDialog(
+                "Clear saved passphrase?",
+                isPresented: Binding(get: { confirmClearPassphrase != nil }, set: { if !$0 { confirmClearPassphrase = nil } }),
+                titleVisibility: .visible,
+                presenting: confirmClearPassphrase
+            ) { key in
+                Button("Clear Passphrase", role: .destructive) { clearPassphrase(for: key) }
+                Button("Cancel", role: .cancel) {}
+            } message: { key in
+                Text("You will be asked for the passphrase the next time you connect using \"\(key.name)\".")
+            }
+            .onAppear {
+                authState.refresh()
+                reload()
+            }
+            .onDisappear {
+                copyResetTask?.cancel()
+                copyResetTask = nil
+            }
+    }
+
+    private var keysList: some View {
         List {
             ForEach(keys) { key in
-                keyRow(for: key)
-                    .contextMenu {
-                        if !key.publicKey.isEmpty {
-                            Button("Copy public key", systemImage: "doc.on.doc") {
-                                copyPublicKey(for: key)
-                            }
-                            ShareLink(item: key.publicKey) {
-                                Label("Share public key", systemImage: "square.and.arrow.up")
-                            }
-                        }
-                        if keysWithSavedPassphrase.contains(key.id) {
-                            Button("Clear saved passphrase", systemImage: "key.slash", role: .destructive) {
-                                confirmClearPassphrase = key
-                            }
-                        }
-                        Button("Delete", systemImage: "trash", role: .destructive) {
-                            confirmDelete = key
-                        }
-                    }
-                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        Button(role: .destructive) {
-                            confirmDelete = key
-                        } label: {
-                            Label("Delete", systemImage: "trash")
-                        }
-                    }
-                    .swipeActions(edge: .leading, allowsFullSwipe: false) {
-                        if keysWithSavedPassphrase.contains(key.id) {
-                            Button {
-                                confirmClearPassphrase = key
-                            } label: {
-                                Label("Clear Passphrase", systemImage: "key.slash")
-                            }
-                            .tint(.orange)
-                        }
-                    }
+                keyListRow(for: key)
             }
         }
         .overlay {
@@ -81,55 +123,51 @@ struct KeyListView: View {
                 }
             }
         }
-        .sheet(isPresented: $showGenerate, onDismiss: reload) {
-            KeyGenerateView()
-        }
-        .sheet(isPresented: $showImport, onDismiss: reload) {
-            KeyImportView()
-        }
-        .alert("Error", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
-            Button("OK") {}
-        } message: {
-            Text(error ?? "")
-        }
-        .confirmationDialog(
-            "Turn off iCloud sync?",
-            isPresented: Binding(get: { confirmOff != nil }, set: { if !$0 { confirmOff = nil } }),
-            titleVisibility: .visible,
-            presenting: confirmOff
-        ) { key in
-            Button("Turn Off Sync", role: .destructive) { setSync(false, key) }
-            Button("Cancel", role: .cancel) {}
-        } message: { _ in
-            Text("This removes the key from your other devices. It stays on this one.")
-        }
-        .confirmationDialog(
-            confirmDeleteTitle,
-            isPresented: Binding(get: { confirmDelete != nil }, set: { if !$0 { confirmDelete = nil } }),
-            titleVisibility: .visible,
-            presenting: confirmDelete
-        ) { key in
-            Button("Delete Key", role: .destructive) { deleteKey(key) }
-            Button("Cancel", role: .cancel) {}
-        } message: { key in
-            Text(deleteWarningMessage(for: key))
-        }
-        .confirmationDialog(
-            "Clear saved passphrase?",
-            isPresented: Binding(get: { confirmClearPassphrase != nil }, set: { if !$0 { confirmClearPassphrase = nil } }),
-            titleVisibility: .visible,
-            presenting: confirmClearPassphrase
-        ) { key in
-            Button("Clear Passphrase", role: .destructive) { clearPassphrase(for: key) }
-            Button("Cancel", role: .cancel) {}
-        } message: { key in
-            Text("You will be asked for the passphrase the next time you connect using \"\(key.name)\".")
-        }
-        .onAppear(perform: reload)
-        .onDisappear {
-            copyResetTask?.cancel()
-            copyResetTask = nil
-        }
+    }
+
+    private func keyListRow(for key: StoredKey) -> some View {
+        keyRow(for: key)
+            .contextMenu {
+                if !key.publicKey.isEmpty {
+                    Button("Copy public key", systemImage: "doc.on.doc") {
+                        copyPublicKey(for: key)
+                    }
+                    ShareLink(item: key.publicKey) {
+                        Label("Share public key", systemImage: "square.and.arrow.up")
+                    }
+                    if authState.hasDigitalOceanToken {
+                        Button("Push to DigitalOcean", systemImage: "icloud.and.arrow.up") {
+                            pushKeyToDigitalOcean(key)
+                        }
+                        .disabled(pushingKeyID != nil)
+                    }
+                }
+                if keysWithSavedPassphrase.contains(key.id) {
+                    Button("Clear saved passphrase", systemImage: "key.slash", role: .destructive) {
+                        confirmClearPassphrase = key
+                    }
+                }
+                Button("Delete", systemImage: "trash", role: .destructive) {
+                    confirmDelete = key
+                }
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button(role: .destructive) {
+                    confirmDelete = key
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+            }
+            .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                if keysWithSavedPassphrase.contains(key.id) {
+                    Button {
+                        confirmClearPassphrase = key
+                    } label: {
+                        Label("Clear Passphrase", systemImage: "key.slash")
+                    }
+                    .tint(.orange)
+                }
+            }
     }
 
     private var confirmDeleteTitle: String {
@@ -156,6 +194,11 @@ struct KeyListView: View {
                         .accessibilityLabel("Passphrase-protected")
                 }
 
+                if pushingKeyID == key.id {
+                    ProgressView()
+                        .controlSize(.small)
+                }
+
                 Menu {
                     if !key.publicKey.isEmpty {
                         Button("Copy public key", systemImage: "doc.on.doc") {
@@ -163,6 +206,12 @@ struct KeyListView: View {
                         }
                         ShareLink(item: key.publicKey) {
                             Label("Share public key", systemImage: "square.and.arrow.up")
+                        }
+                        if authState.hasDigitalOceanToken {
+                            Button("Push to DigitalOcean", systemImage: "icloud.and.arrow.up") {
+                                pushKeyToDigitalOcean(key)
+                            }
+                            .disabled(pushingKeyID != nil)
                         }
                     }
                     if keysWithSavedPassphrase.contains(key.id) {
@@ -293,5 +342,36 @@ struct KeyListView: View {
             self.error = "\(error)"
         }
         reload()
+    }
+
+    private func pushKeyToDigitalOcean(_ key: StoredKey) {
+        guard proStore.isProUnlocked else {
+            AppHaptics.impact(.light)
+            showingPaywall = true
+            return
+        }
+        guard !key.publicKey.isEmpty else { return }
+        guard let token = DigitalOceanTokenStore.read() else {
+            authState.refresh()
+            self.error = DOError.missingToken.localizedDescription
+            return
+        }
+
+        AppHaptics.impact(.light)
+        pushingKeyID = key.id
+        Task {
+            defer { pushingKeyID = nil }
+            do {
+                let pushed = try await DigitalOceanClient(token: token).createSSHKey(
+                    name: key.name,
+                    publicKey: key.publicKey
+                )
+                AppHaptics.notify(.success)
+                pushSuccessMessage = "\"\(pushed.name)\" is now registered on your DigitalOcean account."
+            } catch {
+                AppHaptics.notify(.error)
+                self.error = error.localizedDescription
+            }
+        }
     }
 }
