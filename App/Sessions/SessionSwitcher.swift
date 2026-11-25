@@ -22,9 +22,12 @@ struct SessionSwitcher: View {
                             HStack(spacing: 10) {
                                 ConnectionStatusDot(status: live.connectionStatus, size: 8, glow: live.connectionStatus == .connected)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(live.title)
-                                        .font(.body.weight(isSelected ? .semibold : .medium))
-                                        .foregroundStyle(.primary)
+                                    HStack(spacing: 6) {
+                                        Text(live.title)
+                                            .font(.body.weight(isSelected ? .semibold : .medium))
+                                            .foregroundStyle(.primary)
+                                        AgentActivityBadge(state: live.agentActivityState)
+                                    }
                                     Text(live.connectionStatus.accessibilityLabel)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)

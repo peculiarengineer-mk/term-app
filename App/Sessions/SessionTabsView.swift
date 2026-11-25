@@ -32,6 +32,7 @@ struct ConnectionStatusDot: View {
 struct ActiveSessionPill: View {
     let title: String
     let status: LiveSession.ConnectionStatus
+    var agentActivityState: AgentActivityState = .idle
     let totalCount: Int
     let showSwitcher: Bool
     let isDark: Bool
@@ -57,9 +58,13 @@ struct ActiveSessionPill: View {
                     ConnectionStatusDot(status: status, size: 8, glow: true)
 
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("Active Session")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.secondary)
+                        HStack(spacing: 6) {
+                            Text("Active Session")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
+
+                            AgentActivityBadge(state: agentActivityState, showLabel: true)
+                        }
 
                         HStack(spacing: 4) {
                             Text(title)
@@ -215,6 +220,7 @@ struct SessionTabsView<HostList: View>: View {
             return ActiveSessionPill(
                 title: live.title,
                 status: live.connectionStatus,
+                agentActivityState: live.agentActivityState,
                 totalCount: totalCount,
                 showSwitcher: showSwitcher,
                 isDark: theme.isDark,
@@ -298,6 +304,11 @@ struct SessionTabsView<HostList: View>: View {
             tabOrder.removeAll { !liveSet.contains($0) && !pendingSet.contains($0) }
             if let s = selection, !tabOrder.contains(s) {
                 selection = tabOrder.last
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .termFocusAgentSession)) { note in
+            if let id = note.userInfo?[AgentNotificationManager.sessionIDKey] as? UUID {
+                addTab(id)
             }
         }
         .sheet(isPresented: $switching) {
@@ -458,6 +469,7 @@ struct SessionTabsView<HostList: View>: View {
                     Text(live.title)
                         .lineLimit(1)
                         .font(.subheadline.weight(isSelected ? .semibold : .medium))
+                    AgentActivityBadge(state: live.agentActivityState)
                 }
                 .padding(.vertical, isSelected ? 6 : 8)
             }
@@ -808,6 +820,8 @@ enum SessionToolSheet: Identifiable {
     case snippets(LiveSession)
     case sftp(LiveSession, SSHConnection)
     case portForwards(LiveSession, SSHConnection)
+    case gitDiff(LiveSession)
+    case devServerPreview(LiveSession)
     case paywall
 
     var id: String {
@@ -815,12 +829,14 @@ enum SessionToolSheet: Identifiable {
         case .snippets(let live): "snippets-\(live.id)"
         case .sftp(let live, _): "sftp-\(live.id)"
         case .portForwards(let live, _): "forwards-\(live.id)"
+        case .gitDiff(let live): "gitdiff-\(live.id)"
+        case .devServerPreview(let live): "preview-\(live.id)"
         case .paywall: "paywall"
         }
     }
 }
 
-/// Shared 40x40 tools menu for Snippets, SFTP Files, and Port Forwards across tab and window bars.
+/// Shared 40x40 tools menu for Snippets, SFTP Files, Port Forwards, Git Diff, and Dev Server Preview.
 struct SessionToolsMenu: View {
     let live: LiveSession
     let isProUnlocked: Bool
@@ -861,6 +877,30 @@ struct SessionToolsMenu: View {
                 }
             }
             .disabled(isProUnlocked && sshConnection == nil)
+
+            Divider()
+
+            Button("Git Diff", systemImage: "doc.text.magnifyingglass") {
+                AppHaptics.impact(.light)
+                guard isProUnlocked else {
+                    onSelect(.paywall)
+                    return
+                }
+                onSelect(.gitDiff(live))
+            }
+            .disabled(isProUnlocked && live.connectionStatus != .connected)
+
+            Button("Dev Server Preview", systemImage: "safari") {
+                AppHaptics.impact(.light)
+                guard isProUnlocked else {
+                    onSelect(.paywall)
+                    return
+                }
+                if sshConnection != nil {
+                    onSelect(.devServerPreview(live))
+                }
+            }
+            .disabled(isProUnlocked && (sshConnection == nil || live.connectionStatus != .connected))
 
             Divider()
 
@@ -905,6 +945,10 @@ private struct SessionToolSheetsModifier: ViewModifier {
                         SFTPBrowserView(connection: conn, hostTitle: live.title)
                     case .portForwards(let live, let conn):
                         PortForwardsView(connection: conn, hostID: live.hostID, hostTitle: live.title)
+                    case .gitDiff(let live):
+                        GitDiffInspectorSheet(live: live)
+                    case .devServerPreview(let live):
+                        DevServerPreviewSheet(live: live)
                     case .paywall:
                         ProPaywallView()
                     }

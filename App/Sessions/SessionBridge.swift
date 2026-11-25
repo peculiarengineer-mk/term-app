@@ -23,6 +23,8 @@ final class SessionBridge: TerminalIO {
         /// Whether the remote is on the alternate screen (vim, htop, tmux), tracked so a trimmed
         /// replay that lost the switch-in sequence still renders on the right screen.
         var altScreen = false
+        var onOutputChunk: (@Sendable ([UInt8]) -> Void)?
+        var onUserInput: (@Sendable ([UInt8]) -> Void)?
 
         private static let altOn = ["\u{1b}[?1049h", "\u{1b}[?1047h", "\u{1b}[?47h"].map { Data($0.utf8) }
         private static let altOff = ["\u{1b}[?1049l", "\u{1b}[?1047l", "\u{1b}[?47l", "\u{1b}c"].map { Data($0.utf8) }  // ESC c = reset
@@ -60,6 +62,16 @@ final class SessionBridge: TerminalIO {
     private enum OutboundEvent: Sendable {
         case bytes(Data)
         case resize(cols: Int, rows: Int)
+    }
+
+    var onOutputChunk: (@Sendable ([UInt8]) -> Void)? {
+        get { state.withLock { $0.onOutputChunk } }
+        set { state.withLock { $0.onOutputChunk = newValue } }
+    }
+
+    var onUserInput: (@Sendable ([UInt8]) -> Void)? {
+        get { state.withLock { $0.onUserInput } }
+        set { state.withLock { $0.onUserInput = newValue } }
     }
 
     /// Each access returns a fresh stream: replay of recent output, then live output.
@@ -102,10 +114,12 @@ final class SessionBridge: TerminalIO {
         let output = session.output
         self.drain = Task {
             for await data in output {
-                state.withLock { f in
+                let outputObserver = state.withLock { f -> (@Sendable ([UInt8]) -> Void)? in
                     f.append(data)
                     for c in f.subscribers.values { c.yield(data) }
+                    return f.onOutputChunk
                 }
+                outputObserver?(Array(data))
             }
             // Detach under the lock, finish outside it (finish re-enters the lock via onTermination).
             let ending: [AsyncStream<Data>.Continuation] = state.withLock { f in
@@ -132,6 +146,10 @@ final class SessionBridge: TerminalIO {
         drain.cancel()
     }
 
-    func send(_ bytes: [UInt8]) { outbound.yield(.bytes(Data(bytes))) }
+    func send(_ bytes: [UInt8]) {
+        outbound.yield(.bytes(Data(bytes)))
+        let inputObserver = state.withLock { $0.onUserInput }
+        inputObserver?(bytes)
+    }
     func resized(cols: Int, rows: Int) { outbound.yield(.resize(cols: cols, rows: rows)) }
 }

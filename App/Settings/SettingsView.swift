@@ -13,6 +13,7 @@ struct SettingsView: View {
     @AppStorage(AppearanceSettings.fontFamilyKey) private var fontFamilyRaw = AppearanceSettings.defaultFontFamilyRaw
     @AppStorage(AppearanceSettings.cursorStyleKey) private var cursorStyleRaw = AppearanceSettings.defaultCursorStyleRaw
     @AppStorage(AppearanceSettings.hapticsKey) private var hapticsEnabled = AppearanceSettings.defaultHapticsEnabled
+    @AppStorage(AgentNotificationManager.notificationsEnabledKey) private var agentNotificationsEnabled = true
     @State private var securityError: String?
     @State private var showingPaywall = false
 
@@ -148,6 +149,20 @@ struct SettingsView: View {
 
             Section {
                 NavigationLink("Command Snippets", destination: SnippetDrawerView(onRun: nil))
+            }
+
+            Section {
+                Toggle("Agent Alerts", isOn: $agentNotificationsEnabled)
+                    .onChange(of: agentNotificationsEnabled) { _, on in
+                        if on {
+                            AppHaptics.impact(.light)
+                            AgentNotificationManager.shared.requestAuthorizationIfNeeded()
+                        }
+                    }
+            } header: {
+                Text("AI Agents")
+            } footer: {
+                Text("Fires haptics and local notifications when an AI agent waits for approval or finishes responding while you are away or on another tab.")
             }
 
             Section("Cloud") {

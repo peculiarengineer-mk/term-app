@@ -90,7 +90,7 @@ struct ProPaywallView: View {
                 icon: "sparkles",
                 tint: Self.appleProAmber,
                 title: "AI Agent Sessions",
-                subtitle: "Launch & reattach Claude Code, agy, Codex & custom CLIs in persistent tmux sessions with mobile Prompt Composer & quick actions."
+                subtitle: "Launch & reattach Claude Code, agy, Codex & custom CLIs in persistent tmux sessions with Prompt Composer, Photo Attach, Git Diff, Dev Server Preview & alerts."
             )
 
             Divider()

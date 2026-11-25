@@ -82,10 +82,12 @@ struct TerminalPane: View {
         .id(ObjectIdentifier(live.bridge))
         .onAppear {
             isVisible = true
+            live.terminalAppeared()
             syncExtraKeysBar()
         }
         .onDisappear {
             isVisible = false
+            live.terminalDisappeared()
             zoomHUDTask?.cancel()
             zoomHUDTask = nil
         }
@@ -301,6 +303,7 @@ struct SessionSceneView: View {
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(theme.foregroundColor)
                         .lineLimit(1)
+                    AgentActivityBadge(state: live.agentActivityState)
                 }
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)

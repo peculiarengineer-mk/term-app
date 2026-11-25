@@ -1,4 +1,6 @@
+import PhotosUI
 import SwiftUI
+import SSHKit
 import Store
 import TermUI
 
@@ -8,6 +10,11 @@ struct AITerminalControlsOverlay: View {
     let theme: TerminalTheme
 
     @State private var isComposerExpanded = false
+    @State private var isUploadingPhoto = false
+    @State private var photoUploadError: String?
+    @State private var showingGitDiff = false
+    @State private var showingDevPreview = false
+    @State private var uploadTask: Task<Void, Never>?
 
     private var accentTint: Color {
         if let context = live.aiAgentContext {
@@ -18,6 +25,10 @@ struct AITerminalControlsOverlay: View {
 
     private var isConnected: Bool {
         live.connectionStatus == .connected
+    }
+
+    private var canUseSSH: Bool {
+        isConnected && live.session is SSHConnection
     }
 
     private var showNoTmuxNotice: Bool {
@@ -37,7 +48,16 @@ struct AITerminalControlsOverlay: View {
                     agentName: live.aiAgentContext?.agent.name,
                     accentTint: accentTint,
                     isConnected: isConnected,
+                    canUploadPhoto: canUseSSH,
+                    isUploadingPhoto: isUploadingPhoto,
+                    photoUploadError: photoUploadError,
                     theme: theme,
+                    onPickPhoto: { item in
+                        uploadPhoto(item)
+                    },
+                    onDismissPhotoError: {
+                        photoUploadError = nil
+                    },
                     onSend: {
                         sendBracketedPrompt(submit: true)
                     },
@@ -55,9 +75,18 @@ struct AITerminalControlsOverlay: View {
                 accentTint: accentTint,
                 isComposerExpanded: isComposerExpanded,
                 isConnected: isConnected,
+                canPreview: canUseSSH,
                 theme: theme,
                 onSendText: { sequence in
                     sendRaw(sequence)
+                },
+                onOpenGitDiff: {
+                    AppHaptics.impact(.light)
+                    showingGitDiff = true
+                },
+                onOpenPreview: {
+                    AppHaptics.impact(.light)
+                    showingDevPreview = true
                 },
                 onToggleComposer: {
                     AppHaptics.impact(.light)
@@ -66,6 +95,50 @@ struct AITerminalControlsOverlay: View {
                     }
                 }
             )
+        }
+        .sheet(isPresented: $showingGitDiff) {
+            GitDiffInspectorSheet(live: live)
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+        }
+        .sheet(isPresented: $showingDevPreview) {
+            DevServerPreviewSheet(live: live)
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+        }
+        .onDisappear {
+            uploadTask?.cancel()
+            uploadTask = nil
+        }
+    }
+
+    private func uploadPhoto(_ item: PhotosPickerItem) {
+        guard !isUploadingPhoto else { return }
+        uploadTask?.cancel()
+        isUploadingPhoto = true
+        photoUploadError = nil
+
+        let session = live.session
+        uploadTask = Task { @MainActor in
+            defer {
+                isUploadingPhoto = false
+                uploadTask = nil
+            }
+            do {
+                let remotePath = try await PhotoAttachmentUploader.upload(item: item, session: session)
+                guard !Task.isCancelled else { return }
+                live.aiPromptDraft = RemoteAttachmentHelper.promptInsertion(
+                    forRemotePath: remotePath,
+                    existingPrompt: live.aiPromptDraft
+                )
+                AppHaptics.notify(.success)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled else { return }
+                photoUploadError = error.localizedDescription
+                AppHaptics.notify(.error)
+            }
         }
     }
 
@@ -145,8 +218,11 @@ struct AIQuickActionBar: View {
     let accentTint: Color
     let isComposerExpanded: Bool
     let isConnected: Bool
+    let canPreview: Bool
     let theme: TerminalTheme
     let onSendText: (String) -> Void
+    let onOpenGitDiff: () -> Void
+    let onOpenPreview: () -> Void
     let onToggleComposer: () -> Void
 
     private var surfaceBorder: Color {
@@ -215,6 +291,25 @@ struct AIQuickActionBar: View {
                         onSendText("\u{03}")
                     }
 
+                    actionChip(
+                        title: "Diff",
+                        systemImage: "doc.text.magnifyingglass",
+                        tint: nil,
+                        accessibilityLabel: "Inspect Git diff and changed files"
+                    ) {
+                        onOpenGitDiff()
+                    }
+
+                    actionChip(
+                        title: "Preview",
+                        systemImage: "safari",
+                        tint: nil,
+                        isEnabled: canPreview,
+                        accessibilityLabel: "Preview remote dev server"
+                    ) {
+                        onOpenPreview()
+                    }
+
                     composeButton
                 }
                 .padding(.horizontal, 10)
@@ -233,9 +328,11 @@ struct AIQuickActionBar: View {
         title: String,
         systemImage: String,
         tint: Color?,
+        isEnabled: Bool? = nil,
         accessibilityLabel: String,
         action: @escaping () -> Void
     ) -> some View {
+        let enabled = isEnabled ?? isConnected
         let chipFill = tint.map { $0.opacity(theme.isDark ? 0.16 : 0.12) }
             ?? (theme.isDark ? Color.white.opacity(0.08) : Color.black.opacity(0.06))
         let chipStroke = tint.map { $0.opacity(0.36) } ?? surfaceBorder
@@ -255,8 +352,8 @@ struct AIQuickActionBar: View {
             .overlay(Capsule().strokeBorder(chipStroke, lineWidth: 0.75))
         }
         .buttonStyle(.plain)
-        .disabled(!isConnected)
-        .opacity(isConnected ? 1 : 0.45)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.45)
         .accessibilityLabel(accessibilityLabel)
     }
 
@@ -288,18 +385,24 @@ struct AIQuickActionBar: View {
     }
 }
 
-/// Docked expandable multi-line prompt composer with native autocorrect, cursor drag, and voice dictation.
+/// Docked expandable multi-line prompt composer with native autocorrect, cursor drag, photo attach, and dictation.
 struct AIPromptComposerView: View {
     @Binding var prompt: String
     let agentName: String?
     let accentTint: Color
     let isConnected: Bool
+    let canUploadPhoto: Bool
+    let isUploadingPhoto: Bool
+    let photoUploadError: String?
     let theme: TerminalTheme
+    let onPickPhoto: (PhotosPickerItem) -> Void
+    let onDismissPhotoError: () -> Void
     let onSend: () -> Void
     let onPaste: () -> Void
     let onDismissComposer: () -> Void
 
     @FocusState private var isFieldFocused: Bool
+    @State private var selectedPhotoItem: PhotosPickerItem?
 
     private var hasText: Bool {
         !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -379,7 +482,57 @@ struct AIPromptComposerView: View {
                 )
                 .padding(.horizontal, 12)
 
+            if isUploadingPhoto {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Uploading image to /tmp via SFTP…")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(theme.secondaryForegroundColor)
+                    Spacer()
+                }
+                .padding(.horizontal, 14)
+            } else if let photoUploadError {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                    Text(photoUploadError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(2)
+                    Spacer(minLength: 4)
+                    Button {
+                        onDismissPhotoError()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss upload error")
+                }
+                .padding(.horizontal, 14)
+            }
+
             HStack(spacing: 10) {
+                PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                    Group {
+                        if isUploadingPhoto {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "photo.badge.plus")
+                                .font(.subheadline.weight(.semibold))
+                        }
+                    }
+                    .frame(width: 24, height: 20)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.regular)
+                .disabled(!canUploadPhoto || isUploadingPhoto)
+                .accessibilityLabel("Attach screenshot or photo via SFTP")
+
                 Button {
                     isFieldFocused = false
                     onPaste()
@@ -415,6 +568,12 @@ struct AIPromptComposerView: View {
                 theme.backgroundColor.opacity(0.90)
                 Rectangle().fill(.ultraThinMaterial)
             }
+        }
+        .onChange(of: selectedPhotoItem) { _, newItem in
+            guard let newItem else { return }
+            selectedPhotoItem = nil
+            AppHaptics.impact(.light)
+            onPickPhoto(newItem)
         }
         .onAppear {
             DispatchQueue.main.async {

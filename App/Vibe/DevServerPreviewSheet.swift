@@ -1,0 +1,350 @@
+import SwiftUI
+import SSHKit
+import Store
+import TermUI
+
+/// Sheet detecting listening ports on the remote host, auto-forwarding via `-L`, and previewing in-app.
+struct DevServerPreviewSheet: View {
+    private struct PreviewTarget: Identifiable {
+        let id = UUID()
+        let url: URL
+    }
+
+    let live: LiveSession
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
+
+    @State private var ports: [ListeningPort] = []
+    @State private var activeForwards: [ActivePortForward] = []
+    @State private var isLoading = false
+    @State private var loadError: String?
+    @State private var actionError: String?
+    @State private var forwardingPort: UInt16?
+    @State private var customPortText = ""
+    @State private var previewTarget: PreviewTarget?
+    @State private var loadGeneration = 0
+    @State private var didInitialLoad = false
+    @FocusState private var isCustomPortFocused: Bool
+
+    private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var sshConnection: SSHConnection? { live.session as? SSHConnection }
+    private var devServerPorts: [ListeningPort] { ports.filter(\.isLikelyDevServer) }
+    private var otherPorts: [ListeningPort] { ports.filter { !$0.isLikelyDevServer } }
+
+    private var parsedCustomPort: UInt16? {
+        let trimmed = customPortText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let port = UInt16(trimmed), port > 0 else { return nil }
+        return port
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if !devServerPorts.isEmpty {
+                    Section("Dev Servers") {
+                        ForEach(devServerPorts) { port in
+                            portRow(port)
+                        }
+                    }
+                }
+
+                if !otherPorts.isEmpty {
+                    Section("Other Listening Ports") {
+                        ForEach(otherPorts) { port in
+                            portRow(port)
+                        }
+                    }
+                }
+
+                if !isLoading && ports.isEmpty && loadError == nil {
+                    Section("Detected Ports") {
+                        HStack(spacing: 10) {
+                            Image(systemName: "network.slash")
+                                .foregroundStyle(.secondary)
+                            Text("No listening TCP ports detected on the remote host.")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+
+                customPortSection
+            }
+            .listStyle(.insetGrouped)
+            .overlay {
+                if isLoading && ports.isEmpty {
+                    ProgressView("Scanning listening ports…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let loadError, ports.isEmpty {
+                    ContentUnavailableView {
+                        Label("Could Not Scan Ports", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(loadError)
+                    } actions: {
+                        Button("Retry") {
+                            Task { await reload() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(AgentVisuals.appleProAmber)
+                    }
+                }
+            }
+            .refreshable {
+                await reload()
+            }
+            .navigationTitle("Dev Server Preview")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        AppHaptics.impact(.light)
+                        Task { await reload() }
+                    } label: {
+                        if isLoading {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    .disabled(isLoading || forwardingPort != nil)
+                }
+
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { isCustomPortFocused = false }
+                }
+            }
+            .task {
+                guard !didInitialLoad else { return }
+                didInitialLoad = true
+                await reload()
+            }
+            .sheet(item: $previewTarget) { target in
+                InAppSafariView(url: target.url, tintColor: theme.accentColor)
+                    .ignoresSafeArea()
+            }
+            .alert(
+                "Preview Failed",
+                isPresented: Binding(get: { actionError != nil }, set: { if !$0 { actionError = nil } })
+            ) {
+                Button("OK") {}
+            } message: {
+                Text(actionError ?? "")
+            }
+        }
+    }
+
+    private var customPortSection: some View {
+        Section {
+            HStack(spacing: 10) {
+                TextField("Port (e.g. 3000)", text: $customPortText)
+                    .keyboardType(.numberPad)
+                    .font(.system(.body, design: .monospaced))
+                    .focused($isCustomPortFocused)
+
+                Button {
+                    guard let port = parsedCustomPort else { return }
+                    Task { await preview(port: port, processName: nil) }
+                } label: {
+                    if let customPort = parsedCustomPort, forwardingPort == customPort {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Label("Preview", systemImage: "safari")
+                            .fontWeight(.semibold)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(AgentVisuals.appleProAmber)
+                .disabled(parsedCustomPort == nil || forwardingPort != nil || sshConnection == nil)
+            }
+        } header: {
+            Text("Custom Port")
+        } footer: {
+            Text("Creates an ephemeral local SSH tunnel (-L 0:127.0.0.1:port) and opens it in-app.")
+        }
+    }
+
+    private func portRow(_ port: ListeningPort) -> some View {
+        let existingForward = activeForward(for: port.port)
+        let isBusy = forwardingPort == port.port
+        let accent = port.isLikelyDevServer ? AgentVisuals.appleProAmber : Color.secondary
+
+        return Button {
+            AppHaptics.impact(.light)
+            Task { await preview(port: port.port, processName: port.processName) }
+        } label: {
+            HStack(spacing: 12) {
+                SquircleIcon(
+                    symbolName: port.isLikelyDevServer ? "safari.fill" : "network",
+                    tint: accent,
+                    fillOpacity: theme.isDark ? 0.20 : 0.12,
+                    rimOpacity: 0.36,
+                    size: 34
+                )
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Text(port.processName ?? (port.isLikelyDevServer ? "Dev Server" : "Listening Socket"))
+                            .font(.headline)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Text(":\(port.port)")
+                            .font(.system(.caption, design: .monospaced).weight(.bold))
+                            .foregroundStyle(accent)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(accent.opacity(theme.isDark ? 0.18 : 0.12), in: Capsule())
+                    }
+
+                    HStack(spacing: 6) {
+                        Text("\(port.address):\(port.port)")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+
+                        if let existingForward {
+                            Text("· Tunneled :\(existingForward.boundLocalPort)")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.green)
+                        }
+                    }
+                }
+
+                Spacer(minLength: 8)
+
+                if isBusy {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "safari")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(AgentVisuals.appleProAmber)
+                        .accessibilityHidden(true)
+                }
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(forwardingPort != nil || sshConnection == nil)
+        .contextMenu {
+            Button("Open Preview", systemImage: "safari") {
+                Task { await preview(port: port.port, processName: port.processName) }
+            }
+            if let existingForward {
+                Button("Stop Tunnel", systemImage: "stop.circle", role: .destructive) {
+                    Task { await stopForward(existingForward.id) }
+                }
+            }
+        }
+    }
+
+    private func activeForward(for remotePort: UInt16) -> ActivePortForward? {
+        activeForwards.first { forward in
+            forward.rule.remotePort == remotePort && isLoopbackHost(forward.rule.remoteHost)
+        }
+    }
+
+    private func isLoopbackHost(_ host: String) -> Bool {
+        let normalized = host.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "127.0.0.1" || normalized == "localhost" || normalized == "::1"
+    }
+
+    private func reload() async {
+        loadGeneration += 1
+        let generation = loadGeneration
+        isLoading = true
+        loadError = nil
+
+        do {
+            async let commandTask = live.session.exec(
+                ListeningPortsHelper.listListeningPortsCommand(),
+                timeout: .seconds(10)
+            )
+            async let forwardsTask: [ActivePortForward] = sshConnection?.activePortForwards() ?? []
+
+            let (result, forwards) = try await (commandTask, forwardsTask)
+            guard !Task.isCancelled, generation == loadGeneration else { return }
+
+            ports = ListeningPortsHelper.parseListeningPorts(from: result.stdout)
+            activeForwards = forwards
+            isLoading = false
+        } catch is CancellationError {
+            if generation == loadGeneration {
+                isLoading = false
+            }
+        } catch {
+            guard generation == loadGeneration else { return }
+            isLoading = false
+            if ports.isEmpty {
+                loadError = error.localizedDescription
+            } else {
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func preview(port: UInt16, processName: String?) async {
+        isCustomPortFocused = false
+        guard let connection = sshConnection else {
+            actionError = "An active SSH connection is required for port forwarding."
+            return
+        }
+
+        forwardingPort = port
+        defer { forwardingPort = nil }
+
+        do {
+            let currentForwards = await connection.activePortForwards()
+            activeForwards = currentForwards
+
+            let boundLocalPort: UInt16
+            if let existing = currentForwards.first(where: {
+                $0.rule.remotePort == port && isLoopbackHost($0.rule.remoteHost)
+            }) {
+                boundLocalPort = existing.boundLocalPort
+            } else {
+                let trimmedName = processName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let ruleName = trimmedName.isEmpty ? "Preview :\(port)" : "\(trimmedName) (:\(port))"
+                let started = try await connection.startLocalForward(
+                    PortForwardRule(
+                        name: ruleName,
+                        localPort: 0,
+                        remoteHost: "127.0.0.1",
+                        remotePort: port
+                    )
+                )
+                boundLocalPort = started.boundLocalPort
+                activeForwards = await connection.activePortForwards()
+            }
+
+            guard let url = URL(string: "http://127.0.0.1:\(boundLocalPort)") else {
+                actionError = "Could not build local preview URL for port \(boundLocalPort)."
+                return
+            }
+
+            AppHaptics.notify(.success)
+            previewTarget = PreviewTarget(url: url)
+        } catch {
+            AppHaptics.notify(.error)
+            actionError = "Could not forward port \(port): \(error.localizedDescription)"
+        }
+    }
+
+    private func stopForward(_ id: UUID) async {
+        guard let connection = sshConnection else { return }
+        await connection.stopLocalForward(id: id)
+        activeForwards = await connection.activePortForwards()
+        AppHaptics.notify(.warning)
+    }
+}

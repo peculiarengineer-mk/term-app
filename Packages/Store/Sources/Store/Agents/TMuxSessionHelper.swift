@@ -110,7 +110,7 @@ public enum TMuxSessionHelper {
     }
 
     /// Expands a leading `~` / `~/` safely into `"$HOME"` while single-quoting literal path suffixes.
-    static func shellPathExpression(for path: String) -> String {
+    public static func shellPathExpression(for path: String) -> String {
         let cleaned = path
             .replacingOccurrences(of: "\0", with: "")
             .trimmingCharacters(in: .newlines)

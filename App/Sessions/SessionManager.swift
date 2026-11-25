@@ -23,7 +23,17 @@ final class LiveSession: Identifiable {
     let controller: TerminalController
     let bar: ExtraKeysBar
     /// Live connection status driven by `ReconnectCoordinator` (single consumer of `session.state`).
-    var connectionStatus: ConnectionStatus = .connected
+    var connectionStatus: ConnectionStatus = .connected {
+        didSet {
+            if connectionStatus != .connected {
+                completionDebounceTask?.cancel()
+                completionDebounceTask = nil
+                if case .running = agentActivityState {
+                    agentActivityState = .idle
+                }
+            }
+        }
+    }
     /// Drawn over the terminal by whichever tab shows this session (T9 uses it for the Reconnect prompt).
     var overlay: AnyView?
     /// What the last handshake negotiated; nil when unknown.
@@ -43,9 +53,45 @@ final class LiveSession: Identifiable {
     /// One-shot launch/attach command sent once the session is connected, then cleared.
     var pendingLaunchCommand: String?
     /// Controls visibility of the docked mobile AI Quick-Action Bar & Prompt Composer.
-    var showAIAgentControls: Bool
+    var showAIAgentControls: Bool {
+        didSet {
+            if showAIAgentControls {
+                AgentNotificationManager.shared.requestAuthorizationIfNeeded()
+            } else if !isAgentActivityTracked {
+                outputTailData.removeAll(keepingCapacity: false)
+                agentActivityState = .idle
+            }
+        }
+    }
     /// Preserves in-progress multi-line prompt text across tab switches.
     var aiPromptDraft: String = ""
+    /// Live AI agent execution state inferred from terminal output and user input.
+    var agentActivityState: AgentActivityState = .idle {
+        didSet {
+            if case .running = agentActivityState { return }
+            completionDebounceTask?.cancel()
+            completionDebounceTask = nil
+        }
+    }
+
+    @ObservationIgnored private var outputTailData = Data()
+    @ObservationIgnored nonisolated(unsafe) private var completionDebounceTask: Task<Void, Never>?
+    @ObservationIgnored private var visibleTerminalCount = 0
+
+    private static let maxOutputTailBytes = 2048
+    private static let completionDebounceDuration: Duration = .seconds(4)
+
+    var isAgentActivityTracked: Bool {
+        aiAgentContext != nil || showAIAgentControls
+    }
+
+    var isTerminalVisible: Bool {
+        visibleTerminalCount > 0
+    }
+
+    private var activityAgentName: String {
+        aiAgentContext?.agent.name ?? title
+    }
 
     init(
         id: UUID = UUID(),
@@ -76,6 +122,23 @@ final class LiveSession: Identifiable {
         bar.hapticsEnabled = AppearanceSettings.hapticsEnabled()
         bar.onDismissKeyboard = { [weak c] in c?.dismissKeyboard() }
         self.bar = bar
+        attachActivityObservers(to: bridge)
+    }
+
+    func terminalAppeared() {
+        visibleTerminalCount += 1
+    }
+
+    func terminalDisappeared() {
+        visibleTerminalCount = max(0, visibleTerminalCount - 1)
+    }
+
+    func cleanupActivityTracking() {
+        completionDebounceTask?.cancel()
+        completionDebounceTask = nil
+        outputTailData.removeAll(keepingCapacity: false)
+        bridge.onOutputChunk = nil
+        bridge.onUserInput = nil
     }
 
     /// Dispatches `pendingLaunchCommand` once after the shell connects and clears it so reconnects never re-send.
@@ -102,10 +165,122 @@ final class LiveSession: Identifiable {
     }
 
     fileprivate func replace(session: any Session, bridge: SessionBridge, algorithms: NegotiatedAlgorithms?) {
+        cleanupActivityTracking()
         self.session = session; self.bridge = bridge
         self.algorithms = algorithms
         connectionStatus = .connected
         quantumNoticeDismissed = false
+        agentActivityState = .idle
+        attachActivityObservers(to: bridge)
+    }
+
+    private func attachActivityObservers(to targetBridge: SessionBridge) {
+        targetBridge.onOutputChunk = { [weak self, weak targetBridge] chunk in
+            Task { @MainActor [weak self] in
+                guard let self, let targetBridge, self.bridge === targetBridge else { return }
+                self.handleOutputChunk(chunk)
+            }
+        }
+        targetBridge.onUserInput = { [weak self, weak targetBridge] bytes in
+            Task { @MainActor [weak self] in
+                guard let self, let targetBridge, self.bridge === targetBridge else { return }
+                self.handleUserInput(bytes)
+            }
+        }
+    }
+
+    private func handleOutputChunk(_ chunk: [UInt8]) {
+        guard isAgentActivityTracked, !chunk.isEmpty else { return }
+
+        outputTailData.append(contentsOf: chunk)
+        if outputTailData.count > Self.maxOutputTailBytes {
+            var trimmed = outputTailData.suffix(Self.maxOutputTailBytes)
+            while let first = trimmed.first, (first & 0xC0) == 0x80 {
+                trimmed = trimmed.dropFirst()
+            }
+            outputTailData = Data(trimmed)
+        }
+
+        let tailText = String(decoding: outputTailData, as: UTF8.self)
+        if let approvalPrompt = AgentActivityDetector.detectApprovalPrompt(in: tailText) {
+            completionDebounceTask?.cancel()
+            completionDebounceTask = nil
+            let nextState = AgentActivityState.waitingForApproval(prompt: approvalPrompt)
+            if agentActivityState != nextState {
+                agentActivityState = nextState
+                AgentNotificationManager.shared.notifyIfNeeded(
+                    sessionTitle: title,
+                    agentName: activityAgentName,
+                    state: nextState,
+                    isActiveVisibleTab: isTerminalVisible,
+                    sessionID: id
+                )
+            }
+            return
+        }
+
+        let chunkText = String(decoding: chunk, as: UTF8.self)
+        guard AgentActivityDetector.isMeaningfulOutput(chunkText) else { return }
+
+        if agentActivityState != .running {
+            agentActivityState = .running
+        }
+        scheduleCompletionDebounce()
+    }
+
+    private func handleUserInput(_ bytes: [UInt8]) {
+        guard !bytes.isEmpty, !Self.isTerminalQueryResponse(bytes) else { return }
+
+        outputTailData.removeAll(keepingCapacity: true)
+        completionDebounceTask?.cancel()
+        completionDebounceTask = nil
+
+        let resetState: AgentActivityState = isAgentActivityTracked ? .running : .idle
+        if agentActivityState != resetState {
+            agentActivityState = resetState
+        }
+    }
+
+    private func scheduleCompletionDebounce() {
+        completionDebounceTask?.cancel()
+        completionDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: Self.completionDebounceDuration)
+            guard !Task.isCancelled,
+                  let self,
+                  self.isAgentActivityTracked,
+                  self.connectionStatus == .connected,
+                  case .running = self.agentActivityState else {
+                return
+            }
+            self.agentActivityState = .completed
+            AgentNotificationManager.shared.notifyIfNeeded(
+                sessionTitle: self.title,
+                agentName: self.activityAgentName,
+                state: .completed,
+                isActiveVisibleTab: self.isTerminalVisible,
+                sessionID: self.id
+            )
+        }
+    }
+
+    private static func isTerminalQueryResponse(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count >= 4, bytes[0] == 0x1B else { return false }
+        if bytes[1] == 0x5D {
+            // OSC responses (e.g. color queries ESC ] 10 ; rgb:...)
+            return true
+        }
+        guard bytes[1] == 0x5B, let last = bytes.last else { return false }
+        if last == 0x52 { // DSR cursor report: ESC [ <digits/;> R
+            return bytes.dropFirst(2).dropLast().allSatisfy {
+                ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x3B || $0 == 0x3F
+            }
+        }
+        if last == 0x63 { // DA response: ESC [ ? <digits/;> c
+            return bytes.dropFirst(2).dropLast().allSatisfy {
+                ($0 >= 0x30 && $0 <= 0x39) || $0 == 0x3B || $0 == 0x3F || $0 == 0x3E
+            }
+        }
+        return false
     }
 }
 
@@ -145,6 +320,9 @@ final class SessionManager {
             isTmuxBacked: isTmuxBacked
         )
         sessions.append(live)
+        if aiAgentContext != nil {
+            AgentNotificationManager.shared.requestAuthorizationIfNeeded()
+        }
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
         startAutoPortForwards(for: hostID, on: session)
         onSessionsChanged?()
@@ -215,6 +393,7 @@ final class SessionManager {
     func close(_ id: UUID) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         let live = sessions.remove(at: i)
+        live.cleanupActivityTracking()
         onSessionsChanged?()
         let session = live.session
         Task { await session.close() }
