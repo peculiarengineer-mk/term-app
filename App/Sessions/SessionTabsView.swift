@@ -145,6 +145,7 @@ struct SessionTabsView<HostList: View>: View {
         }
     }
 
+    let onFocusHosts: () -> Void
     @ViewBuilder let hostList: (ActiveSessionPill?) -> HostList
     @Environment(\.modelContext) private var modelContext
     @Environment(SessionManager.self) private var manager
@@ -152,6 +153,15 @@ struct SessionTabsView<HostList: View>: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
+    @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
+
+    init(
+        onFocusHosts: @escaping () -> Void = {},
+        @ViewBuilder hostList: @escaping (ActiveSessionPill?) -> HostList
+    ) {
+        self.onFocusHosts = onFocusHosts
+        self.hostList = hostList
+    }
     /// Lives as long as this view. If iOS rebuilds a disconnected scene, its sessions stay open and
     /// are reachable from the switcher (accepted for M1).
     @State private var windowID = UUID()
@@ -196,6 +206,10 @@ struct SessionTabsView<HostList: View>: View {
     private var selectedPending: PendingConnection? {
         guard let selection else { return nil }
         return pendingConnections.first(where: { $0.id == selection })
+    }
+
+    private var isTerminalActive: Bool {
+        selectedLive != nil || selectedPending != nil
     }
 
     private var activeSessionPill: ActiveSessionPill? {
@@ -293,6 +307,7 @@ struct SessionTabsView<HostList: View>: View {
                 )
             }
         }
+        .background { keyboardShortcutsLayer }
         .onChange(of: selection) { _, newSelection in
             if let newSelection {
                 lastSelectedID = newSelection
@@ -672,6 +687,7 @@ struct SessionTabsView<HostList: View>: View {
 
     private func requestCloseLive(_ live: LiveSession) {
         if live.connectionStatus == .connected {
+            AppHaptics.impact(.light)
             closingTab = live
         } else {
             AppHaptics.impact(.light)
@@ -694,19 +710,137 @@ struct SessionTabsView<HostList: View>: View {
         openWindow(value: id)
     }
 
-    fileprivate func newTab() { selection = nil }
+    fileprivate func newTab() {
+        AppHaptics.impact(.light)
+        selection = nil
+        onFocusHosts()
+    }
 
     fileprivate func closeCurrent() {
         guard let s = selection else { return }
         if let live = windowLiveSessions.first(where: { $0.id == s }) {
             requestCloseLive(live)
         } else if pendingConnections.contains(where: { $0.id == s }) {
+            AppHaptics.impact(.light)
             cancelPending(s)
         }
     }
 
     fileprivate func switchTab(_ index: Int) {
-        if tabOrder.indices.contains(index) { selection = tabOrder[index] }
+        let entries = tabEntries
+        guard entries.indices.contains(index) else { return }
+        let targetID = entries[index].id
+        if selection != targetID {
+            AppHaptics.impact(.light)
+            selection = targetID
+        }
+    }
+
+    private func adjustFontSize(by delta: Double) {
+        let clamped = min(max(fontSize + delta, AppearanceSettings.minFontSize), AppearanceSettings.maxFontSize)
+        fontSize = clamped
+        AppHaptics.impact(.light)
+    }
+
+    private func resetFontSize() {
+        fontSize = AppearanceSettings.defaultFontSize
+        AppHaptics.impact(.light)
+    }
+
+    private func openGitDiffShortcut() {
+        guard activeToolSheet == nil,
+              !switching,
+              closingTab == nil,
+              inspectingSecurity == nil,
+              let live = selectedLive,
+              live.connectionStatus == .connected else {
+            return
+        }
+        AppHaptics.impact(.light)
+        activeToolSheet = proStore.isProUnlocked ? .gitDiff(live) : .paywall
+    }
+
+    private func openDevServerPreviewShortcut() {
+        guard activeToolSheet == nil,
+              !switching,
+              closingTab == nil,
+              inspectingSecurity == nil,
+              let live = selectedLive,
+              live.connectionStatus == .connected else {
+            return
+        }
+        AppHaptics.impact(.light)
+        if !proStore.isProUnlocked {
+            activeToolSheet = .paywall
+        } else if live.session is SSHConnection {
+            activeToolSheet = .devServerPreview(live)
+        }
+    }
+
+    @ViewBuilder
+    private var keyboardShortcutsLayer: some View {
+        let modalFree = activeToolSheet == nil && !switching && closingTab == nil && inspectingSecurity == nil
+        ZStack {
+            if isTerminalActive && modalFree {
+                shortcutButton("Hosts Quick Connect", key: "t", modifiers: .command) {
+                    newTab()
+                }
+                shortcutButton("Close Tab", key: "w", modifiers: .command) {
+                    closeCurrent()
+                }
+
+                ForEach(1...9, id: \.self) { number in
+                    if tabEntries.indices.contains(number - 1) {
+                        shortcutButton(
+                            "Switch to Tab \(number)",
+                            key: KeyEquivalent(Character(String(number))),
+                            modifiers: .command
+                        ) {
+                            switchTab(number - 1)
+                        }
+                    }
+                }
+
+                if selectedLive != nil {
+                    shortcutButton("Increase Font Size", key: "=", modifiers: .command) {
+                        adjustFontSize(by: 1)
+                    }
+                    shortcutButton("", key: "+", modifiers: .command) {
+                        adjustFontSize(by: 1)
+                    }
+                    shortcutButton("", key: "+", modifiers: [.command, .shift]) {
+                        adjustFontSize(by: 1)
+                    }
+                    shortcutButton("Decrease Font Size", key: "-", modifiers: .command) {
+                        adjustFontSize(by: -1)
+                    }
+                    shortcutButton("Reset Font Size", key: "0", modifiers: .command) {
+                        resetFontSize()
+                    }
+                    shortcutButton("Git Diff Inspector", key: "d", modifiers: [.command, .shift]) {
+                        openGitDiffShortcut()
+                    }
+                    shortcutButton("Dev Server Preview", key: "p", modifiers: [.command, .shift]) {
+                        openDevServerPreviewShortcut()
+                    }
+                }
+            }
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func shortcutButton(
+        _ title: String,
+        key: KeyEquivalent,
+        modifiers: EventModifiers,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .keyboardShortcut(key, modifiers: modifiers)
     }
 }
 

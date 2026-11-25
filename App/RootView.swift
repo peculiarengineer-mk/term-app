@@ -10,12 +10,14 @@ struct RootView: View {
     }
 
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
+    @AppStorage("onboarding.completed") private var onboardingCompleted = false
     @State private var selectedTab: AppTab = .hosts
+    @State private var showingWelcome = false
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
 
     var body: some View {
-        SessionTabsView { activeSessionPill in // wiring: T8
+        SessionTabsView(onFocusHosts: { selectedTab = .hosts }) { activeSessionPill in // wiring: T8
             TabView(selection: $selectedTab) {
                 tabContent(activeSessionPill: activeSessionPill) {
                     HostListView() // wiring: T7
@@ -52,6 +54,22 @@ struct RootView: View {
         .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
         .tint(theme.accentColor)
         .modifier(PrivacyBlurModifier())
+        .onAppear {
+            if !onboardingCompleted {
+                showingWelcome = true
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("TermAppReplayOnboarding"))) { _ in
+            showingWelcome = true
+        }
+        .sheet(isPresented: $showingWelcome, onDismiss: {
+            onboardingCompleted = true
+        }) {
+            WelcomeSheetView()
+                .interactiveDismissDisabled(false)
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+        }
     }
 
     private func tabContent<Content: View>(

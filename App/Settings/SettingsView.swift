@@ -211,9 +211,7 @@ struct SettingsView: View {
             } footer: {
                 Text("Syncs saved hosts, saved passwords and trusted host keys through iCloud. Takes effect the next time the app opens. Turning sync off keeps everything on this device and leaves what is already in iCloud in place.")
             }
-            Section {
-                NavigationLink("Licences", destination: LicencesView())
-            }
+            aboutLegalSection
             #if DEBUG
             Section("Debug") {
                 NavigationLink("Sync tools", destination: DebugSyncTools())
@@ -240,6 +238,68 @@ struct SettingsView: View {
             ProPaywallView()
                 .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: currentTheme))
                 .tint(currentTheme.accentColor)
+        }
+    }
+
+    private var appVersionSummary: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "\(version) (\(build))"
+    }
+
+    private var aboutLegalSection: some View {
+        Section("About & Legal") {
+            HStack {
+                Text("Version")
+                Spacer()
+                Text(appVersionSummary)
+                    .font(.subheadline.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+
+            externalLinkRow(
+                title: "Privacy Policy",
+                urlString: "https://github.com/peculiarengineer-mk/term-app/blob/main/PRIVACY.md"
+            )
+
+            externalLinkRow(
+                title: "Terms of Use",
+                urlString: "https://github.com/peculiarengineer-mk/term-app/blob/main/TERMS.md"
+            )
+
+            externalLinkRow(
+                title: "Support & Feedback",
+                urlString: "https://github.com/peculiarengineer-mk/term-app/blob/main/SUPPORT.md"
+            )
+
+            externalLinkRow(
+                title: "Report an Issue",
+                urlString: "https://github.com/peculiarengineer-mk/term-app/issues"
+            )
+
+            NavigationLink("Licences", destination: LicencesView())
+
+            Button("Replay Welcome Guide") {
+                AppHaptics.impact(.light)
+                NotificationCenter.default.post(name: Notification.Name("TermAppReplayOnboarding"), object: nil)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func externalLinkRow(title: String, urlString: String) -> some View {
+        if let url = URL(string: urlString) {
+            Link(destination: url) {
+                HStack {
+                    Text(title)
+                        .foregroundStyle(.primary)
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
+            }
         }
     }
 

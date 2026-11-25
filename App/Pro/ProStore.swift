@@ -1,7 +1,6 @@
 import Foundation
 import Observation
 import StoreKit
-import UIKit
 
 /// Manages StoreKit 2 entitlements and purchases for the one-time TermApp Pro unlock.
 @MainActor @Observable
@@ -10,15 +9,15 @@ final class ProStore {
 
     private(set) var product: Product?
     private(set) var isPurchased = false
+    private(set) var isTestFlight = false
     private(set) var isLoading = false
     private(set) var errorMessage: String?
 
     @ObservationIgnored
     nonisolated(unsafe) private var updatesTask: Task<Void, Never>?
 
-    var isTestFlight: Bool {
-        Bundle.main.appStoreReceiptURL?.lastPathComponent == "sandboxReceipt"
-    }
+    @ObservationIgnored
+    private var isRefreshingEnvironment = false
 
     var isProUnlocked: Bool {
         if isPurchased { return true }
@@ -31,6 +30,9 @@ final class ProStore {
 
     init() {
         updatesTask = observeTransactionUpdates()
+        Task { [weak self] in
+            await self?.refreshAppEnvironment()
+        }
         Task { [weak self] in
             await self?.loadInitialState()
         }
@@ -56,7 +58,22 @@ final class ProStore {
         }
     }
 
+    func refreshAppEnvironment() async {
+        guard !isRefreshingEnvironment else { return }
+        isRefreshingEnvironment = true
+        defer { isRefreshingEnvironment = false }
+
+        if case .verified(let tx) = try? await AppTransaction.shared {
+            isTestFlight = (tx.environment == .sandbox)
+        } else {
+            isTestFlight = false
+        }
+    }
+
     func refreshEntitlements() async {
+        Task { [weak self] in
+            await self?.refreshAppEnvironment()
+        }
         var entitled = false
         for await result in Transaction.currentEntitlements {
             guard case .verified(let transaction) = result else { continue }

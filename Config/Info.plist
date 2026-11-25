@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>TermApp connects to SSH servers on your local network.</string>
+	<string>TermApp connects to SSH servers and development machines on your local network.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>TermApp uses Face ID to lock access to your SSH sessions and keys.</string>
 	<key>ITSAppUsesNonExemptEncryption</key>

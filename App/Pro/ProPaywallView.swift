@@ -27,6 +27,7 @@ struct ProPaywallView: View {
                     heroHeader
                     featuresCard
                     purchaseSection
+                    legalFooter
                 }
                 .frame(maxWidth: 460)
                 .padding(.horizontal, 20)
@@ -270,5 +271,24 @@ struct ProPaywallView: View {
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(Color.green.opacity(0.32), lineWidth: 1)
         )
+    }
+
+    private var legalFooter: some View {
+        HStack(spacing: 8) {
+            if let privacyURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/PRIVACY.md") {
+                Link("Privacy Policy", destination: privacyURL)
+            }
+
+            Text("·")
+                .accessibilityHidden(true)
+
+            if let termsURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/TERMS.md") {
+                Link("Terms of Use", destination: termsURL)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(theme.secondaryForegroundColor)
+        .tint(theme.secondaryForegroundColor)
+        .padding(.top, 2)
     }
 }
