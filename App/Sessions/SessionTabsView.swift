@@ -149,6 +149,7 @@ struct SessionTabsView<HostList: View>: View {
     @ViewBuilder let hostList: (ActiveSessionPill?) -> HostList
     @Environment(\.modelContext) private var modelContext
     @Environment(SessionManager.self) private var manager
+    @Environment(AppLockManager.self) private var appLock
     @Environment(ProStore.self) private var proStore
     @Environment(\.openWindow) private var openWindow
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -321,9 +322,17 @@ struct SessionTabsView<HostList: View>: View {
                 selection = tabOrder.last
             }
         }
+        .onAppear {
+            consumeAndFocusPendingAgentSessionIfUnlocked()
+        }
+        .onChange(of: appLock.isLocked) { _, isLocked in
+            if !isLocked {
+                consumeAndFocusPendingAgentSessionIfUnlocked()
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .termFocusAgentSession)) { note in
             if let id = note.userInfo?[AgentNotificationManager.sessionIDKey] as? UUID {
-                addTab(id)
+                focusAgentSessionIfUnlocked(id)
             }
         }
         .sheet(isPresented: $switching) {
@@ -700,6 +709,22 @@ struct SessionTabsView<HostList: View>: View {
         manager.show(id, in: windowID) // moves it out of any other window
         if !tabOrder.contains(id) { tabOrder.append(id) }
         selection = id
+    }
+
+    private func focusAgentSessionIfUnlocked(_ id: UUID) {
+        guard !appLock.isLocked else { return }
+        _ = AgentNotificationManager.shared.consumePendingFocusSessionID()
+        guard manager.session(id: id) != nil else { return }
+        addTab(id)
+    }
+
+    private func consumeAndFocusPendingAgentSessionIfUnlocked() {
+        guard !appLock.isLocked,
+              let id = AgentNotificationManager.shared.consumePendingFocusSessionID(),
+              manager.session(id: id) != nil else {
+            return
+        }
+        addTab(id)
     }
 
     private func moveToWindow(_ id: UUID) {

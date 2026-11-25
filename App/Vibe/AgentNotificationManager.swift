@@ -8,28 +8,59 @@ extension Notification.Name {
     static let termFocusAgentSession = Notification.Name("TermAppFocusAgentSession")
 }
 
+/// Dedicated non-isolated delegate proxy so UserNotifications callbacks on background queues
+/// never hit Swift 6 `@MainActor` / `async` ObjC bridging thunk executor checks.
+private final class NotificationCenterDelegateProxy: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let rawID = response.notification.request.content.userInfo[AgentNotificationManager.sessionIDKey] as? String
+        if let rawID, let sessionID = UUID(uuidString: rawID) {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    AgentNotificationManager.shared.handleNotificationTap(sessionID: sessionID)
+                }
+            }
+        }
+        completionHandler()
+    }
+}
+
 /// Manages local notifications and haptics when AI coding agents wait for approval or finish responding.
 @MainActor
-final class AgentNotificationManager: NSObject, UNUserNotificationCenterDelegate {
+final class AgentNotificationManager {
     static let shared = AgentNotificationManager()
     static let notificationsEnabledKey = "agents.notificationsEnabled"
     nonisolated static let sessionIDKey = "sessionID"
 
+    private let delegateProxy = NotificationCenterDelegateProxy()
+    private let notificationCenter: NotificationCenter
     private var isDelegateConfigured = false
     private var isRequestingAuthorization = false
+    private(set) var pendingFocusSessionID: UUID?
 
     var isEnabled: Bool {
         UserDefaults.standard.object(forKey: Self.notificationsEnabledKey) as? Bool ?? true
     }
 
-    override private init() {
-        super.init()
+    init(notificationCenter: NotificationCenter = .default) {
+        self.notificationCenter = notificationCenter
     }
 
     func configureDelegate() {
         guard !isDelegateConfigured else { return }
         isDelegateConfigured = true
-        UNUserNotificationCenter.current().delegate = self
+        UNUserNotificationCenter.current().delegate = delegateProxy
     }
 
     /// Requests local notification authorization once if `notificationsEnabled` is on and permission is undetermined.
@@ -125,28 +156,21 @@ final class AgentNotificationManager: NSObject, UNUserNotificationCenterDelegate
         }
     }
 
-    // MARK: - UNUserNotificationCenterDelegate
-
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        willPresent notification: UNNotification
-    ) async -> UNNotificationPresentationOptions {
-        [.banner, .sound]
+    /// Records a tapped notification's session ID for deferred focus (e.g. while locked or launching)
+    /// and notifies any mounted `SessionTabsView`.
+    func handleNotificationTap(sessionID: UUID) {
+        pendingFocusSessionID = sessionID
+        notificationCenter.post(
+            name: .termFocusAgentSession,
+            object: nil,
+            userInfo: [Self.sessionIDKey: sessionID]
+        )
     }
 
-    nonisolated func userNotificationCenter(
-        _ center: UNUserNotificationCenter,
-        didReceive response: UNNotificationResponse
-    ) async {
-        let rawID = response.notification.request.content.userInfo[Self.sessionIDKey] as? String
-        guard let rawID, let sessionID = UUID(uuidString: rawID) else { return }
-        await MainActor.run {
-            NotificationCenter.default.post(
-                name: .termFocusAgentSession,
-                object: nil,
-                userInfo: [Self.sessionIDKey: sessionID]
-            )
-        }
+    /// Returns and clears any pending session focus request from a notification tap.
+    func consumePendingFocusSessionID() -> UUID? {
+        defer { pendingFocusSessionID = nil }
+        return pendingFocusSessionID
     }
 }
 

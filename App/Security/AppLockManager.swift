@@ -16,6 +16,9 @@ final class AppLockManager {
     /// Tracks whether the next `.active` transition should automatically trigger `unlock()`,
     /// preventing an infinite Face ID prompt loop after the user taps Cancel.
     private var autoUnlockPending: Bool
+    /// Monotonic counter invalidated on lock/disable so stale `LAContext.evaluatePolicy`
+    /// completions from an earlier lock cycle cannot mutate state or block re-authentication.
+    private var lockGeneration: UInt64 = 0
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -29,7 +32,9 @@ final class AppLockManager {
         appLockEnabled = enabled
         defaults.set(enabled, forKey: Self.defaultsKey)
         if !enabled {
+            lockGeneration &+= 1
             isLocked = false
+            isAuthenticating = false
             authError = nil
             autoUnlockPending = false
         }
@@ -45,14 +50,20 @@ final class AppLockManager {
             return Self.unavailableMessage(for: policyError)
         }
 
+        let generation = lockGeneration
         isAuthenticating = true
-        defer { isAuthenticating = false }
+        defer {
+            if lockGeneration == generation {
+                isAuthenticating = false
+            }
+        }
 
         do {
             let success = try await Self.evaluatePolicy(
                 context,
                 reason: "Verify your identity to enable Face ID / Passcode Lock."
             )
+            guard lockGeneration == generation else { return nil }
             if success {
                 setEnabled(true)
                 AppHaptics.notify(.success)
@@ -60,6 +71,7 @@ final class AppLockManager {
             }
             return "Authentication was not completed."
         } catch let error as LAError {
+            guard lockGeneration == generation else { return nil }
             switch error.code {
             case .userCancel, .appCancel, .systemCancel:
                 return nil
@@ -67,13 +79,16 @@ final class AppLockManager {
                 return Self.userFriendlyMessage(for: error)
             }
         } catch {
+            guard lockGeneration == generation else { return nil }
             return error.localizedDescription
         }
     }
 
     func lockIfEnabled() {
         guard appLockEnabled else { return }
+        lockGeneration &+= 1
         isLocked = true
+        isAuthenticating = false
         autoUnlockPending = true
         authError = nil
     }
@@ -94,15 +109,21 @@ final class AppLockManager {
             return
         }
 
+        let generation = lockGeneration
         isAuthenticating = true
         authError = nil
-        defer { isAuthenticating = false }
+        defer {
+            if lockGeneration == generation {
+                isAuthenticating = false
+            }
+        }
 
         do {
             let success = try await Self.evaluatePolicy(
                 context,
                 reason: "Unlock TermApp to access your SSH sessions and keys."
             )
+            guard lockGeneration == generation, appLockEnabled else { return }
             if success {
                 isLocked = false
                 authError = nil
@@ -112,6 +133,7 @@ final class AppLockManager {
                 authError = "Authentication failed. Tap Unlock to try again."
             }
         } catch let error as LAError {
+            guard lockGeneration == generation, appLockEnabled else { return }
             isLocked = true
             switch error.code {
             case .userCancel, .appCancel, .systemCancel:
@@ -120,6 +142,7 @@ final class AppLockManager {
                 authError = Self.userFriendlyMessage(for: error)
             }
         } catch {
+            guard lockGeneration == generation, appLockEnabled else { return }
             isLocked = true
             authError = error.localizedDescription
         }
