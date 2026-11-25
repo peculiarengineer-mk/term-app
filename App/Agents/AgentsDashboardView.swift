@@ -4,7 +4,7 @@ import SSHKit
 import Store
 import TermUI
 
-/// Dashboard listing open AI terminal tabs and live/detached remote `tmux` AI sessions across saved hosts.
+/// Dashboard listing open AI terminal tabs and live/detached remote `tmux` sessions across saved hosts.
 struct AgentsDashboardView: View {
     private struct DiscoveredSession: Identifiable, Hashable {
         let hostID: UUID
@@ -14,22 +14,57 @@ struct AgentsDashboardView: View {
         var id: String { "\(hostID.uuidString)::\(session.sessionName)" }
     }
 
-    private struct HostScanOutcome: Sendable {
+    enum HostScanStatus: Sendable, Equatable {
+        case ok(sessionCount: Int)
+        case tmuxMissing
+        case needsAuthOrTrust(reason: String)
+        case unreachable(reason: String)
+
+        var issueReason: String? {
+            switch self {
+            case .ok:
+                nil
+            case .tmuxMissing:
+                "tmux not installed"
+            case .needsAuthOrTrust(let reason), .unreachable(let reason):
+                reason
+            }
+        }
+
+        var symbolName: String {
+            switch self {
+            case .ok:
+                "checkmark.circle"
+            case .tmuxMissing:
+                "terminal"
+            case .needsAuthOrTrust:
+                "lock.shield"
+            case .unreachable:
+                "wifi.slash"
+            }
+        }
+    }
+
+    private struct HostScanOutcome: Sendable, Identifiable {
         let hostID: UUID
         let hostLabel: String
         let sessions: [TMuxSessionHelper.RemoteAISession]
-        let note: String?
+        let status: HostScanStatus
+
+        var id: UUID { hostID }
     }
 
     @Environment(SessionManager.self) private var sessionManager
     @Environment(ProStore.self) private var proStore
     @Environment(\.openSessionTab) private var openSessionTab
+    @Environment(\.connectHost) private var connectHost
     @Environment(\.launchAIAgent) private var launchAIAgent
+    @Environment(\.runTerminalCommand) private var runTerminalCommand
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
 
     @State private var remoteSessions: [DiscoveredSession] = []
-    @State private var scanNotes: [String] = []
+    @State private var scanOutcomes: [HostScanOutcome] = []
     @State private var isScanning = false
     @State private var hasScannedOnce = false
     @State private var scanGeneration = 0
@@ -42,6 +77,26 @@ struct AgentsDashboardView: View {
 
     private var openAISessions: [LiveSession] {
         sessionManager.sessions.filter { $0.aiAgentContext != nil }
+    }
+
+    private var aiSessions: [DiscoveredSession] {
+        remoteSessions.filter(\.session.isAISession)
+    }
+
+    private var otherTmuxSessions: [DiscoveredSession] {
+        remoteSessions.filter { !$0.session.isAISession }
+    }
+
+    private var hostScanIssues: [HostScanOutcome] {
+        scanOutcomes
+            .filter { $0.status.issueReason != nil }
+            .sorted { lhs, rhs in
+                let cmp = lhs.hostLabel.localizedCaseInsensitiveCompare(rhs.hostLabel)
+                if cmp != .orderedSame {
+                    return cmp == .orderedAscending
+                }
+                return lhs.hostID.uuidString < rhs.hostID.uuidString
+            }
     }
 
     var body: some View {
@@ -87,7 +142,10 @@ struct AgentsDashboardView: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: { item in
-            Text("This terminates \"\(item.session.sessionName)\" on \(item.hostLabel). Unsaved agent state in that tmux session will stop.")
+            let detail = item.session.isAISession
+                ? "Unsaved agent state in that tmux session will stop."
+                : "Running processes in that tmux session will stop."
+            Text("This terminates \"\(item.session.sessionName)\" on \(item.hostLabel). \(detail)")
         }
         .alert(
             "Action Failed",
@@ -113,23 +171,46 @@ struct AgentsDashboardView: View {
                 }
             }
 
-            Section {
-                ForEach(remoteSessions) { item in
-                    remoteSessionRow(item)
-                }
-            } header: {
-                HStack(spacing: 8) {
-                    Text("Remote tmux Sessions")
-                    if isScanning {
-                        ProgressView()
-                            .controlSize(.mini)
+            if !aiSessions.isEmpty || (isScanning && otherTmuxSessions.isEmpty && hostScanIssues.isEmpty) {
+                Section {
+                    ForEach(aiSessions) { item in
+                        remoteSessionRow(item)
+                    }
+                } header: {
+                    sectionHeader("Remote AI Sessions", showSpinner: isScanning)
+                } footer: {
+                    if !aiSessions.isEmpty && otherTmuxSessions.isEmpty && hostScanIssues.isEmpty {
+                        Text("Pull down to refresh active and detached tmux sessions.")
                     }
                 }
-            } footer: {
-                if !scanNotes.isEmpty {
-                    Text(scanNotes.joined(separator: "\n"))
-                } else if !remoteSessions.isEmpty {
-                    Text("Pull down to refresh active and detached TermApp tmux sessions.")
+            }
+
+            if !otherTmuxSessions.isEmpty {
+                Section {
+                    ForEach(otherTmuxSessions) { item in
+                        otherTmuxSessionRow(item)
+                    }
+                } header: {
+                    sectionHeader("Other tmux Sessions", showSpinner: isScanning && aiSessions.isEmpty)
+                } footer: {
+                    if hostScanIssues.isEmpty {
+                        Text("Tap to attach in a terminal tab, or swipe to kill a session.")
+                    }
+                }
+            }
+
+            if !hostScanIssues.isEmpty {
+                Section {
+                    ForEach(hostScanIssues) { outcome in
+                        hostScanStatusRow(outcome)
+                    }
+                } header: {
+                    sectionHeader(
+                        "Host Scan Status",
+                        showSpinner: isScanning && aiSessions.isEmpty && otherTmuxSessions.isEmpty
+                    )
+                } footer: {
+                    Text("Connect once to trust host keys or sign in, then pull down to refresh.")
                 }
             }
         }
@@ -137,7 +218,7 @@ struct AgentsDashboardView: View {
             await scanAllHosts()
         }
         .overlay {
-            if openAISessions.isEmpty && remoteSessions.isEmpty && !isScanning {
+            if openAISessions.isEmpty && remoteSessions.isEmpty && hostScanIssues.isEmpty && !isScanning {
                 if hosts.isEmpty {
                     ContentUnavailableView(
                         "No Saved Hosts",
@@ -160,6 +241,16 @@ struct AgentsDashboardView: View {
                         .tint(AgentVisuals.appleProAmber)
                     }
                 }
+            }
+        }
+    }
+
+    private func sectionHeader(_ title: String, showSpinner: Bool) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+            if showSpinner {
+                ProgressView()
+                    .controlSize(.mini)
             }
         }
     }
@@ -222,17 +313,68 @@ struct AgentsDashboardView: View {
         let session = item.session
         let descriptor = AgentVisuals.agentDescriptor(forSlug: session.agentSlug)
         let tint = AgentVisuals.agentTint(for: descriptor)
+        let badge = session.projectSlug.isEmpty ? session.sessionName : session.projectSlug
+        let subtitle: String = {
+            if !session.isTermAppManaged && session.sessionName != badge {
+                let prefix = "\(item.hostLabel) · \(session.sessionName)"
+                guard let path = session.currentPath, !path.isEmpty else { return prefix }
+                return "\(prefix) · \(path)"
+            }
+            return subtitleLine(hostLabel: item.hostLabel, path: session.currentPath)
+        }()
+
+        return tmuxSessionRow(
+            item: item,
+            iconSymbol: AgentVisuals.agentSymbol(for: descriptor),
+            iconTint: tint,
+            title: descriptor.name,
+            badgeText: badge,
+            badgeTint: tint,
+            subtitle: subtitle,
+            accessibilityDescription: "\(descriptor.name) on \(item.hostLabel), \(session.isAttached ? "attached" : "idle")",
+            onAttach: { forceNewTab in attach(item, forceNewTab: forceNewTab) }
+        )
+    }
+
+    private func otherTmuxSessionRow(_ item: DiscoveredSession) -> some View {
+        let session = item.session
+        let commandBadge = session.detectedCommand ?? ""
+        return tmuxSessionRow(
+            item: item,
+            iconSymbol: "terminal",
+            iconTint: AgentVisuals.slateColor,
+            title: session.sessionName,
+            badgeText: commandBadge,
+            badgeTint: AgentVisuals.slateColor,
+            subtitle: subtitleLine(hostLabel: item.hostLabel, path: session.currentPath),
+            accessibilityDescription: "tmux session \(session.sessionName) on \(item.hostLabel), \(session.isAttached ? "attached" : "idle")",
+            onAttach: { _ in attachGeneralSession(item) }
+        )
+    }
+
+    private func tmuxSessionRow(
+        item: DiscoveredSession,
+        iconSymbol: String,
+        iconTint: Color,
+        title: String,
+        badgeText: String,
+        badgeTint: Color,
+        subtitle: String,
+        accessibilityDescription: String,
+        onAttach: @escaping (Bool) -> Void
+    ) -> some View {
+        let session = item.session
         let ledColor = session.isAttached ? AgentVisuals.activeGreen : AgentVisuals.appleProAmber
         let activityDate = session.lastActivityAt ?? session.createdAt
 
         return Button {
             AppHaptics.impact(.light)
-            attach(item)
+            onAttach(false)
         } label: {
             HStack(spacing: 12) {
                 SquircleIcon(
-                    symbolName: AgentVisuals.agentSymbol(for: descriptor),
-                    tint: tint,
+                    symbolName: iconSymbol,
+                    tint: iconTint,
                     fillOpacity: theme.isDark ? 0.20 : 0.14,
                     rimOpacity: 0.36
                 )
@@ -241,22 +383,22 @@ struct AgentsDashboardView: View {
                     HStack(spacing: 6) {
                         CloudStatusLED(color: ledColor, size: 7)
 
-                        Text(descriptor.name)
+                        Text(title)
                             .font(.headline)
                             .foregroundStyle(.primary)
                             .lineLimit(1)
 
-                        if !session.projectSlug.isEmpty {
-                            Text(session.projectSlug)
+                        if !badgeText.isEmpty {
+                            Text(badgeText)
                                 .font(.caption2.monospaced().weight(.semibold))
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                                .foregroundStyle(tint)
-                                .background(tint.opacity(theme.isDark ? 0.16 : 0.12), in: Capsule())
+                                .foregroundStyle(badgeTint)
+                                .background(badgeTint.opacity(theme.isDark ? 0.16 : 0.12), in: Capsule())
                         }
                     }
 
-                    Text(subtitleLine(hostLabel: item.hostLabel, path: session.currentPath))
+                    Text(subtitle)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -286,11 +428,11 @@ struct AgentsDashboardView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(descriptor.name) on \(item.hostLabel), \(session.isAttached ? "attached" : "idle")")
+        .accessibilityLabel(accessibilityDescription)
         .contextMenu {
             Button("Attach", systemImage: "terminal") {
                 AppHaptics.impact(.light)
-                attach(item, forceNewTab: true)
+                onAttach(true)
             }
             Button("Kill Session", systemImage: "xmark.octagon", role: .destructive) {
                 killingSession = item
@@ -306,12 +448,62 @@ struct AgentsDashboardView: View {
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
             Button {
                 AppHaptics.impact(.light)
-                attach(item)
+                onAttach(false)
             } label: {
                 Label("Attach", systemImage: "terminal")
             }
             .tint(AgentVisuals.activeGreen)
         }
+    }
+
+    private func hostScanStatusRow(_ outcome: HostScanOutcome) -> some View {
+        let reason = outcome.status.issueReason ?? ""
+        let tint: Color = switch outcome.status {
+        case .ok:
+            AgentVisuals.activeGreen
+        case .tmuxMissing:
+            AgentVisuals.slateColor
+        case .needsAuthOrTrust:
+            AgentVisuals.appleProAmber
+        case .unreachable:
+            Color(red: 0xFF / 255.0, green: 0x45 / 255.0, blue: 0x3A / 255.0)
+        }
+
+        return HStack(spacing: 12) {
+            SquircleIcon(
+                symbolName: outcome.status.symbolName,
+                tint: tint,
+                fillOpacity: theme.isDark ? 0.18 : 0.12,
+                rimOpacity: 0.34,
+                size: 32
+            )
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(outcome.hostLabel)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 8)
+
+            if let host = hosts.first(where: { $0.id == outcome.hostID }) {
+                Button("Connect") {
+                    AppHaptics.impact(.light)
+                    connectHost?(host)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(tint)
+                .accessibilityLabel("Connect to \(outcome.hostLabel)")
+            }
+        }
+        .padding(.vertical, 2)
     }
 
     private func subtitleLine(hostLabel: String, path: String?) -> String {
@@ -342,6 +534,12 @@ struct AgentsDashboardView: View {
         launchAIAgent?(host, context, command)
     }
 
+    private func attachGeneralSession(_ item: DiscoveredSession) {
+        guard let host = hosts.first(where: { $0.id == item.hostID }) else { return }
+        let command = TMuxSessionHelper.attachCommand(sessionName: item.session.sessionName)
+        runTerminalCommand?(host, command)
+    }
+
     private func killSession(_ item: DiscoveredSession) async {
         guard let host = hosts.first(where: { $0.id == item.hostID }) else { return }
         let target = AgentHostTarget(host: host, sessionManager: sessionManager)
@@ -362,10 +560,11 @@ struct AgentsDashboardView: View {
         scanGeneration += 1
         let generation = scanGeneration
         let targets = hosts.map { AgentHostTarget(host: $0, sessionManager: sessionManager) }
+        let knownCommands = Self.buildKnownCommands()
 
         guard !targets.isEmpty else {
             remoteSessions = []
-            scanNotes = []
+            scanOutcomes = []
             isScanning = false
             hasScannedOnce = true
             return
@@ -376,37 +575,7 @@ struct AgentsDashboardView: View {
         let outcomes = await withTaskGroup(of: HostScanOutcome.self) { group in
             for target in targets {
                 group.addTask {
-                    do {
-                        let result = try await AgentAuthHelper.exec(
-                            TMuxSessionHelper.listSessionsCommand(),
-                            on: target,
-                            timeout: .seconds(8)
-                        )
-                        let parsed = TMuxSessionHelper.parseSessions(
-                            from: result.stdout,
-                            onlyTermAppManaged: true
-                        )
-                        return HostScanOutcome(
-                            hostID: target.id,
-                            hostLabel: target.displayName,
-                            sessions: parsed,
-                            note: nil
-                        )
-                    } catch let error as AgentRemoteError where error.isAuthOrTrustIssue {
-                        return HostScanOutcome(
-                            hostID: target.id,
-                            hostLabel: target.displayName,
-                            sessions: [],
-                            note: "\(target.displayName): connect once to scan"
-                        )
-                    } catch {
-                        return HostScanOutcome(
-                            hostID: target.id,
-                            hostLabel: target.displayName,
-                            sessions: [],
-                            note: "\(target.displayName): \(error.localizedDescription)"
-                        )
-                    }
+                    await Self.scanHost(target, knownCommands: knownCommands)
                 }
             }
 
@@ -433,11 +602,135 @@ struct AgentsDashboardView: View {
             if lhsDate != rhsDate {
                 return lhsDate > rhsDate
             }
-            return lhs.hostLabel.localizedCaseInsensitiveCompare(rhs.hostLabel) == .orderedAscending
+            let hostOrder = lhs.hostLabel.localizedCaseInsensitiveCompare(rhs.hostLabel)
+            if hostOrder != .orderedSame {
+                return hostOrder == .orderedAscending
+            }
+            return lhs.session.sessionName.localizedCaseInsensitiveCompare(rhs.session.sessionName) == .orderedAscending
         }
-        scanNotes = outcomes.compactMap(\.note).sorted()
+        scanOutcomes = outcomes
         isScanning = false
         hasScannedOnce = true
+    }
+
+    private static func buildKnownCommands() -> [String: String] {
+        var commands: [String: String] = [:]
+        for preset in HostProjectStore.allPresets() {
+            let cmd = preset.command.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cmd.isEmpty {
+                commands[cmd] = preset.slug
+            }
+        }
+        return commands
+    }
+
+    private nonisolated static func scanHost(
+        _ target: AgentHostTarget,
+        knownCommands: [String: String]
+    ) async -> HostScanOutcome {
+        do {
+            let result = try await AgentAuthHelper.exec(
+                TMuxSessionHelper.listSessionsCommand(),
+                on: target,
+                timeout: .seconds(8)
+            )
+            if TMuxSessionHelper.isTmuxMissing(in: result.stdout) {
+                return HostScanOutcome(
+                    hostID: target.id,
+                    hostLabel: target.displayName,
+                    sessions: [],
+                    status: .tmuxMissing
+                )
+            }
+            let parsed = TMuxSessionHelper.parseSessions(
+                from: result.stdout,
+                onlyTermAppManaged: false,
+                knownCommands: knownCommands
+            )
+            return HostScanOutcome(
+                hostID: target.id,
+                hostLabel: target.displayName,
+                sessions: parsed,
+                status: .ok(sessionCount: parsed.count)
+            )
+        } catch let error as AgentRemoteError where error.isAuthOrTrustIssue {
+            return HostScanOutcome(
+                hostID: target.id,
+                hostLabel: target.displayName,
+                sessions: [],
+                status: .needsAuthOrTrust(reason: conciseAuthReason(for: error, target: target))
+            )
+        } catch let error as SSHError {
+            switch error {
+            case .authenticationFailed:
+                return HostScanOutcome(
+                    hostID: target.id,
+                    hostLabel: target.displayName,
+                    sessions: [],
+                    status: .needsAuthOrTrust(reason: "Needs login or authentication")
+                )
+            case .hostKeyRejected:
+                return HostScanOutcome(
+                    hostID: target.id,
+                    hostLabel: target.displayName,
+                    sessions: [],
+                    status: .needsAuthOrTrust(reason: "Needs login or host key trust")
+                )
+            default:
+                return HostScanOutcome(
+                    hostID: target.id,
+                    hostLabel: target.displayName,
+                    sessions: [],
+                    status: .unreachable(reason: conciseUnreachableReason(for: error, hostLabel: target.displayName))
+                )
+            }
+        } catch {
+            return HostScanOutcome(
+                hostID: target.id,
+                hostLabel: target.displayName,
+                sessions: [],
+                status: .unreachable(reason: conciseUnreachableReason(for: error, hostLabel: target.displayName))
+            )
+        }
+    }
+
+    private nonisolated static func conciseAuthReason(
+        for error: AgentRemoteError,
+        target: AgentHostTarget
+    ) -> String {
+        switch error {
+        case .untrustedHostKey:
+            "Needs login or host key trust"
+        case .hostKeyMismatch:
+            "Host key changed — connect to verify"
+        case .missingCredentials:
+            "Missing SSH key credentials"
+        case .needsInteractiveAuth:
+            if target.authMethod == "keyboardInteractive" {
+                "Needs interactive 2FA login"
+            } else {
+                "Needs login or host key trust"
+            }
+        case .commandFailed(let message):
+            message
+        }
+    }
+
+    private nonisolated static func conciseUnreachableReason(
+        for error: Error,
+        hostLabel: String
+    ) -> String {
+        let raw = error.localizedDescription
+            .replacingOccurrences(of: "\(hostLabel): ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = raw.lowercased()
+        if lower.contains("timed out") || lower.contains("timeout") {
+            return "Offline / timed out"
+        }
+        if lower.contains("could not reach") || lower.contains("connection") {
+            return "Offline / unreachable"
+        }
+        return raw.isEmpty ? "Offline / unreachable" : raw
     }
 
     private var proPromptView: some View {

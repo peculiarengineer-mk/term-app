@@ -3,6 +3,8 @@ import Foundation
 /// Pure, POSIX-shell-safe command builder and parser for managing `tmux`-backed AI agent sessions.
 public enum TMuxSessionHelper {
     public static let sessionPrefix = "termapp-ai-"
+    public static let tmuxMissingMarker = "TERMAPP_TMUX_MISSING"
+    public static let panesBeginMarker = "TERMAPP_PANES_BEGIN"
 
     private static let standardPATH = "$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin"
     private static let bracketedPasteBegin = "\u{1B}[200~"
@@ -19,6 +21,13 @@ public enum TMuxSessionHelper {
         public var createdAt: Date?
         public var lastActivityAt: Date?
         public var currentPath: String?
+        public var isTermAppManaged: Bool = true
+        public var detectedCommand: String? = nil
+
+        /// `true` for TermApp-managed sessions or any `tmux` session running a recognized AI CLI.
+        public var isAISession: Bool {
+            isTermAppManaged || !agentSlug.isEmpty
+        }
 
         public init(
             sessionName: String,
@@ -28,7 +37,9 @@ public enum TMuxSessionHelper {
             windowCount: Int,
             createdAt: Date? = nil,
             lastActivityAt: Date? = nil,
-            currentPath: String? = nil
+            currentPath: String? = nil,
+            isTermAppManaged: Bool = true,
+            detectedCommand: String? = nil
         ) {
             self.id = sessionName
             self.sessionName = sessionName
@@ -39,6 +50,39 @@ public enum TMuxSessionHelper {
             self.createdAt = createdAt
             self.lastActivityAt = lastActivityAt
             self.currentPath = currentPath
+            self.isTermAppManaged = isTermAppManaged
+            self.detectedCommand = detectedCommand
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case id
+            case sessionName
+            case agentSlug
+            case projectSlug
+            case isAttached
+            case windowCount
+            case createdAt
+            case lastActivityAt
+            case currentPath
+            case isTermAppManaged
+            case detectedCommand
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let sessionName = try container.decode(String.self, forKey: .sessionName)
+            self.id = try container.decodeIfPresent(String.self, forKey: .id) ?? sessionName
+            self.sessionName = sessionName
+            self.agentSlug = try container.decode(String.self, forKey: .agentSlug)
+            self.projectSlug = try container.decode(String.self, forKey: .projectSlug)
+            self.isAttached = try container.decode(Bool.self, forKey: .isAttached)
+            self.windowCount = try container.decode(Int.self, forKey: .windowCount)
+            self.createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt)
+            self.lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
+            self.currentPath = try container.decodeIfPresent(String.self, forKey: .currentPath)
+            self.isTermAppManaged = try container.decodeIfPresent(Bool.self, forKey: .isTermAppManaged)
+                ?? sessionName.hasPrefix(TMuxSessionHelper.sessionPrefix)
+            self.detectedCommand = try container.decodeIfPresent(String.self, forKey: .detectedCommand)
         }
     }
 
@@ -322,10 +366,13 @@ public enum TMuxSessionHelper {
         return "export PATH=\"\(standardPATH):$PATH\"; tmux kill-session -t \(quoted)"
     }
 
-    /// Builds a POSIX command to list `tmux` sessions in tab-delimited format.
+    /// Builds a POSIX command to list `tmux` sessions and pane commands in tab-delimited format.
+    ///
+    /// Prints `TERMAPP_TMUX_MISSING` when `tmux` is not installed on the remote host.
     public static func listSessionsCommand() -> String {
-        let format = "#{session_name}\\t#{session_attached}\\t#{session_windows}\\t#{session_created}\\t#{session_activity}\\t#{pane_current_path}"
-        return "export PATH=\"\(standardPATH):$PATH\"; tmux list-sessions -F \"$(printf '\(format)')\" 2>/dev/null || true"
+        let sessionFormat = "#{session_name}\\t#{session_attached}\\t#{session_windows}\\t#{session_created}\\t#{session_activity}\\t#{pane_current_path}\\t#{pane_current_command}"
+        let paneFormat = "#{session_name}\\t#{pane_current_command}\\t#{pane_current_path}"
+        return "export PATH=\"\(standardPATH):$PATH\"; if command -v tmux >/dev/null 2>&1; then tmux list-sessions -F \"$(printf '\(sessionFormat)')\" 2>/dev/null || true; printf '\(panesBeginMarker)\\n'; tmux list-panes -a -F \"$(printf '\(paneFormat)')\" 2>/dev/null || true; else printf '\(tmuxMissingMarker)\\n'; fi"
     }
 
     /// Builds a POSIX command that expands `path`, prints `PWD:<resolved>` on line 1, and lists sorted non-hidden subdirectories.
@@ -337,24 +384,55 @@ public enum TMuxSessionHelper {
 
     // MARK: - Output Parsers
 
+    /// Returns `true` when `listSessionsCommand()` output indicates `tmux` is not installed.
+    public static func isTmuxMissing(in output: String) -> Bool {
+        output
+            .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == tmuxMissingMarker }
+    }
+
     /// Parses output from `listSessionsCommand()` into structured session records.
-    public static func parseSessions(from output: String, onlyTermAppManaged: Bool = true) -> [RemoteAISession] {
-        var sessions: [RemoteAISession] = []
+    public static func parseSessions(
+        from output: String,
+        onlyTermAppManaged: Bool = true,
+        knownCommands: [String: String] = [:]
+    ) -> [RemoteAISession] {
+        var sessionLines: [String] = []
+        var panesBySession: [String: [ParsedPaneInfo]] = [:]
+        var inPanesSection = false
 
         for rawLine in output.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
             let line = String(rawLine).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
-            if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty { continue }
 
-            let fields: [String]
-            if line.contains("\t") {
-                fields = line.components(separatedBy: "\t")
-            } else if line.contains("\\t") {
-                fields = line.components(separatedBy: "\\t")
-            } else {
+            if trimmed == panesBeginMarker {
+                inPanesSection = true
+                continue
+            }
+            if trimmed == tmuxMissingMarker {
                 continue
             }
 
-            guard fields.count >= 3 else { continue }
+            if inPanesSection {
+                guard let fields = splitTabFields(line), fields.count >= 2 else { continue }
+                let paneSession = fields[0].trimmingCharacters(in: .whitespaces)
+                let paneCommand = fields[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                let panePath = fields.count > 2 ? nonEmptyTrimmed(fields[2]) : nil
+                guard !paneSession.isEmpty, !paneCommand.isEmpty else { continue }
+                panesBySession[paneSession, default: []].append(
+                    ParsedPaneInfo(command: paneCommand, path: panePath)
+                )
+            } else {
+                sessionLines.append(line)
+            }
+        }
+
+        let commandLookup = buildCommandLookup(knownCommands: knownCommands)
+        var sessions: [RemoteAISession] = []
+
+        for line in sessionLines {
+            guard let fields = splitTabFields(line), fields.count >= 3 else { continue }
 
             let name = fields[0].trimmingCharacters(in: .whitespaces)
             guard !name.isEmpty else { continue }
@@ -370,18 +448,45 @@ public enum TMuxSessionHelper {
                 continue
             }
 
-            let (agentSlug, projectSlug) = parseSlugs(from: name, isManaged: isManaged)
-            if onlyTermAppManaged && agentSlug.isEmpty {
-                continue
-            }
-
             let createdAt = fields.count > 3 ? parseTimestamp(fields[3]) : nil
             let lastActivityAt = fields.count > 4 ? parseTimestamp(fields[4]) : nil
-            let currentPath: String? = {
-                guard fields.count > 5 else { return nil }
-                let path = fields[5].trimmingCharacters(in: .whitespacesAndNewlines)
-                return path.isEmpty ? nil : path
-            }()
+            var currentPath = fields.count > 5 ? nonEmptyTrimmed(fields[5]) : nil
+            let activeCommand = fields.count > 6 ? nonEmptyTrimmed(fields[6]) : nil
+            let sessionPanes = panesBySession[name] ?? []
+
+            let aiMatch = detectAIAgent(
+                activeCommand: activeCommand,
+                panes: sessionPanes,
+                commandLookup: commandLookup
+            )
+
+            if currentPath == nil {
+                currentPath = aiMatch?.panePath ?? sessionPanes.compactMap(\.path).first
+            } else if !isManaged, let aiPanePath = aiMatch?.panePath, aiMatch?.fromSecondaryPane == true {
+                currentPath = aiPanePath
+            }
+
+            let fallbackCommand = activeCommand.map(commandBasename).flatMap { $0.isEmpty ? nil : $0 }
+                ?? sessionPanes.lazy.map { commandBasename($0.command) }.first { !$0.isEmpty }
+            let detectedCommand = aiMatch?.normalizedCommand ?? fallbackCommand
+
+            let agentSlug: String
+            let projectSlug: String
+            if isManaged {
+                let (parsedAgent, parsedProject) = parseSlugs(from: name, isManaged: true)
+                if onlyTermAppManaged && parsedAgent.isEmpty {
+                    continue
+                }
+                agentSlug = parsedAgent
+                projectSlug = parsedProject
+            } else if let aiMatch {
+                agentSlug = aiMatch.slug
+                projectSlug = currentPath.map { Self.projectSlug(from: $0) } ?? name
+            } else {
+                agentSlug = ""
+                // Preserve `projectSlug == ""` for legacy 6-column outputs while labeling modern general sessions.
+                projectSlug = detectedCommand != nil ? name : ""
+            }
 
             sessions.append(
                 RemoteAISession(
@@ -392,7 +497,9 @@ public enum TMuxSessionHelper {
                     windowCount: windowCount,
                     createdAt: createdAt,
                     lastActivityAt: lastActivityAt,
-                    currentPath: currentPath
+                    currentPath: currentPath,
+                    isTermAppManaged: isManaged,
+                    detectedCommand: detectedCommand
                 )
             )
         }
@@ -483,6 +590,98 @@ public enum TMuxSessionHelper {
     }
 
     // MARK: - Private Parsing Helpers
+
+    private struct ParsedPaneInfo {
+        let command: String
+        let path: String?
+    }
+
+    private struct DetectedAgentMatch {
+        let slug: String
+        let normalizedCommand: String
+        let panePath: String?
+        let fromSecondaryPane: Bool
+    }
+
+    private static func splitTabFields(_ line: String) -> [String]? {
+        if line.contains("\t") {
+            return line.components(separatedBy: "\t")
+        }
+        if line.contains("\\t") {
+            return line.components(separatedBy: "\\t")
+        }
+        return nil
+    }
+
+    private static func nonEmptyTrimmed(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func buildCommandLookup(knownCommands: [String: String]) -> [String: String] {
+        var lookup: [String: String] = [:]
+        for builtIn in BuiltInAIAgent.allCases {
+            lookup[builtIn.command.lowercased()] = builtIn.rawValue
+        }
+        for (rawCommand, rawSlug) in knownCommands {
+            let base = commandBasename(rawCommand).lowercased()
+            let slug = rawSlug.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !base.isEmpty, !slug.isEmpty {
+                lookup[base] = slug
+            }
+        }
+        return lookup
+    }
+
+    private static func commandBasename(_ raw: String) -> String {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if let firstToken = trimmed.split(whereSeparator: \.isWhitespace).first {
+            trimmed = String(firstToken)
+        }
+        if let lastSlash = trimmed.lastIndex(of: "/") {
+            trimmed = String(trimmed[trimmed.index(after: lastSlash)...])
+        }
+        if trimmed.hasPrefix("-"), trimmed.count > 1 {
+            trimmed.removeFirst()
+        }
+        return trimmed
+    }
+
+    private static func detectAIAgent(
+        activeCommand: String?,
+        panes: [ParsedPaneInfo],
+        commandLookup: [String: String]
+    ) -> DetectedAgentMatch? {
+        if let activeCommand {
+            let base = commandBasename(activeCommand).lowercased()
+            if !base.isEmpty, let slug = commandLookup[base] {
+                let matchingPanePath = panes.first {
+                    commandBasename($0.command).lowercased() == base && $0.path != nil
+                }?.path
+                return DetectedAgentMatch(
+                    slug: slug,
+                    normalizedCommand: base,
+                    panePath: matchingPanePath,
+                    fromSecondaryPane: false
+                )
+            }
+        }
+
+        for pane in panes {
+            let base = commandBasename(pane.command).lowercased()
+            if !base.isEmpty, let slug = commandLookup[base] {
+                return DetectedAgentMatch(
+                    slug: slug,
+                    normalizedCommand: base,
+                    panePath: pane.path,
+                    fromSecondaryPane: true
+                )
+            }
+        }
+
+        return nil
+    }
 
     private static func parseSlugs(from sessionName: String, isManaged: Bool) -> (agent: String, project: String) {
         guard isManaged else { return ("", "") }

@@ -227,6 +227,11 @@ final class AIAgentTests: XCTestCase {
         )
 
         let listCmd = TMuxSessionHelper.listSessionsCommand()
+        XCTAssertFalse(listCmd.contains("\n"))
+        XCTAssertFalse(listCmd.contains("\r"))
+        XCTAssertTrue(listCmd.contains("command -v tmux >/dev/null 2>&1"))
+        XCTAssertTrue(listCmd.contains("TERMAPP_TMUX_MISSING"))
+        XCTAssertTrue(listCmd.contains("TERMAPP_PANES_BEGIN"))
         XCTAssertTrue(listCmd.contains("tmux list-sessions -F"))
         XCTAssertTrue(listCmd.contains("#{session_name}"))
         XCTAssertTrue(listCmd.contains("#{session_attached}"))
@@ -234,6 +239,8 @@ final class AIAgentTests: XCTestCase {
         XCTAssertTrue(listCmd.contains("#{session_created}"))
         XCTAssertTrue(listCmd.contains("#{session_activity}"))
         XCTAssertTrue(listCmd.contains("#{pane_current_path}"))
+        XCTAssertTrue(listCmd.contains("#{pane_current_command}"))
+        XCTAssertTrue(listCmd.contains("tmux list-panes -a -F"))
         XCTAssertTrue(listCmd.contains("2>/dev/null || true"))
     }
 
@@ -431,9 +438,201 @@ final class AIAgentTests: XCTestCase {
         XCTAssertEqual(allSessions[2].sessionName, "dev-shell")
         XCTAssertEqual(allSessions[2].agentSlug, "")
         XCTAssertEqual(allSessions[2].projectSlug, "")
+        XCTAssertFalse(allSessions[2].isTermAppManaged)
+        XCTAssertNil(allSessions[2].detectedCommand)
+        XCTAssertFalse(allSessions[2].isAISession)
         XCTAssertTrue(allSessions[2].isAttached)
         XCTAssertEqual(allSessions[2].windowCount, 3)
         XCTAssertEqual(allSessions[2].currentPath, "/tmp")
+    }
+
+    func testDiscoverArbitrarySessionsAndAutoDetectAgents() throws {
+        let output = [
+            "termapp-ai-claude-term-app\t1\t1\t1700000000\t1700000900\t/Users/me/term-app\tclaude",
+            "dev\t1\t2\t1700000100\t1700000800\t/Users/me/my-service\tclaude",
+            "0\t0\t1\t1700000200\t1700000700\t/srv/Api_V2\t/opt/homebrew/bin/CODEX",
+            "ops\t0\t3\t1700000300\t1700000600\t/home/ubuntu\tzsh",
+            "main\t0\t1\t1700000400\t1700000500\t/Users/me\t-zsh",
+            "scratch\t1\t1\t1700000450\t1700000480\t/tmp\tnode",
+            "custom-run\t0\t1\t1700000460\t1700000470\t/Users/me/goose-repo\tgoose",
+            TMuxSessionHelper.panesBeginMarker,
+            "ops\tzsh\t/home/ubuntu",
+            "ops\t/usr/local/bin/agy\t/home/ubuntu/agent-workspace",
+            "main\tbash\t/Users/me",
+            "main\tvim\t/Users/me",
+            "scratch\tnode\t/tmp",
+        ].joined(separator: "\n")
+
+        // Managed-only filter excludes non-termapp-ai sessions even if they run AI CLIs.
+        let managedOnly = TMuxSessionHelper.parseSessions(from: output, onlyTermAppManaged: true)
+        XCTAssertEqual(managedOnly.map(\.sessionName), ["termapp-ai-claude-term-app"])
+        XCTAssertTrue(managedOnly[0].isTermAppManaged)
+        XCTAssertEqual(managedOnly[0].detectedCommand, "claude")
+        XCTAssertTrue(managedOnly[0].isAISession)
+
+        // All sessions discovery + built-in and custom command detection.
+        let sessions = TMuxSessionHelper.parseSessions(
+            from: output,
+            onlyTermAppManaged: false,
+            knownCommands: ["goose": "goose-agent"]
+        )
+        XCTAssertEqual(sessions.count, 7)
+
+        // 0: TermApp-managed session
+        XCTAssertTrue(sessions[0].isTermAppManaged)
+        XCTAssertTrue(sessions[0].isAISession)
+        XCTAssertEqual(sessions[0].agentSlug, "claude")
+        XCTAssertEqual(sessions[0].projectSlug, "term-app")
+        XCTAssertEqual(sessions[0].detectedCommand, "claude")
+
+        // 1: Arbitrary session "dev" running claude in 7th column
+        XCTAssertEqual(sessions[1].sessionName, "dev")
+        XCTAssertFalse(sessions[1].isTermAppManaged)
+        XCTAssertTrue(sessions[1].isAISession)
+        XCTAssertEqual(sessions[1].agentSlug, "claude")
+        XCTAssertEqual(sessions[1].projectSlug, "my-service")
+        XCTAssertEqual(sessions[1].detectedCommand, "claude")
+        XCTAssertEqual(sessions[1].currentPath, "/Users/me/my-service")
+
+        // 2: Numeric session "0" running /opt/homebrew/bin/CODEX (case-insensitive basename)
+        XCTAssertEqual(sessions[2].sessionName, "0")
+        XCTAssertFalse(sessions[2].isTermAppManaged)
+        XCTAssertTrue(sessions[2].isAISession)
+        XCTAssertEqual(sessions[2].agentSlug, "codex")
+        XCTAssertEqual(sessions[2].projectSlug, "api-v2")
+        XCTAssertEqual(sessions[2].detectedCommand, "codex")
+
+        // 3: Multi-pane session "ops" where active pane is zsh but secondary pane runs agy
+        XCTAssertEqual(sessions[3].sessionName, "ops")
+        XCTAssertFalse(sessions[3].isTermAppManaged)
+        XCTAssertTrue(sessions[3].isAISession)
+        XCTAssertEqual(sessions[3].agentSlug, "agy")
+        XCTAssertEqual(sessions[3].projectSlug, "agent-workspace")
+        XCTAssertEqual(sessions[3].detectedCommand, "agy")
+        XCTAssertEqual(sessions[3].currentPath, "/home/ubuntu/agent-workspace")
+
+        // 4: General session "main" running -zsh / bash / vim (not AI)
+        XCTAssertEqual(sessions[4].sessionName, "main")
+        XCTAssertFalse(sessions[4].isTermAppManaged)
+        XCTAssertFalse(sessions[4].isAISession)
+        XCTAssertEqual(sessions[4].agentSlug, "")
+        XCTAssertEqual(sessions[4].projectSlug, "main")
+        XCTAssertEqual(sessions[4].detectedCommand, "zsh")
+
+        // 5: General session "scratch" running node (not AI)
+        XCTAssertEqual(sessions[5].sessionName, "scratch")
+        XCTAssertFalse(sessions[5].isTermAppManaged)
+        XCTAssertFalse(sessions[5].isAISession)
+        XCTAssertEqual(sessions[5].agentSlug, "")
+        XCTAssertEqual(sessions[5].projectSlug, "scratch")
+        XCTAssertEqual(sessions[5].detectedCommand, "node")
+
+        // 6: Custom preset CLI detected via knownCommands
+        XCTAssertEqual(sessions[6].sessionName, "custom-run")
+        XCTAssertFalse(sessions[6].isTermAppManaged)
+        XCTAssertTrue(sessions[6].isAISession)
+        XCTAssertEqual(sessions[6].agentSlug, "goose-agent")
+        XCTAssertEqual(sessions[6].projectSlug, "goose-repo")
+        XCTAssertEqual(sessions[6].detectedCommand, "goose")
+    }
+
+    func testAutoDetectAiderOpenCodeAndPathFallbacks() throws {
+        let output = [
+            "work\t0\t2\t1700000000\t1700000100\t\tzsh",
+            "assist\t1\t1\t1700000000\t1700000200\t\topencode",
+            TMuxSessionHelper.panesBeginMarker,
+            "work\tzsh\t",
+            "work\taider\t/srv/billing",
+        ].joined(separator: "\n")
+
+        let sessions = TMuxSessionHelper.parseSessions(from: output, onlyTermAppManaged: false)
+        XCTAssertEqual(sessions.count, 2)
+
+        XCTAssertEqual(sessions[0].sessionName, "work")
+        XCTAssertEqual(sessions[0].agentSlug, "aider")
+        XCTAssertEqual(sessions[0].projectSlug, "billing")
+        XCTAssertEqual(sessions[0].currentPath, "/srv/billing")
+        XCTAssertTrue(sessions[0].isAISession)
+
+        XCTAssertEqual(sessions[1].sessionName, "assist")
+        XCTAssertEqual(sessions[1].agentSlug, "opencode")
+        XCTAssertEqual(sessions[1].projectSlug, "assist")
+        XCTAssertNil(sessions[1].currentPath)
+        XCTAssertTrue(sessions[1].isAISession)
+    }
+
+    func testRemoteAISessionDefaultsAndCodableBackwardCompatibility() throws {
+        // Existing initializer defaults remain backward compatible.
+        let defaultInitSession = TMuxSessionHelper.RemoteAISession(
+            sessionName: "termapp-ai-claude-app",
+            agentSlug: "claude",
+            projectSlug: "app",
+            isAttached: true,
+            windowCount: 1
+        )
+        XCTAssertTrue(defaultInitSession.isTermAppManaged)
+        XCTAssertNil(defaultInitSession.detectedCommand)
+        XCTAssertTrue(defaultInitSession.isAISession)
+
+        // Managed session whose agent exited to shell remains an AI session.
+        let managedExited = TMuxSessionHelper.RemoteAISession(
+            sessionName: "termapp-ai-codex-api",
+            agentSlug: "codex",
+            projectSlug: "api",
+            isAttached: false,
+            windowCount: 1,
+            isTermAppManaged: true,
+            detectedCommand: "zsh"
+        )
+        XCTAssertTrue(managedExited.isAISession)
+
+        let encoded = try JSONEncoder().encode(managedExited)
+        let decoded = try JSONDecoder().decode(TMuxSessionHelper.RemoteAISession.self, from: encoded)
+        XCTAssertEqual(decoded, managedExited)
+
+        // Legacy encoded payload lacking isTermAppManaged / detectedCommand decodes cleanly.
+        let legacyJSON = """
+        {"id":"dev","sessionName":"dev","agentSlug":"","projectSlug":"","isAttached":false,"windowCount":1}
+        """
+        let legacyDecoded = try JSONDecoder().decode(
+            TMuxSessionHelper.RemoteAISession.self,
+            from: Data(legacyJSON.utf8)
+        )
+        XCTAssertFalse(legacyDecoded.isTermAppManaged)
+        XCTAssertNil(legacyDecoded.detectedCommand)
+        XCTAssertFalse(legacyDecoded.isAISession)
+    }
+
+    func testIsTmuxMissingAndListSessionsShellSyntax() throws {
+        XCTAssertTrue(TMuxSessionHelper.isTmuxMissing(in: "TERMAPP_TMUX_MISSING\n"))
+        XCTAssertTrue(TMuxSessionHelper.isTmuxMissing(in: "Welcome\r\nTERMAPP_TMUX_MISSING\r\n"))
+        XCTAssertFalse(TMuxSessionHelper.isTmuxMissing(in: ""))
+        XCTAssertFalse(TMuxSessionHelper.isTmuxMissing(in: "TERMAPP_PANES_BEGIN\n"))
+        XCTAssertFalse(
+            TMuxSessionHelper.isTmuxMissing(
+                in: "TERMAPP_TMUX_MISSING\t0\t1\t1700000000\t1700000000\t/tmp\tzsh\nTERMAPP_PANES_BEGIN\n"
+            )
+        )
+        XCTAssertEqual(TMuxSessionHelper.parseSessions(from: "TERMAPP_TMUX_MISSING\n", onlyTermAppManaged: false), [])
+
+        let cmd = TMuxSessionHelper.listSessionsCommand()
+        XCTAssertFalse(cmd.contains("\n"))
+        XCTAssertFalse(cmd.contains("\r"))
+        XCTAssertEqual(cmd.filter { $0 == "'" }.count % 2, 0)
+        XCTAssertEqual(cmd.filter { $0 == "\"" }.count % 2, 0)
+        XCTAssertTrue(cmd.contains("if command -v tmux >/dev/null 2>&1; then "))
+        XCTAssertTrue(cmd.contains("; else printf 'TERMAPP_TMUX_MISSING\\n'; fi"))
+
+        #if os(macOS)
+        for shellPath in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: shellPath)
+            process.arguments = ["-n", "-c", cmd]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, "\(shellPath) -n failed on listSessionsCommand()")
+        }
+        #endif
     }
 
     func testListDirectoriesCommandAndParser() {
