@@ -233,27 +233,31 @@ final class ReconnectCoordinator {
                 Task { await conn.close() }
                 return
             }
-            let aiContext = self.manager.session(id: id)?.aiAgentContext
-            let tmux = aiContext.map { TMuxSessionHelper.attachCommand(sessionName: $0.sessionName) } ?? entry.tmuxCommand
+            let currentLive = self.manager.session(id: id)
+            let aiContext = currentLive?.aiAgentContext
+            let isTmuxBacked = currentLive?.isTmuxBacked ?? true
             self.entries[id] = nil
             entry.cancel()
             self.manager.replace(id, session: conn, bridge: bridge)
             self.manager.session(id: id)?.overlay = nil
-            if aiContext != nil, let tmux {
-                let targetBridge = bridge
-                let sessionManager = self.manager
-                Task { @MainActor in
-                    try? await Task.sleep(for: .milliseconds(250))
-                    guard !Task.isCancelled,
-                          let current = sessionManager.session(id: id),
-                          current.connectionStatus == .connected,
-                          current.bridge === targetBridge else {
-                        return
+            if let aiContext {
+                if isTmuxBacked {
+                    let tmux = TMuxSessionHelper.safeAttachCommand(sessionName: aiContext.sessionName)
+                    let targetBridge = bridge
+                    let sessionManager = self.manager
+                    Task { @MainActor in
+                        try? await Task.sleep(for: .milliseconds(250))
+                        guard !Task.isCancelled,
+                              let current = sessionManager.session(id: id),
+                              current.connectionStatus == .connected,
+                              current.bridge === targetBridge else {
+                            return
+                        }
+                        TmuxAttach.send(tmux, via: targetBridge)
                     }
-                    TmuxAttach.send(tmux, via: targetBridge)
                 }
             } else {
-                TmuxAttach.send(tmux, via: bridge)
+                TmuxAttach.send(entry.tmuxCommand, via: bridge)
             }
             self.watchSessions()
         }

@@ -171,16 +171,36 @@ public struct AIAgentLaunchContext: Codable, Sendable, Hashable {
     public var sessionName: String
     public var workingDirectory: String
     public var hostID: UUID?
+    public var isTmuxBacked: Bool
 
     public init(
         agent: AIAgentDescriptor,
         sessionName: String,
         workingDirectory: String,
-        hostID: UUID? = nil
+        hostID: UUID? = nil,
+        isTmuxBacked: Bool = true
     ) {
         self.agent = agent
         self.sessionName = sessionName
         self.workingDirectory = workingDirectory
         self.hostID = hostID
+        self.isTmuxBacked = isTmuxBacked
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case agent
+        case sessionName
+        case workingDirectory
+        case hostID
+        case isTmuxBacked
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        agent = try container.decode(AIAgentDescriptor.self, forKey: .agent)
+        sessionName = try container.decode(String.self, forKey: .sessionName)
+        workingDirectory = try container.decode(String.self, forKey: .workingDirectory)
+        hostID = try container.decodeIfPresent(UUID.self, forKey: .hostID)
+        isTmuxBacked = try container.decodeIfPresent(Bool.self, forKey: .isTmuxBacked) ?? true
     }
 }

@@ -71,6 +71,40 @@ final class AIAgentTests: XCTestCase {
         XCTAssertEqual(launchCtx.sessionName, "termapp-ai-claude-repo")
         XCTAssertEqual(launchCtx.workingDirectory, "~/repo")
         XCTAssertEqual(launchCtx.hostID, hostID)
+        XCTAssertTrue(launchCtx.isTmuxBacked)
+
+        let directCtx = AIAgentLaunchContext(
+            agent: builtIns[0],
+            sessionName: "termapp-ai-claude-repo",
+            workingDirectory: "~/repo",
+            hostID: hostID,
+            isTmuxBacked: false
+        )
+        XCTAssertFalse(directCtx.isTmuxBacked)
+    }
+
+    func testLaunchContextDecodingDefaultsIsTmuxBackedToTrue() throws {
+        let builtIn = AIAgentDescriptor(builtIn: .claude)
+        let original = AIAgentLaunchContext(
+            agent: builtIn,
+            sessionName: "termapp-ai-claude-repo",
+            workingDirectory: "~/repo",
+            hostID: UUID(),
+            isTmuxBacked: false
+        )
+        let encoded = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(AIAgentLaunchContext.self, from: encoded)
+        XCTAssertEqual(decoded, original)
+        XCTAssertFalse(decoded.isTmuxBacked)
+
+        let legacyPayload: [String: Any] = [
+            "agent": try JSONSerialization.jsonObject(with: JSONEncoder().encode(builtIn)),
+            "sessionName": "termapp-ai-claude-repo",
+            "workingDirectory": "~/repo",
+        ]
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyPayload)
+        let legacyDecoded = try JSONDecoder().decode(AIAgentLaunchContext.self, from: legacyData)
+        XCTAssertTrue(legacyDecoded.isTmuxBacked)
     }
 
     func testCustomPresetDecodingDefaultsMissingOptionalFields() throws {
@@ -201,6 +235,154 @@ final class AIAgentTests: XCTestCase {
         XCTAssertTrue(listCmd.contains("#{session_activity}"))
         XCTAssertTrue(listCmd.contains("#{pane_current_path}"))
         XCTAssertTrue(listCmd.contains("2>/dev/null || true"))
+    }
+
+    func testRemotePackageManagerDisplayNames() {
+        XCTAssertEqual(
+            TMuxSessionHelper.RemotePackageManager.allCases,
+            [.brew, .apt, .dnf, .yum, .pacman, .apk, .zypper, .pkg, .unknown]
+        )
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.brew.displayName, "Homebrew")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.apt.displayName, "APT")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.dnf.displayName, "DNF")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.yum.displayName, "YUM")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.pacman.displayName, "Pacman")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.apk.displayName, "APK")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.zypper.displayName, "Zypper")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.pkg.displayName, "pkg")
+        XCTAssertEqual(TMuxSessionHelper.RemotePackageManager.unknown.displayName, "Unknown")
+    }
+
+    func testCheckTmuxCommandAndParseTmuxAvailability() throws {
+        let cmd = TMuxSessionHelper.checkTmuxCommand()
+        XCTAssertFalse(cmd.contains("\n"))
+        XCTAssertFalse(cmd.contains("\r"))
+        XCTAssertTrue(cmd.contains("export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\""))
+        XCTAssertTrue(cmd.contains("command -v tmux >/dev/null 2>&1"))
+        XCTAssertTrue(cmd.contains("TMUX:INSTALLED"))
+        XCTAssertTrue(cmd.contains("TMUX:MISSING"))
+        XCTAssertTrue(cmd.contains("id -u"))
+        XCTAssertTrue(cmd.contains("ROOT:1"))
+        XCTAssertTrue(cmd.contains("ROOT:0"))
+        for token in ["brew", "apt-get", "PM:apt", "dnf", "yum", "pacman", "apk", "zypper", "pkg", "PM:unknown"] {
+            XCTAssertTrue(cmd.contains(token), "Missing expected token \(token) in checkTmuxCommand")
+        }
+
+        let macParsed = TMuxSessionHelper.parseTmuxAvailability(from: "TMUX:INSTALLED\nROOT:0\nPM:brew\n")
+        XCTAssertEqual(
+            macParsed,
+            TMuxSessionHelper.TMuxAvailability(isInstalled: true, packageManager: .brew, isRoot: false)
+        )
+
+        let linuxMotd = """
+        Welcome to Ubuntu 24.04.1 LTS\r
+        Last login: Tue Nov 25 09:00:00 2026\r
+        TMUX:MISSING\r
+        ROOT:1\r
+        PM:apt\r
+        """
+        XCTAssertEqual(
+            TMuxSessionHelper.parseTmuxAvailability(from: linuxMotd),
+            TMuxSessionHelper.TMuxAvailability(isInstalled: false, packageManager: .apt, isRoot: true)
+        )
+
+        for pm in TMuxSessionHelper.RemotePackageManager.allCases {
+            let parsed = TMuxSessionHelper.parseTmuxAvailability(from: "TMUX:MISSING\nROOT:0\nPM:\(pm.rawValue)\n")
+            XCTAssertEqual(parsed.packageManager, pm)
+            XCTAssertFalse(parsed.isInstalled)
+            XCTAssertFalse(parsed.isRoot)
+        }
+
+        let unrecognizedPM = TMuxSessionHelper.parseTmuxAvailability(from: "TMUX:MISSING\nROOT:0\nPM:nix\n")
+        XCTAssertEqual(
+            unrecognizedPM,
+            TMuxSessionHelper.TMuxAvailability(isInstalled: false, packageManager: .unknown, isRoot: false)
+        )
+
+        XCTAssertEqual(
+            TMuxSessionHelper.parseTmuxAvailability(from: ""),
+            TMuxSessionHelper.TMuxAvailability(isInstalled: false, packageManager: .unknown, isRoot: false)
+        )
+
+        let encoded = try JSONEncoder().encode(macParsed)
+        let decoded = try JSONDecoder().decode(TMuxSessionHelper.TMuxAvailability.self, from: encoded)
+        XCTAssertEqual(decoded, macParsed)
+    }
+
+    func testInstallTmuxCommand() {
+        let standardPATHPrefix = "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; "
+
+        // Unknown always returns nil.
+        for isRoot in [false, true] {
+            for interactive in [false, true] {
+                XCTAssertNil(
+                    TMuxSessionHelper.installTmuxCommand(packageManager: .unknown, isRoot: isRoot, interactive: interactive)
+                )
+            }
+        }
+
+        // Brew never uses sudo.
+        for isRoot in [false, true] {
+            for interactive in [false, true] {
+                let cmd = TMuxSessionHelper.installTmuxCommand(packageManager: .brew, isRoot: isRoot, interactive: interactive)
+                XCTAssertEqual(cmd, standardPATHPrefix + "brew install tmux")
+                XCTAssertFalse(cmd?.contains("sudo") ?? true)
+            }
+        }
+
+        // APT variants.
+        XCTAssertEqual(
+            TMuxSessionHelper.installTmuxCommand(packageManager: .apt, isRoot: true, interactive: false),
+            standardPATHPrefix + "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmux"
+        )
+        XCTAssertEqual(
+            TMuxSessionHelper.installTmuxCommand(packageManager: .apt, isRoot: true, interactive: true),
+            standardPATHPrefix + "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmux"
+        )
+        XCTAssertEqual(
+            TMuxSessionHelper.installTmuxCommand(packageManager: .apt, isRoot: false, interactive: false),
+            standardPATHPrefix + "sudo -n sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmux'"
+        )
+        XCTAssertEqual(
+            TMuxSessionHelper.installTmuxCommand(packageManager: .apt, isRoot: false, interactive: true),
+            standardPATHPrefix + "sudo apt-get update && sudo apt-get install -y tmux"
+        )
+
+        // Other Linux / BSD package managers.
+        let expectations: [(TMuxSessionHelper.RemotePackageManager, String)] = [
+            (.dnf, "dnf install -y tmux"),
+            (.yum, "yum install -y tmux"),
+            (.pacman, "pacman -Sy --noconfirm tmux"),
+            (.apk, "apk add --no-cache tmux"),
+            (.zypper, "zypper --non-interactive install tmux"),
+            (.pkg, "pkg install -y tmux"),
+        ]
+
+        for (pm, baseCmd) in expectations {
+            XCTAssertEqual(
+                TMuxSessionHelper.installTmuxCommand(packageManager: pm, isRoot: true, interactive: false),
+                standardPATHPrefix + baseCmd
+            )
+            XCTAssertEqual(
+                TMuxSessionHelper.installTmuxCommand(packageManager: pm, isRoot: false, interactive: false),
+                standardPATHPrefix + "sudo -n " + baseCmd
+            )
+            XCTAssertEqual(
+                TMuxSessionHelper.installTmuxCommand(packageManager: pm, isRoot: false, interactive: true),
+                standardPATHPrefix + "sudo " + baseCmd
+            )
+        }
+    }
+
+    func testSafeAttachCommand() {
+        let cmd = TMuxSessionHelper.safeAttachCommand(sessionName: "termapp-ai-claude-app")
+        XCTAssertFalse(cmd.contains("\n"))
+        XCTAssertFalse(cmd.contains("\r"))
+        XCTAssertTrue(cmd.contains("export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\""))
+        XCTAssertTrue(cmd.contains("if command -v tmux >/dev/null 2>&1; then tmux attach-session -t 'termapp-ai-claude-app'; fi"))
+
+        let odd = TMuxSessionHelper.safeAttachCommand(sessionName: "odd'name$(id)")
+        XCTAssertTrue(odd.contains("if command -v tmux >/dev/null 2>&1; then tmux attach-session -t 'odd'\\''name$(id)'; fi"))
     }
 
     // MARK: - Output Parsing

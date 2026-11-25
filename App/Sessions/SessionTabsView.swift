@@ -273,6 +273,9 @@ struct SessionTabsView<HostList: View>: View {
         .environment(\.launchAIAgent) { host, context, command in
             launchAIAgent(host: host, context: context, command: command)
         }
+        .environment(\.runTerminalCommand) { host, command in
+            connectHost(host, pendingLaunchCommand: command)
+        }
         .background(SceneReader(scene: $scene))
         .background {
             if let scene {

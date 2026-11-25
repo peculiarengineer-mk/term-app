@@ -20,8 +20,17 @@ struct AITerminalControlsOverlay: View {
         live.connectionStatus == .connected
     }
 
+    private var showNoTmuxNotice: Bool {
+        live.aiAgentContext != nil && !live.isTmuxBacked && !live.tmuxNoticeDismissed
+    }
+
     var body: some View {
         VStack(spacing: 0) {
+            if showNoTmuxNotice {
+                noTmuxNoticeStrip
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+
             if isComposerExpanded {
                 AIPromptComposerView(
                     prompt: $live.aiPromptDraft,
@@ -78,6 +87,55 @@ struct AITerminalControlsOverlay: View {
         }
         withAnimation(.easeInOut(duration: 0.18)) {
             isComposerExpanded = false
+        }
+    }
+
+    private var noTmuxNoticeStrip: some View {
+        let amber = AgentVisuals.appleProAmber
+        let border = theme.isDark ? Color.white.opacity(0.12) : Color.black.opacity(0.10)
+
+        return VStack(spacing: 0) {
+            Rectangle()
+                .fill(border)
+                .frame(height: 0.5)
+
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(amber)
+                    .accessibilityHidden(true)
+
+                Text("No tmux · This agent session will end if you close TermApp.")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(theme.foregroundColor)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 4)
+
+                Button {
+                    AppHaptics.impact(.light)
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        live.tmuxNoticeDismissed = true
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(theme.secondaryForegroundColor)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss tmux persistence warning")
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 5)
+            .background {
+                ZStack {
+                    theme.backgroundColor.opacity(0.86)
+                    Rectangle().fill(.ultraThinMaterial)
+                    amber.opacity(theme.isDark ? 0.14 : 0.10)
+                }
+            }
         }
     }
 }

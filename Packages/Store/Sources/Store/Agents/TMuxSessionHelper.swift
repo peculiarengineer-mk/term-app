@@ -53,6 +53,46 @@ public enum TMuxSessionHelper {
         }
     }
 
+    /// Package managers detected on a remote host for 1-tap `tmux` installation.
+    public enum RemotePackageManager: String, Codable, Sendable, Equatable, CaseIterable {
+        case brew
+        case apt
+        case dnf
+        case yum
+        case pacman
+        case apk
+        case zypper
+        case pkg
+        case unknown
+
+        public var displayName: String {
+            switch self {
+            case .brew: "Homebrew"
+            case .apt: "APT"
+            case .dnf: "DNF"
+            case .yum: "YUM"
+            case .pacman: "Pacman"
+            case .apk: "APK"
+            case .zypper: "Zypper"
+            case .pkg: "pkg"
+            case .unknown: "Unknown"
+            }
+        }
+    }
+
+    /// Result of probing a remote host for `tmux`, root privilege, and available package manager.
+    public struct TMuxAvailability: Codable, Sendable, Equatable {
+        public let isInstalled: Bool
+        public let packageManager: RemotePackageManager
+        public let isRoot: Bool
+
+        public init(isInstalled: Bool, packageManager: RemotePackageManager, isRoot: Bool) {
+            self.isInstalled = isInstalled
+            self.packageManager = packageManager
+            self.isRoot = isRoot
+        }
+    }
+
     // MARK: - Quoting & Naming
 
     /// Wraps `value` in POSIX single quotes, escaping embedded single quotes as `'\''`.
@@ -208,6 +248,74 @@ public enum TMuxSessionHelper {
         return "export PATH=\"\(standardPATH):$PATH\"; tmux attach-session -t \(quoted)"
     }
 
+    /// Builds a POSIX command to attach to an existing `tmux` session only if `tmux` is installed.
+    public static func safeAttachCommand(sessionName: String) -> String {
+        let quoted = shellQuote(sessionName)
+        return "export PATH=\"\(standardPATH):$PATH\"; if command -v tmux >/dev/null 2>&1; then tmux attach-session -t \(quoted); fi"
+    }
+
+    /// Builds a POSIX command that checks whether `tmux` is installed, whether the user is root, and which package manager is available.
+    public static func checkTmuxCommand() -> String {
+        let pathExport = "export PATH=\"\(standardPATH):$PATH\""
+        let tmuxCheck = "if command -v tmux >/dev/null 2>&1; then printf 'TMUX:INSTALLED\\n'; else printf 'TMUX:MISSING\\n'; fi"
+        let rootCheck = "if [ \"$(id -u 2>/dev/null)\" = \"0\" ]; then printf 'ROOT:1\\n'; else printf 'ROOT:0\\n'; fi"
+        let pmCheck = [
+            "if command -v brew >/dev/null 2>&1; then printf 'PM:brew\\n'",
+            "elif command -v apt-get >/dev/null 2>&1; then printf 'PM:apt\\n'",
+            "elif command -v dnf >/dev/null 2>&1; then printf 'PM:dnf\\n'",
+            "elif command -v yum >/dev/null 2>&1; then printf 'PM:yum\\n'",
+            "elif command -v pacman >/dev/null 2>&1; then printf 'PM:pacman\\n'",
+            "elif command -v apk >/dev/null 2>&1; then printf 'PM:apk\\n'",
+            "elif command -v zypper >/dev/null 2>&1; then printf 'PM:zypper\\n'",
+            "elif command -v pkg >/dev/null 2>&1; then printf 'PM:pkg\\n'",
+            "else printf 'PM:unknown\\n'; fi",
+        ].joined(separator: "; ")
+        return "\(pathExport); \(tmuxCheck); \(rootCheck); \(pmCheck)"
+    }
+
+    /// Builds a POSIX command to install `tmux` with the given package manager, or `nil` for `.unknown`.
+    public static func installTmuxCommand(
+        packageManager: RemotePackageManager,
+        isRoot: Bool,
+        interactive: Bool
+    ) -> String? {
+        let pathPrefix = "export PATH=\"\(standardPATH):$PATH\"; "
+        let installStep: String
+        switch packageManager {
+        case .unknown:
+            return nil
+        case .brew:
+            // Homebrew refuses to run as root and manages its own prefix permissions.
+            installStep = "brew install tmux"
+        case .apt:
+            if isRoot {
+                installStep = "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmux"
+            } else if !interactive {
+                installStep = "sudo -n sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmux'"
+            } else {
+                installStep = "sudo apt-get update && sudo apt-get install -y tmux"
+            }
+        case .dnf:
+            installStep = sudoWrapped("dnf install -y tmux", isRoot: isRoot, interactive: interactive)
+        case .yum:
+            installStep = sudoWrapped("yum install -y tmux", isRoot: isRoot, interactive: interactive)
+        case .pacman:
+            installStep = sudoWrapped("pacman -Sy --noconfirm tmux", isRoot: isRoot, interactive: interactive)
+        case .apk:
+            installStep = sudoWrapped("apk add --no-cache tmux", isRoot: isRoot, interactive: interactive)
+        case .zypper:
+            installStep = sudoWrapped("zypper --non-interactive install tmux", isRoot: isRoot, interactive: interactive)
+        case .pkg:
+            installStep = sudoWrapped("pkg install -y tmux", isRoot: isRoot, interactive: interactive)
+        }
+        return pathPrefix + installStep
+    }
+
+    private static func sudoWrapped(_ command: String, isRoot: Bool, interactive: Bool) -> String {
+        if isRoot { return command }
+        return interactive ? "sudo \(command)" : "sudo -n \(command)"
+    }
+
     /// Builds a POSIX command to kill a specific `tmux` session.
     public static func killSessionCommand(sessionName: String) -> String {
         let quoted = shellQuote(sessionName)
@@ -321,6 +429,37 @@ public enum TMuxSessionHelper {
         }
 
         return RemoteDirectoryListing(currentPath: currentPath, directories: directories)
+    }
+
+    /// Parses output from `checkTmuxCommand()` into `TMuxAvailability`.
+    public static func parseTmuxAvailability(from output: String) -> TMuxAvailability {
+        var isInstalled = false
+        var isRoot = false
+        var packageManager: RemotePackageManager = .unknown
+
+        for rawLine in output.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty { continue }
+
+            if line == "TMUX:INSTALLED" {
+                isInstalled = true
+            } else if line == "TMUX:MISSING" {
+                isInstalled = false
+            } else if line == "ROOT:1" {
+                isRoot = true
+            } else if line == "ROOT:0" {
+                isRoot = false
+            } else if line.hasPrefix("PM:") {
+                let rawPM = String(line.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                packageManager = RemotePackageManager(rawValue: rawPM) ?? .unknown
+            }
+        }
+
+        return TMuxAvailability(
+            isInstalled: isInstalled,
+            packageManager: packageManager,
+            isRoot: isRoot
+        )
     }
 
     // MARK: - Bracketed Paste

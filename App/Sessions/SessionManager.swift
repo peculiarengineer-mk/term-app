@@ -36,6 +36,10 @@ final class LiveSession: Identifiable {
     var ephemeralHost: Host?
     /// Optional AI agent launch/attach metadata when this session runs a managed AI coding agent.
     var aiAgentContext: AIAgentLaunchContext?
+    /// Whether this AI agent session runs inside `tmux` (`false` when launched while `tmux` is missing).
+    var isTmuxBacked: Bool
+    /// The user dismissed the missing-`tmux` persistence notice for this session.
+    var tmuxNoticeDismissed = false
     /// One-shot launch/attach command sent once the session is connected, then cleared.
     var pendingLaunchCommand: String?
     /// Controls visibility of the docked mobile AI Quick-Action Bar & Prompt Composer.
@@ -52,11 +56,13 @@ final class LiveSession: Identifiable {
         algorithms: NegotiatedAlgorithms? = nil,
         ephemeralHost: Host? = nil,
         aiAgentContext: AIAgentLaunchContext? = nil,
-        pendingLaunchCommand: String? = nil
+        pendingLaunchCommand: String? = nil,
+        isTmuxBacked: Bool? = nil
     ) {
         self.algorithms = algorithms
         self.ephemeralHost = ephemeralHost
         self.aiAgentContext = aiAgentContext
+        self.isTmuxBacked = isTmuxBacked ?? aiAgentContext?.isTmuxBacked ?? true
         self.pendingLaunchCommand = pendingLaunchCommand
         self.showAIAgentControls = aiAgentContext != nil
         self.id = id; self.hostID = hostID; self.title = title
@@ -124,7 +130,8 @@ final class SessionManager {
         algorithms: NegotiatedAlgorithms? = nil,
         ephemeralHost: Host? = nil,
         aiAgentContext: AIAgentLaunchContext? = nil,
-        pendingLaunchCommand: String? = nil
+        pendingLaunchCommand: String? = nil,
+        isTmuxBacked: Bool? = nil
     ) -> LiveSession {
         let live = LiveSession(
             hostID: hostID,
@@ -134,7 +141,8 @@ final class SessionManager {
             algorithms: algorithms,
             ephemeralHost: ephemeralHost,
             aiAgentContext: aiAgentContext,
-            pendingLaunchCommand: pendingLaunchCommand
+            pendingLaunchCommand: pendingLaunchCommand,
+            isTmuxBacked: isTmuxBacked
         )
         sessions.append(live)
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
@@ -225,6 +233,10 @@ private struct LaunchAIAgentKey: EnvironmentKey {
     static let defaultValue: (@MainActor (Host, AIAgentLaunchContext, String) -> Void)? = nil
 }
 
+private struct RunTerminalCommandKey: EnvironmentKey {
+    static let defaultValue: (@MainActor (Host, String) -> Void)? = nil
+}
+
 extension EnvironmentValues {
     /// Set by `SessionTabsView`: shows a just-opened session as a tab in this window.
     var openSessionTab: @MainActor (UUID) -> Void {
@@ -242,5 +254,11 @@ extension EnvironmentValues {
     var launchAIAgent: (@MainActor (Host, AIAgentLaunchContext, String) -> Void)? {
         get { self[LaunchAIAgentKey.self] }
         set { self[LaunchAIAgentKey.self] = newValue }
+    }
+
+    /// Set by `SessionTabsView`: opens an interactive terminal tab for `Host` and executes a one-shot shell command.
+    var runTerminalCommand: (@MainActor (Host, String) -> Void)? {
+        get { self[RunTerminalCommandKey.self] }
+        set { self[RunTerminalCommandKey.self] = newValue }
     }
 }

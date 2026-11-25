@@ -12,6 +12,7 @@ struct LaunchAIAgentSheet: View {
     @Environment(SessionManager.self) private var sessionManager
     @Environment(ProStore.self) private var proStore
     @Environment(\.launchAIAgent) private var launchAIAgent
+    @Environment(\.runTerminalCommand) private var runTerminalCommand
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
 
@@ -26,6 +27,13 @@ struct LaunchAIAgentSheet: View {
     @State private var showingCustomPresetSheet = false
     @State private var showingPaywall = false
     @State private var didInitialize = false
+    @State private var tmuxAvailability: TMuxSessionHelper.TMuxAvailability?
+    @State private var isInstallingTmux = false
+    @State private var tmuxInstallError: String?
+    @State private var tmuxRequiresInteractiveInstall = false
+    @State private var tmuxJustInstalled = false
+    @State private var tmuxProbeGeneration = 0
+    @State private var tmuxInstallTask: Task<Void, Never>?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
 
@@ -67,6 +75,10 @@ struct LaunchAIAgentSheet: View {
         TMuxSessionHelper.sessionName(agentSlug: selectedAgent.slug, workingDirectory: normalizedWorkingDirectory)
     }
 
+    private var isTmuxKnownMissing: Bool {
+        tmuxAvailability?.isInstalled == false
+    }
+
     var body: some View {
         NavigationStack {
             Group {
@@ -87,7 +99,7 @@ struct LaunchAIAgentSheet: View {
                     Button("Cancel") { dismiss() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Launch") {
+                    Button(isTmuxKnownMissing ? "Launch Anyway" : "Launch") {
                         launchSession()
                     }
                     .fontWeight(.semibold)
@@ -104,6 +116,17 @@ struct LaunchAIAgentSheet: View {
                         applyHostDefaults(for: initial.id)
                     }
                 }
+            }
+            .task(id: selectedHost?.id) {
+                guard let host = selectedHost else {
+                    resetTmuxProbeState()
+                    return
+                }
+                await probeTmuxStatus(for: host)
+            }
+            .onDisappear {
+                tmuxInstallTask?.cancel()
+                tmuxInstallTask = nil
             }
             .sheet(isPresented: $showingFolderPicker) {
                 if let host = selectedHost {
@@ -146,12 +169,148 @@ struct LaunchAIAgentSheet: View {
     private var launchForm: some View {
         Form {
             hostSection
+            tmuxStatusSection
             agentSection
             directorySection
             optionsSection
             launchButtonSection
         }
         .scrollDismissesKeyboard(.interactively)
+    }
+
+    @ViewBuilder
+    private var tmuxStatusSection: some View {
+        if let host = selectedHost {
+            if tmuxJustInstalled, tmuxAvailability?.isInstalled == true {
+                Section {
+                    tmuxConfirmedCard
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                }
+            } else if let availability = tmuxAvailability, !availability.isInstalled {
+                Section {
+                    tmuxMissingCard(host: host, availability: availability)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
+                }
+            }
+        }
+    }
+
+    private func tmuxMissingCard(
+        host: Host,
+        availability: TMuxSessionHelper.TMuxAvailability
+    ) -> some View {
+        let amber = AgentVisuals.appleProAmber
+        let fill = amber.opacity(theme.isDark ? 0.14 : 0.10)
+        let stroke = amber.opacity(0.45)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(amber)
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("tmux is not installed on \(hostDisplayLabel(host))")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+
+                    Text("Without tmux, your agent session will die if you close TermApp or lose connection.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if availability.packageManager != .unknown {
+                if let tmuxInstallError {
+                    Text(tmuxInstallError)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(tmuxRequiresInteractiveInstall ? amber : Color.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if tmuxRequiresInteractiveInstall,
+                   let interactiveCmd = TMuxSessionHelper.installTmuxCommand(
+                       packageManager: availability.packageManager,
+                       isRoot: availability.isRoot,
+                       interactive: true
+                   ) {
+                    VStack(spacing: 8) {
+                        Button {
+                            AppHaptics.impact(.light)
+                            dismiss()
+                            runTerminalCommand?(host, interactiveCmd)
+                        } label: {
+                            Label("Install in Terminal", systemImage: "terminal.fill")
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                        .tint(amber)
+                        .disabled(isInstallingTmux)
+                    }
+                } else {
+                    Button {
+                        startTmuxInstall(on: host, availability: availability)
+                    } label: {
+                        HStack(spacing: 8) {
+                            if isInstallingTmux {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Installing tmux via \(availability.packageManager.displayName)…")
+                                    .font(.subheadline.weight(.semibold))
+                            } else {
+                                Label(
+                                    "Install tmux via \(availability.packageManager.displayName)",
+                                    systemImage: "arrow.down.circle.fill"
+                                )
+                                .font(.subheadline.weight(.semibold))
+                            }
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
+                    .tint(amber)
+                    .disabled(isInstallingTmux)
+                }
+            }
+        }
+        .padding(14)
+        .background(fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(stroke, lineWidth: 1)
+        )
+    }
+
+    private var tmuxConfirmedCard: some View {
+        let green = AgentVisuals.activeGreen
+        let fill = green.opacity(theme.isDark ? 0.14 : 0.10)
+        let stroke = green.opacity(0.45)
+
+        return HStack(spacing: 10) {
+            Image(systemName: "checkmark.circle.fill")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(green)
+                .accessibilityHidden(true)
+
+            Text("tmux installed — your agent session will persist in the background.")
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(fill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(stroke, lineWidth: 1)
+        )
     }
 
     private var hostSection: some View {
@@ -428,7 +587,11 @@ struct LaunchAIAgentSheet: View {
         } header: {
             Text("Session Options")
         } footer: {
-            Text("Relaunching in the same project directory reattaches to this persistent tmux session.")
+            Text(
+                isTmuxKnownMissing
+                    ? "tmux is not installed, so this agent will run directly in your shell without background persistence."
+                    : "Relaunching in the same project directory reattaches to this persistent tmux session."
+            )
         }
     }
 
@@ -439,7 +602,7 @@ struct LaunchAIAgentSheet: View {
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: AgentVisuals.agentSymbol(for: selectedAgent))
-                    Text("Launch \(selectedAgent.name)")
+                    Text(isTmuxKnownMissing ? "Launch \(selectedAgent.name) Anyway" : "Launch \(selectedAgent.name)")
                         .fontWeight(.semibold)
                 }
                 .frame(maxWidth: .infinity)
@@ -450,10 +613,15 @@ struct LaunchAIAgentSheet: View {
             .listRowBackground(Color.clear)
             .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 0))
             .disabled(selectedHost == nil)
+        } footer: {
+            if isTmuxKnownMissing {
+                Text("Running without tmux: closing TermApp or losing connection will terminate this agent.")
+            }
         }
     }
 
     private func applyHostDefaults(for hostID: UUID) {
+        resetTmuxProbeState()
         let hostFavorites = HostProjectStore.favorites(for: hostID)
         let hostRecents = HostProjectStore.recents(for: hostID)
         favorites = hostFavorites
@@ -473,6 +641,172 @@ struct LaunchAIAgentSheet: View {
         } else {
             selectedAgentID = BuiltInAIAgent.claude.id
         }
+    }
+
+    private func resetTmuxProbeState() {
+        tmuxInstallTask?.cancel()
+        tmuxInstallTask = nil
+        tmuxAvailability = nil
+        isInstallingTmux = false
+        tmuxInstallError = nil
+        tmuxRequiresInteractiveInstall = false
+        tmuxJustInstalled = false
+    }
+
+    private func probeTmuxStatus(for host: Host) async {
+        tmuxProbeGeneration += 1
+        let generation = tmuxProbeGeneration
+        let target = AgentHostTarget(host: host, sessionManager: sessionManager)
+
+        do {
+            let result = try await AgentAuthHelper.exec(
+                TMuxSessionHelper.checkTmuxCommand(),
+                on: target,
+                timeout: .seconds(8)
+            )
+            guard !Task.isCancelled,
+                  generation == tmuxProbeGeneration,
+                  selectedHost?.id == host.id else {
+                return
+            }
+            guard result.exitCode == 0,
+                  result.stdout.contains("TMUX:INSTALLED") || result.stdout.contains("TMUX:MISSING") else {
+                tmuxAvailability = nil
+                return
+            }
+            let parsed = TMuxSessionHelper.parseTmuxAvailability(from: result.stdout)
+            withAnimation(.easeInOut(duration: 0.2)) {
+                tmuxAvailability = parsed
+            }
+        } catch {
+            // Silently ignore auth, untrusted-host, or reachability errors on unconfigured hosts.
+            guard !Task.isCancelled,
+                  generation == tmuxProbeGeneration,
+                  selectedHost?.id == host.id else {
+                return
+            }
+            tmuxAvailability = nil
+        }
+    }
+
+    private func startTmuxInstall(on host: Host, availability: TMuxSessionHelper.TMuxAvailability) {
+        guard !isInstallingTmux else { return }
+        tmuxInstallTask?.cancel()
+        tmuxInstallTask = Task {
+            await installTmux(on: host, availability: availability)
+        }
+    }
+
+    private func installTmux(on host: Host, availability: TMuxSessionHelper.TMuxAvailability) async {
+        guard let command = TMuxSessionHelper.installTmuxCommand(
+            packageManager: availability.packageManager,
+            isRoot: availability.isRoot,
+            interactive: false
+        ) else {
+            return
+        }
+
+        AppHaptics.impact(.light)
+        isInstallingTmux = true
+        tmuxInstallError = nil
+        tmuxRequiresInteractiveInstall = false
+
+        let target = AgentHostTarget(host: host, sessionManager: sessionManager)
+        let hostID = host.id
+
+        do {
+            let result = try await AgentAuthHelper.exec(
+                command,
+                on: target,
+                timeout: .seconds(90)
+            )
+            guard !Task.isCancelled, selectedHost?.id == hostID else { return }
+
+            if result.exitCode == 0 {
+                let verifyResult = try await AgentAuthHelper.exec(
+                    TMuxSessionHelper.checkTmuxCommand(),
+                    on: target,
+                    timeout: .seconds(8)
+                )
+                guard !Task.isCancelled, selectedHost?.id == hostID else { return }
+
+                if verifyResult.exitCode == 0,
+                   verifyResult.stdout.contains("TMUX:INSTALLED") || verifyResult.stdout.contains("TMUX:MISSING") {
+                    let verified = TMuxSessionHelper.parseTmuxAvailability(from: verifyResult.stdout)
+                    isInstallingTmux = false
+                    if verified.isInstalled {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            tmuxAvailability = verified
+                            tmuxJustInstalled = true
+                            tmuxInstallError = nil
+                            tmuxRequiresInteractiveInstall = false
+                        }
+                        AppHaptics.notify(.success)
+                    } else {
+                        tmuxAvailability = verified
+                        tmuxInstallError = "Installation finished, but tmux was not found in PATH."
+                        tmuxRequiresInteractiveInstall = TMuxSessionHelper.installTmuxCommand(
+                            packageManager: availability.packageManager,
+                            isRoot: availability.isRoot,
+                            interactive: true
+                        ) != nil
+                        AppHaptics.notify(.warning)
+                    }
+                    return
+                }
+            }
+
+            isInstallingTmux = false
+            handleNonZeroInstallResult(result, availability: availability)
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled, selectedHost?.id == hostID else { return }
+            isInstallingTmux = false
+            tmuxInstallError = error.localizedDescription
+            tmuxRequiresInteractiveInstall = TMuxSessionHelper.installTmuxCommand(
+                packageManager: availability.packageManager,
+                isRoot: availability.isRoot,
+                interactive: true
+            ) != nil
+            AppHaptics.notify(.error)
+        }
+    }
+
+    private func handleNonZeroInstallResult(
+        _ result: SSHExecResult,
+        availability: TMuxSessionHelper.TMuxAvailability
+    ) {
+        let combined = (result.stderr + "\n" + result.stdout).lowercased()
+        let needsPassword = !availability.isRoot
+            && availability.packageManager != .brew
+            && (combined.contains("password")
+                || combined.contains("no tty")
+                || combined.contains("a terminal is required")
+                || combined.contains("askpass"))
+
+        if needsPassword {
+            tmuxInstallError = "Administrator password required to install tmux."
+        } else {
+            tmuxInstallError = conciseErrorLine(from: result.stderr)
+                ?? conciseErrorLine(from: result.stdout)
+                ?? "Install failed (exit code \(result.exitCode))."
+        }
+        tmuxRequiresInteractiveInstall = TMuxSessionHelper.installTmuxCommand(
+            packageManager: availability.packageManager,
+            isRoot: availability.isRoot,
+            interactive: true
+        ) != nil
+        AppHaptics.notify(.error)
+    }
+
+    private func conciseErrorLine(from output: String) -> String? {
+        let lines = output
+            .split(omittingEmptySubsequences: true, whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let line = lines.last else { return nil }
+        return line.count > 160 ? String(line.prefix(157)) + "…" : line
     }
 
     private func toggleFavoriteDirectory() {
@@ -512,7 +846,8 @@ struct LaunchAIAgentSheet: View {
             agent: agent,
             sessionName: sessionName,
             workingDirectory: dir,
-            hostID: host.id
+            hostID: host.id,
+            isTmuxBacked: tmuxAvailability?.isInstalled ?? true
         )
 
         AppHaptics.notify(.success)
