@@ -233,12 +233,28 @@ final class ReconnectCoordinator {
                 Task { await conn.close() }
                 return
             }
-            let tmux = entry.tmuxCommand
+            let aiContext = self.manager.session(id: id)?.aiAgentContext
+            let tmux = aiContext.map { TMuxSessionHelper.attachCommand(sessionName: $0.sessionName) } ?? entry.tmuxCommand
             self.entries[id] = nil
             entry.cancel()
             self.manager.replace(id, session: conn, bridge: bridge)
             self.manager.session(id: id)?.overlay = nil
-            TmuxAttach.send(tmux, via: bridge)
+            if aiContext != nil, let tmux {
+                let targetBridge = bridge
+                let sessionManager = self.manager
+                Task { @MainActor in
+                    try? await Task.sleep(for: .milliseconds(250))
+                    guard !Task.isCancelled,
+                          let current = sessionManager.session(id: id),
+                          current.connectionStatus == .connected,
+                          current.bridge === targetBridge else {
+                        return
+                    }
+                    TmuxAttach.send(tmux, via: targetBridge)
+                }
+            } else {
+                TmuxAttach.send(tmux, via: bridge)
+            }
             self.watchSessions()
         }
         snap.model.onFailed = { [weak self, weak entry] network in

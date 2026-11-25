@@ -124,6 +124,8 @@ struct SessionTabsView<HostList: View>: View {
         let host: Host
         let title: String
         let model: HostConnectionModel
+        let aiAgentContext: AIAgentLaunchContext?
+        let pendingLaunchCommand: String?
     }
 
     private enum TabEntry: Identifiable {
@@ -268,6 +270,9 @@ struct SessionTabsView<HostList: View>: View {
         }
         .environment(\.openSessionTab) { id in addTab(id) }
         .environment(\.connectHost) { host in connectHost(host) }
+        .environment(\.launchAIAgent) { host, context, command in
+            launchAIAgent(host: host, context: context, command: command)
+        }
         .background(SceneReader(scene: $scene))
         .background {
             if let scene {
@@ -441,6 +446,12 @@ struct SessionTabsView<HostList: View>: View {
             } label: {
                 HStack(spacing: 6) {
                     ConnectionStatusDot(status: live.connectionStatus)
+                    if let ai = live.aiAgentContext {
+                        Image(systemName: AgentVisuals.agentSymbol(for: ai.agent))
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(AgentVisuals.agentTint(for: ai.agent))
+                            .accessibilityHidden(true)
+                    }
                     Text(live.title)
                         .lineLimit(1)
                         .font(.subheadline.weight(isSelected ? .semibold : .medium))
@@ -563,11 +574,27 @@ struct SessionTabsView<HostList: View>: View {
         }
     }
 
-    func connectHost(_ host: Host) {
+    func launchAIAgent(host: Host, context: AIAgentLaunchContext, command: String) {
+        connectHost(host, aiAgentContext: context, pendingLaunchCommand: command)
+    }
+
+    func connectHost(
+        _ host: Host,
+        aiAgentContext: AIAgentLaunchContext? = nil,
+        pendingLaunchCommand: String? = nil
+    ) {
         let pendingID = UUID()
-        let title = host.label.isEmpty ? host.hostname : host.label
+        let hostTitle = host.label.isEmpty ? host.hostname : host.label
+        let title = aiAgentContext.map { "\($0.agent.name) · \(hostTitle)" } ?? hostTitle
         let model = HostConnectionModel(host: host)
-        let pending = PendingConnection(id: pendingID, host: host, title: title, model: model)
+        let pending = PendingConnection(
+            id: pendingID,
+            host: host,
+            title: title,
+            model: model,
+            aiAgentContext: aiAgentContext,
+            pendingLaunchCommand: pendingLaunchCommand
+        )
         pendingConnections.append(pending)
         tabOrder.append(pendingID)
         selection = pendingID
@@ -577,16 +604,22 @@ struct SessionTabsView<HostList: View>: View {
                 Task { await conn.close() }
                 return
             }
-            let resolvedTitle = model.title.isEmpty ? title : model.title
+            let resolvedHostTitle = model.title.isEmpty ? hostTitle : model.title
+            let resolvedTitle = aiAgentContext.map { "\($0.agent.name) · \(resolvedHostTitle)" } ?? resolvedHostTitle
             let live = manager.open(
                 hostID: host.id,
                 title: resolvedTitle,
                 session: conn,
                 bridge: bridge,
-                ephemeralHost: host.modelContext == nil ? host : nil
+                ephemeralHost: host.modelContext == nil ? host : nil,
+                aiAgentContext: aiAgentContext,
+                pendingLaunchCommand: pendingLaunchCommand
             ) // wiring: T8
-            TmuxAttach.send(model.tmux, via: bridge) // wiring: T9
+            if aiAgentContext == nil && pendingLaunchCommand == nil {
+                TmuxAttach.send(model.tmux, via: bridge) // wiring: T9
+            }
             completePending(pendingID, liveID: live.id)
+            live.dispatchPendingLaunchCommandIfReady()
         }
         model.start()
     }
@@ -825,6 +858,22 @@ struct SessionToolsMenu: View {
                 }
             }
             .disabled(isProUnlocked && sshConnection == nil)
+
+            Divider()
+
+            Button {
+                AppHaptics.impact(.light)
+                guard isProUnlocked else {
+                    onSelect(.paywall)
+                    return
+                }
+                live.showAIAgentControls.toggle()
+            } label: {
+                Label(
+                    live.showAIAgentControls ? "Hide AI Agent Controls" : "AI Agent Controls",
+                    systemImage: live.showAIAgentControls ? "sparkles.rectangle.stack.fill" : "sparkles"
+                )
+            }
         } label: {
             Image(systemName: "square.grid.2x2")
                 .font(.subheadline.weight(.semibold))

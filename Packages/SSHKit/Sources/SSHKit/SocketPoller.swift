@@ -130,7 +130,7 @@ enum SocketPoller {
         }
     }
 
-    private static func remainingMilliseconds(until deadline: ContinuousClock.Instant) -> Int64 {
+    static func remainingMilliseconds(until deadline: ContinuousClock.Instant) -> Int64 {
         let rem = deadline - ContinuousClock.now
         guard rem > .zero else { return 0 }
         let (sec, atto) = rem.components

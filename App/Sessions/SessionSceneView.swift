@@ -9,6 +9,7 @@ import TermUI
 /// bridge rebuilds the terminal view.
 struct TerminalPane: View {
     let live: LiveSession
+    @Environment(ProStore.self) private var proStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
@@ -50,6 +51,10 @@ struct TerminalPane: View {
                         showZoomHUD(for: updated)
                     }
                 )
+
+                if proStore.isProUnlocked, live.showAIAgentControls, live.overlay == nil {
+                    AITerminalControlsOverlay(live: live, theme: theme)
+                }
             }
 
             if let zoomHUDText, live.overlay == nil {
@@ -86,6 +91,11 @@ struct TerminalPane: View {
         }
         .onChange(of: themeName) { _, _ in syncExtraKeysBar() }
         .onChange(of: hapticsEnabled) { _, _ in syncExtraKeysBar() }
+        .onChange(of: live.connectionStatus) { _, status in
+            if status == .connected {
+                live.dispatchPendingLaunchCommandIfReady()
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
             if isVisible, live.overlay == nil, !inspectingSecurity {
                 live.shouldAutoFocus = true

@@ -247,7 +247,7 @@ struct SettingsView: View {
                             .font(.headline)
                             .foregroundStyle(.primary)
 
-                        Text("SFTP, Port Forwarding, DigitalOcean & Cloudflare")
+                        Text("AI Agents, SFTP, Port Forwarding, DigitalOcean & Cloudflare")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }

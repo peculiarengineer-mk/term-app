@@ -243,6 +243,8 @@ public actor SSHConnection: Session {
     private var socketWaitDrainContinuations: [CheckedContinuation<Void, Never>] = []
     private var activeForwards: [UUID: LocalForwardState] = [:]
     private var stoppingForwardTasks: [UUID: Task<Void, Never>] = [:]
+    private var activeExecChannels: [UUID: OpaquePointer] = [:]
+    private var activeExecWakeFlags: [UUID: SocketPoller.CancelFlag] = [:]
 
     // Bounded output buffer for backpressure (prevents unbounded growth on fast remote output).
     private var outputBuffer: [Data] = []
@@ -305,19 +307,43 @@ public actor SSHConnection: Session {
     /// Connects, verifies the host key, authenticates, and opens an interactive PTY shell.
     /// Rejects repeated or concurrent `connect()` calls. Callers must call `close()` when done.
     public func connect(verifyHostKey: @Sendable (HostKey) async -> HostKeyDecision) async throws {
+        try beginConnecting()
+        do {
+            try await withTaskCancellationHandler {
+                try await doConnect(verifyHostKey: verifyHostKey, openShell: true, overallDeadline: nil)
+            } onCancel: { kbd.cancel() }
+        } catch {
+            throw await handleConnectError(error)
+        }
+    }
+
+    /// Connects and authenticates without opening an interactive PTY shell or starting `readLoop`,
+    /// used by `SSHExec.runCommand(...)` for lightweight one-shot command execution.
+    internal func connectForExec(
+        verifyHostKey: @Sendable (HostKey) async -> HostKeyDecision,
+        deadline: ContinuousClock.Instant
+    ) async throws {
+        try beginConnecting()
+        do {
+            try await withTaskCancellationHandler {
+                try await doConnect(verifyHostKey: verifyHostKey, openShell: false, overallDeadline: deadline)
+            } onCancel: { kbd.cancel() }
+        } catch {
+            throw await handleConnectError(error)
+        }
+    }
+
+    private func beginConnecting() throws {
         guard lifecycle == .idle else {
             throw isClosingOrClosed ? SSHError.closed : SSHError.connectionFailed("already connected or connecting")
         }
         lifecycle = .connecting
-        do {
-            try await withTaskCancellationHandler {
-                try await doConnect(verifyHostKey: verifyHostKey)
-            } onCancel: { kbd.cancel() }
-        } catch {
-            let e = (error as? SSHError) ?? (error is CancellationError ? .closed : .connectionFailed("\(error)"))
-            await teardown(error: e)
-            throw e
-        }
+    }
+
+    private func handleConnectError(_ error: Error) async -> SSHError {
+        let e = (error as? SSHError) ?? (error is CancellationError ? .closed : .connectionFailed("\(error)"))
+        await teardown(error: e)
+        return e
     }
 
     /// No deadline: if a keepalive is partly queued on a full send buffer (a dying link), libssh2
@@ -380,6 +406,359 @@ public actor SSHConnection: Session {
 
     /// The algorithms agreed in the handshake; nil before it completes.
     public func negotiatedAlgorithms() -> NegotiatedAlgorithms? { negotiated }
+
+    // MARK: One-shot Exec
+
+    /// Executes a non-interactive command over a fresh SSH `exec` channel on this connected session
+    /// with the default 15-second timeout, without disturbing the interactive PTY channel or `state` stream.
+    public func exec(_ command: String) async throws -> SSHExecResult {
+        try await exec(command, timeout: SSHExec.defaultTimeout, maxOutputBytes: SSHExec.defaultMaxOutputBytes)
+    }
+
+    /// Executes a non-interactive command over a fresh SSH `exec` channel on this connected session,
+    /// capturing stdout, stderr, and exit code without disturbing the interactive PTY channel or `state` stream.
+    public func exec(_ command: String, timeout: Duration) async throws -> SSHExecResult {
+        try await exec(command, timeout: timeout, maxOutputBytes: SSHExec.defaultMaxOutputBytes)
+    }
+
+    internal func exec(
+        _ command: String,
+        timeout: Duration = SSHExec.defaultTimeout,
+        maxOutputBytes: Int = SSHExec.defaultMaxOutputBytes
+    ) async throws -> SSHExecResult {
+        try Task.checkCancellation()
+        guard lifecycle == .connected, session != nil else { throw SSHError.notConnected }
+        guard timeout > .zero else { throw SSHError.timeout }
+
+        let deadline = ContinuousClock.now + timeout
+        let execID = UUID()
+
+        try await openExecChannel(execID: execID, deadline: deadline)
+
+        do {
+            let cmdByteCount = command.utf8.count
+            guard let cmdLen = UInt32(exactly: cmdByteCount) else {
+                throw SSHError.channelFailed("command exceeds maximum length")
+            }
+            let (startRC, startErr) = try await perform(
+                deadline: deadline,
+                execWakeID: execID,
+                allowKeyboardInteractiveGrace: false
+            ) {
+                guard self.lifecycle == .connected, let execChannel = self.activeExecChannels[execID] else {
+                    return Int(LIBSSH2_ERROR_BAD_USE)
+                }
+                return command.withCString { cPtr in
+                    Int(libssh2_channel_process_startup(execChannel, "exec", 4, cPtr, cmdLen))
+                }
+            }
+            guard startRC == 0 else {
+                throw startErr ?? SSHError.channelFailed("exec startup failed (\(startRC))")
+            }
+
+            let accumulator = try await readExecOutput(
+                execID: execID,
+                deadline: deadline,
+                maxOutputBytes: maxOutputBytes
+            )
+
+            let (closeRC, closeErr) = try await perform(
+                deadline: deadline,
+                execWakeID: execID,
+                allowKeyboardInteractiveGrace: false
+            ) {
+                guard self.lifecycle == .connected, let execChannel = self.activeExecChannels[execID] else {
+                    return Int(LIBSSH2_ERROR_BAD_USE)
+                }
+                return Int(libssh2_channel_close(execChannel))
+            }
+            guard closeRC == 0 else {
+                throw closeErr ?? SSHError.channelFailed("exec channel close failed (\(closeRC))")
+            }
+
+            let (waitRC, waitErr) = try await perform(
+                deadline: deadline,
+                execWakeID: execID,
+                allowKeyboardInteractiveGrace: false
+            ) {
+                guard self.lifecycle == .connected, let execChannel = self.activeExecChannels[execID] else {
+                    return Int(LIBSSH2_ERROR_BAD_USE)
+                }
+                return Int(libssh2_channel_wait_closed(execChannel))
+            }
+            guard waitRC == 0 else {
+                throw waitErr ?? SSHError.channelFailed("exec channel wait_closed failed (\(waitRC))")
+            }
+
+            let exitCode = try await readExecExitCode(execID: execID, deadline: deadline)
+
+            let cleanupTask = Task {
+                await self.freeExecChannel(execID: execID, sendCloseFirst: false)
+            }
+            await cleanupTask.value
+
+            return accumulator.buildResult(exitCode: exitCode)
+        } catch {
+            let cleanupTask = Task {
+                await self.freeExecChannel(execID: execID, sendCloseFirst: true)
+            }
+            await cleanupTask.value
+            throw error
+        }
+    }
+
+    private func openExecChannel(execID: UUID, deadline: ContinuousClock.Instant) async throws {
+        _ = try await performPointer(
+            deadline: deadline,
+            execWakeID: execID,
+            allowKeyboardInteractiveGrace: false
+        ) {
+            guard self.lifecycle == .connected, let s = self.session else { return nil }
+            guard let ch = libssh2_channel_open_ex(
+                s,
+                "session",
+                7,
+                2 * 1024 * 1024,
+                32768,
+                nil,
+                0
+            ) else {
+                return nil
+            }
+            self.activeExecChannels[execID] = ch
+            return ch
+        }
+    }
+
+    private func readExecExitCode(execID: UUID, deadline: ContinuousClock.Instant) async throws -> Int32 {
+        try await acquireLock(.libssh2, deadline: deadline)
+        defer { releaseLock(.libssh2) }
+        guard lifecycle == .connected, let s = session, let execChannel = activeExecChannels[execID] else {
+            throw isClosingOrClosed ? SSHError.closed : SSHError.notConnected
+        }
+        return Self.extractExecExitCode(channel: execChannel, session: s)
+    }
+
+    private func readExecOutput(
+        execID: UUID,
+        deadline: ContinuousClock.Instant,
+        maxOutputBytes: Int
+    ) async throws -> SSHExecOutputAccumulator {
+        var accumulator = SSHExecOutputAccumulator(maxBytes: maxOutputBytes)
+        var readBuf = [UInt8](repeating: 0, count: 16 * 1024)
+
+        while true {
+            try Task.checkCancellation()
+            try await acquireLock(.libssh2, deadline: deadline)
+
+            guard lifecycle == .connected, session != nil, let execChannel = activeExecChannels[execID] else {
+                let err: SSHError = isClosingOrClosed ? .closed : .notConnected
+                releaseLock(.libssh2)
+                throw err
+            }
+            if ContinuousClock.now >= deadline {
+                releaseLock(.libssh2)
+                throw SSHError.timeout
+            }
+
+            let receivedBefore = callbacks.received
+            var didRead = false
+            var sawError: SSHError?
+            var interest: SocketPoller.Interest = []
+            var stdoutRC = 0
+            var stderrRC = 0
+            var eof = false
+
+            for _ in 0..<8 {
+                stdoutRC = readBuf.withUnsafeMutableBytes { raw -> Int in
+                    guard let base = raw.baseAddress else { return 0 }
+                    return libssh2_channel_read_ex(
+                        execChannel,
+                        0,
+                        base.assumingMemoryBound(to: CChar.self),
+                        raw.count
+                    )
+                }
+                if stdoutRC > 0 {
+                    didRead = true
+                    do {
+                        try accumulator.appendStdout(readBuf[0..<stdoutRC])
+                    } catch {
+                        sawError = (error as? SSHError) ?? .channelFailed("\(error)")
+                        break
+                    }
+                } else if stdoutRC < 0 && stdoutRC != Int(LIBSSH2_ERROR_EAGAIN) {
+                    sawError = execReadError(code: stdoutRC)
+                    break
+                }
+
+                stderrRC = readBuf.withUnsafeMutableBytes { raw -> Int in
+                    guard let base = raw.baseAddress else { return 0 }
+                    return libssh2_channel_read_ex(
+                        execChannel,
+                        SSH_EXTENDED_DATA_STDERR,
+                        base.assumingMemoryBound(to: CChar.self),
+                        raw.count
+                    )
+                }
+                if stderrRC > 0 {
+                    didRead = true
+                    do {
+                        try accumulator.appendStderr(readBuf[0..<stderrRC])
+                    } catch {
+                        sawError = (error as? SSHError) ?? .channelFailed("\(error)")
+                        break
+                    }
+                } else if stderrRC < 0 && stderrRC != Int(LIBSSH2_ERROR_EAGAIN) {
+                    sawError = execReadError(code: stderrRC)
+                    break
+                }
+
+                if stdoutRC <= 0 && stderrRC <= 0 {
+                    break
+                }
+            }
+
+            if sawError == nil && stdoutRC <= 0 && stderrRC <= 0 {
+                let channelEOF = libssh2_channel_eof(execChannel) == 1
+                if (channelEOF && stdoutRC != Int(LIBSSH2_ERROR_EAGAIN) && stderrRC != Int(LIBSSH2_ERROR_EAGAIN))
+                    || (stdoutRC == 0 && stderrRC == 0) {
+                    eof = true
+                } else if channelEOF {
+                    // EOF arrived mid-pass (e.g. during stderr read after stdout saw EAGAIN): re-probe immediately.
+                    didRead = true
+                } else if stdoutRC == Int(LIBSSH2_ERROR_EAGAIN) || stderrRC == Int(LIBSSH2_ERROR_EAGAIN) {
+                    interest = blockInterest()
+                } else {
+                    interest = [.read]
+                }
+            }
+
+            let receivedAfter = callbacks.received
+            releaseLock(.libssh2)
+
+            if receivedAfter != receivedBefore {
+                wakeChannelWaiters(excludingExecID: execID)
+            }
+
+            if let sawError {
+                throw sawError
+            }
+            if eof {
+                return accumulator
+            }
+            if didRead {
+                await Task.yield()
+                continue
+            }
+            try await waitSocket(
+                interest: interest,
+                deadline: deadline,
+                execWakeID: execID,
+                allowKeyboardInteractiveGrace: false
+            )
+        }
+    }
+
+    private func execReadError(code: Int) -> SSHError {
+        if lifecycle != .connected { return .closed }
+        let err = lastError()
+        if case .protocolError(let c, _) = err, c != 0 {
+            return err
+        }
+        return .channelFailed("exec read failed (\(code))")
+    }
+
+    /// Call only while `.libssh2` lock is held.
+    private static func extractExecExitCode(channel: OpaquePointer, session: OpaquePointer) -> Int32 {
+        if libssh2_channel_has_exit_status(channel) != 0 {
+            return libssh2_channel_get_exit_status(channel)
+        }
+        var sig: UnsafeMutablePointer<CChar>?
+        var sigLen = 0
+        var errmsg: UnsafeMutablePointer<CChar>?
+        var errmsgLen = 0
+        var langtag: UnsafeMutablePointer<CChar>?
+        var langtagLen = 0
+        let sigRC = libssh2_channel_get_exit_signal(
+            channel,
+            &sig, &sigLen,
+            &errmsg, &errmsgLen,
+            &langtag, &langtagLen
+        )
+        let signalName: String? = sig.map {
+            let text = String(
+                decoding: UnsafeBufferPointer(
+                    start: UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self),
+                    count: sigLen
+                ),
+                as: UTF8.self
+            )
+            libssh2_free(session, $0)
+            return text
+        }
+        if let errmsg { libssh2_free(session, errmsg) }
+        if let langtag { libssh2_free(session, langtag) }
+        if sigRC == 0, let signalName, !signalName.isEmpty {
+            return SSHExecSignal.exitCode(forSignalName: signalName)
+        }
+        return libssh2_channel_get_exit_status(channel)
+    }
+
+    private func freeExecChannel(execID: UUID, sendCloseFirst: Bool) async {
+        let deadline = ContinuousClock.now + .seconds(1)
+        var sentClose = !sendCloseFirst
+        while true {
+            try? await acquireLock(.libssh2, cancellable: false)
+            guard session != nil, let ch = activeExecChannels[execID], lifecycle == .connected || lifecycle == .closing else {
+                activeExecChannels.removeValue(forKey: execID)
+                releaseLock(.libssh2)
+                return
+            }
+            if !sentClose {
+                let crc = libssh2_channel_close(ch)
+                if crc == LIBSSH2_ERROR_EAGAIN {
+                    if ContinuousClock.now >= deadline || fd < 0 {
+                        let frc = libssh2_channel_free(ch)
+                        if frc != LIBSSH2_ERROR_EAGAIN {
+                            activeExecChannels.removeValue(forKey: execID)
+                        }
+                        releaseLock(.libssh2)
+                        return
+                    }
+                    let interest = blockInterest()
+                    releaseLock(.libssh2)
+                    await waitForExecDrainSocket(interest: interest, execID: execID)
+                    continue
+                }
+                sentClose = true
+            }
+            let frc = libssh2_channel_free(ch)
+            if frc != LIBSSH2_ERROR_EAGAIN {
+                activeExecChannels.removeValue(forKey: execID)
+                releaseLock(.libssh2)
+                return
+            }
+            if ContinuousClock.now >= deadline || fd < 0 {
+                releaseLock(.libssh2)
+                return
+            }
+            let interest = blockInterest()
+            releaseLock(.libssh2)
+            await waitForExecDrainSocket(interest: interest, execID: execID)
+        }
+    }
+
+    private func waitForExecDrainSocket(interest: SocketPoller.Interest, execID: UUID) async {
+        guard fd >= 0, lifecycle == .connected || lifecycle == .closing else { return }
+        let currentFd = fd
+        let flag = SocketPoller.CancelFlag()
+        let id = registerSocketWait(flag)
+        activeExecWakeFlags[execID] = flag
+        await SocketPoller.wait(fd: currentFd, interest: interest, timeoutMs: 50, cancelFlag: flag)
+        activeExecWakeFlags.removeValue(forKey: execID)
+        unregisterSocketWait(id)
+    }
 
     // MARK: SFTP
 
@@ -666,6 +1045,7 @@ public actor SSHConnection: Session {
             try await acquireLock(.libssh2)
             let rc: Int
             let interest: SocketPoller.Interest
+            let receivedBefore = callbacks.received
             do {
                 guard lifecycle == .connected, session != nil, sftpSession == sftp else {
                     releaseLock(.libssh2)
@@ -675,15 +1055,27 @@ public actor SSHConnection: Session {
                 if rc != Int(LIBSSH2_ERROR_EAGAIN) {
                     if rc < 0 {
                         let err = captureSFTPError(sftp: sftp, context: context)
+                        let receivedAfter = callbacks.received
                         releaseLock(.libssh2)
+                        if receivedAfter != receivedBefore {
+                            wakeChannelWaiters()
+                        }
                         throw err
                     }
+                    let receivedAfter = callbacks.received
                     releaseLock(.libssh2)
+                    if receivedAfter != receivedBefore {
+                        wakeChannelWaiters()
+                    }
                     return rc
                 }
                 interest = blockInterest()
             }
+            let receivedAfter = callbacks.received
             releaseLock(.libssh2)
+            if receivedAfter != receivedBefore {
+                wakeChannelWaiters()
+            }
             try await waitSFTPSocket(interest: interest, context: context)
         }
     }
@@ -697,23 +1089,36 @@ public actor SSHConnection: Session {
             try Task.checkCancellation()
             try await acquireLock(.libssh2)
             let interest: SocketPoller.Interest
+            let receivedBefore = callbacks.received
             do {
                 guard lifecycle == .connected, let s = session, sftpSession == sftp else {
                     releaseLock(.libssh2)
                     throw SFTPError.notConnected
                 }
                 if let handle = op() {
+                    let receivedAfter = callbacks.received
                     releaseLock(.libssh2)
+                    if receivedAfter != receivedBefore {
+                        wakeChannelWaiters()
+                    }
                     return handle
                 }
                 if libssh2_session_last_errno(s) != LIBSSH2_ERROR_EAGAIN {
                     let err = captureSFTPError(sftp: sftp, context: context)
+                    let receivedAfter = callbacks.received
                     releaseLock(.libssh2)
+                    if receivedAfter != receivedBefore {
+                        wakeChannelWaiters()
+                    }
                     throw err
                 }
                 interest = blockInterest()
             }
+            let receivedAfter = callbacks.received
             releaseLock(.libssh2)
+            if receivedAfter != receivedBefore {
+                wakeChannelWaiters()
+            }
             try await waitSFTPSocket(interest: interest, context: context)
         }
     }
@@ -1101,7 +1506,7 @@ public actor SSHConnection: Session {
         releaseLock(.libssh2)
 
         if receivedAfter != receivedBefore {
-            wakeForwardClients(excluding: clientID)
+            wakeChannelWaiters(excludingClientID: clientID)
         }
         return result
     }
@@ -1206,13 +1611,46 @@ public actor SSHConnection: Session {
         }
     }
 
+    private func wakeExecWaiters(excluding excludedExecID: UUID? = nil) {
+        for (eid, flag) in activeExecWakeFlags where eid != excludedExecID {
+            flag.cancel()
+        }
+    }
+
+    private func wakeChannelWaiters(excludingClientID: UUID? = nil, excludingExecID: UUID? = nil) {
+        wakeForwardClients(excluding: excludingClientID)
+        wakeExecWaiters(excluding: excludingExecID)
+    }
+
     // MARK: Connect flow
 
-    private func doConnect(verifyHostKey: @Sendable (HostKey) async -> HostKeyDecision) async throws {
+    private func doConnect(
+        verifyHostKey: @Sendable (HostKey) async -> HostKeyDecision,
+        openShell: Bool,
+        overallDeadline: ContinuousClock.Instant?
+    ) async throws {
         try Task.checkCancellation()
         stateCont.yield(.connecting)
-        var deadline = ContinuousClock.now + .seconds(30)
-        let newFd = try await SocketPoller.connect(host: host, port: port)
+        let allowKbdGrace = overallDeadline == nil
+        var deadline = overallDeadline ?? (ContinuousClock.now + .seconds(30))
+        let connectTimeoutMs: Int32
+        if let overallDeadline {
+            let remMs = SocketPoller.remainingMilliseconds(until: overallDeadline)
+            guard remMs > 0 else { throw SSHError.timeout }
+            connectTimeoutMs = Int32(min(remMs, 15_000))
+        } else {
+            connectTimeoutMs = 15_000
+        }
+        let newFd: Int32
+        do {
+            newFd = try await SocketPoller.connect(host: host, port: port, timeoutMs: connectTimeoutMs)
+        } catch let error as SSHError {
+            if let overallDeadline, ContinuousClock.now >= overallDeadline,
+               case .connectionFailed = error {
+                throw SSHError.timeout
+            }
+            throw error
+        }
         if Task.isCancelled {
             Darwin.close(newFd)
             throw CancellationError()
@@ -1244,7 +1682,7 @@ public actor SSHConnection: Session {
             throw SSHError.connectionFailed("algorithm policy rejected: \(name)")
         }
 
-        var (rc, opErr) = try await perform(deadline: deadline) {
+        var (rc, opErr) = try await perform(deadline: deadline, allowKeyboardInteractiveGrace: allowKbdGrace) {
             guard let s = self.session else { return Int(LIBSSH2_ERROR_BAD_USE) }
             return Int(libssh2_session_handshake(s, self.fd))
         }
@@ -1260,35 +1698,43 @@ public actor SSHConnection: Session {
         negotiated = NegotiatedAlgorithms(
             kex: method(LIBSSH2_METHOD_KEX), hostKey: method(LIBSSH2_METHOD_HOSTKEY),
             cipher: method(LIBSSH2_METHOD_CRYPT_CS), mac: method(LIBSSH2_METHOD_MAC_CS))
-        // The host-key prompt waits on the user; restart the network deadline after it.
-        deadline = ContinuousClock.now + .seconds(30)
+        if overallDeadline == nil {
+            // The host-key prompt waits on the user; restart the network deadline after it.
+            deadline = ContinuousClock.now + .seconds(30)
+        } else if ContinuousClock.now >= deadline {
+            throw SSHError.timeout
+        }
 
         stateCont.yield(.authenticating)
-        try await authenticate(s, deadline: deadline)
+        try await authenticate(s, deadline: deadline, allowKeyboardInteractiveGrace: allowKbdGrace)
 
-        let ch = try await performPointer(deadline: deadline) {
-            guard let s = self.session else { return nil }
-            return libssh2_channel_open_ex(s, "session", 7, 2 * 1024 * 1024, 32768, nil, 0)
+        if openShell {
+            let ch = try await performPointer(deadline: deadline, allowKeyboardInteractiveGrace: allowKbdGrace) {
+                guard let s = self.session else { return nil }
+                return libssh2_channel_open_ex(s, "session", 7, 2 * 1024 * 1024, 32768, nil, 0)
+            }
+            channel = ch
+            let term = "xterm-256color"
+            let ptyCols = Int32(cols)
+            let ptyRows = Int32(rows)
+            (rc, opErr) = try await perform(deadline: deadline, allowKeyboardInteractiveGrace: allowKbdGrace) {
+                guard let ch = self.channel else { return Int(LIBSSH2_ERROR_BAD_USE) }
+                return Int(libssh2_channel_request_pty_ex(ch, term, UInt32(term.utf8.count), nil, 0, ptyCols, ptyRows, 0, 0))
+            }
+            guard rc == 0 else { throw opErr ?? SSHError.channelFailed("pty request failed (\(rc))") }
+            (rc, opErr) = try await perform(deadline: deadline, allowKeyboardInteractiveGrace: allowKbdGrace) {
+                guard let ch = self.channel else { return Int(LIBSSH2_ERROR_BAD_USE) }
+                return Int(libssh2_channel_process_startup(ch, "shell", 5, nil, 0))
+            }
+            guard rc == 0 else { throw opErr ?? SSHError.channelFailed("shell startup failed (\(rc))") }
         }
-        channel = ch
-        let term = "xterm-256color"
-        let ptyCols = Int32(cols)
-        let ptyRows = Int32(rows)
-        (rc, opErr) = try await perform(deadline: deadline) {
-            guard let ch = self.channel else { return Int(LIBSSH2_ERROR_BAD_USE) }
-            return Int(libssh2_channel_request_pty_ex(ch, term, UInt32(term.utf8.count), nil, 0, ptyCols, ptyRows, 0, 0))
-        }
-        guard rc == 0 else { throw opErr ?? SSHError.channelFailed("pty request failed (\(rc))") }
-        (rc, opErr) = try await perform(deadline: deadline) {
-            guard let ch = self.channel else { return Int(LIBSSH2_ERROR_BAD_USE) }
-            return Int(libssh2_channel_process_startup(ch, "shell", 5, nil, 0))
-        }
-        guard rc == 0 else { throw opErr ?? SSHError.channelFailed("shell startup failed (\(rc))") }
 
         guard lifecycle == .connecting else { throw SSHError.closed }
         lifecycle = .connected
         stateCont.yield(.connected)
-        readLoopTask = Task { await self.readLoop() }
+        if openShell {
+            readLoopTask = Task { await self.readLoop() }
+        }
     }
 
     private func currentHostKey(_ s: OpaquePointer) throws -> HostKey {
@@ -1303,7 +1749,11 @@ public actor SSHConnection: Session {
         return HostKey(type: HostKeyType(libssh2: type), sha256: digest, keyData: blob)
     }
 
-    private func authenticate(_ s: OpaquePointer, deadline: ContinuousClock.Instant) async throws {
+    private func authenticate(
+        _ s: OpaquePointer,
+        deadline: ContinuousClock.Instant,
+        allowKeyboardInteractiveGrace: Bool
+    ) async throws {
         defer {
             auth = nil
             kbd.clearHandler()
@@ -1317,12 +1767,12 @@ public actor SSHConnection: Session {
         let opErr: SSHError?
         switch currentAuth {
         case .password(let pw):
-            (rc, opErr) = try await perform(deadline: deadline) {
+            (rc, opErr) = try await perform(deadline: deadline, allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace) {
                 Int(libssh2_userauth_password_ex(s, user, ulen, pw, UInt32(pw.utf8.count), nil))
             }
         case .privateKey(let pem, let passphrase):
             guard !pem.isEmpty else { throw SSHError.authenticationFailed("Empty private key") }
-            (rc, opErr) = try await perform(deadline: deadline) {
+            (rc, opErr) = try await perform(deadline: deadline, allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace) {
                 pem.withUnsafeBytes { buf in
                     guard let base = buf.baseAddress else { return Int(LIBSSH2_ERROR_AUTHENTICATION_FAILED) }
                     return Int(libssh2_userauth_publickey_frommemory(
@@ -1337,7 +1787,7 @@ public actor SSHConnection: Session {
             let slot = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 1)
             slot.initialize(to: box.toOpaque())
             defer { slot.deallocate(); box.release() }
-            (rc, opErr) = try await perform(deadline: deadline) {
+            (rc, opErr) = try await perform(deadline: deadline, allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace) {
                 blob.withUnsafeBytes { buf in
                     guard let base = buf.baseAddress else { return Int(LIBSSH2_ERROR_AUTHENTICATION_FAILED) }
                     return Int(libssh2_userauth_publickey(
@@ -1347,7 +1797,7 @@ public actor SSHConnection: Session {
             }
         case .keyboardInteractive(let handler):
             kbd.setHandler(handler)
-            (rc, opErr) = try await perform(deadline: deadline) {
+            (rc, opErr) = try await perform(deadline: deadline, allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace) {
                 Int(libssh2_userauth_keyboard_interactive_ex(s, user, ulen, kbdCallback))
             }
         }
@@ -1488,7 +1938,7 @@ public actor SSHConnection: Session {
             let receivedAfter = callbacks.received
             releaseLock(.libssh2)
             if receivedAfter != receivedBefore {
-                wakeForwardClients()
+                wakeChannelWaiters()
             }
             if cleanEnd { err = nil }
 
@@ -1751,52 +2201,78 @@ public actor SSHConnection: Session {
         }
     }
 
-    private func waitOnSocket(interest: SocketPoller.Interest, timeoutMs: Int32) async {
+    private func waitOnSocket(interest: SocketPoller.Interest, timeoutMs: Int32, execWakeID: UUID? = nil) async {
         guard fd >= 0, lifecycle == .connecting || lifecycle == .connected else { return }
         let currentFd = fd
         let flag = SocketPoller.CancelFlag()
         let id = registerSocketWait(flag)
+        if let execWakeID {
+            activeExecWakeFlags[execWakeID] = flag
+        }
         await SocketPoller.wait(fd: currentFd, interest: interest, timeoutMs: timeoutMs, cancelFlag: flag)
+        if let execWakeID {
+            activeExecWakeFlags.removeValue(forKey: execWakeID)
+        }
         unregisterSocketWait(id)
     }
 
-    private func effectiveDeadline(_ deadline: ContinuousClock.Instant) -> ContinuousClock.Instant {
-        // Time the user spent answering a keyboard-interactive prompt does not count.
+    private func effectiveDeadline(
+        _ deadline: ContinuousClock.Instant,
+        allowKeyboardInteractiveGrace: Bool = true
+    ) -> ContinuousClock.Instant {
+        // Time the user spent answering a keyboard-interactive prompt does not count during login.
         var effective = deadline
-        if let answered = kbd.lastAnswered(), answered + .seconds(30) > effective {
+        if allowKeyboardInteractiveGrace,
+           lifecycle == .connecting,
+           let answered = kbd.lastAnswered(),
+           answered + .seconds(30) > effective {
             effective = answered + .seconds(30)
         }
         return effective
     }
 
-    private func remainingPollMs(deadline: ContinuousClock.Instant?) -> Int32 {
+    private func remainingPollMs(
+        deadline: ContinuousClock.Instant?,
+        allowKeyboardInteractiveGrace: Bool = true
+    ) -> Int32 {
         guard let deadline else { return 250 }
-        let rem = effectiveDeadline(deadline) - ContinuousClock.now
+        let rem = effectiveDeadline(deadline, allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace) - ContinuousClock.now
         guard rem > .zero else { return 0 }
         let (sec, atto) = rem.components
         let ms = sec * 1_000 + (atto + 999_999_999_999_999) / 1_000_000_000_000_000
         return Int32(min(max(ms, 1), 250))
     }
 
-    private func waitSocket(interest: SocketPoller.Interest, deadline: ContinuousClock.Instant?) async throws {
-        let timeoutMs = remainingPollMs(deadline: deadline)
+    private func waitSocket(
+        interest: SocketPoller.Interest,
+        deadline: ContinuousClock.Instant?,
+        execWakeID: UUID? = nil,
+        allowKeyboardInteractiveGrace: Bool = true
+    ) async throws {
+        let timeoutMs = remainingPollMs(deadline: deadline, allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace)
         if timeoutMs <= 0 { throw SSHError.timeout }
-        await waitOnSocket(interest: interest, timeoutMs: timeoutMs)
+        await waitOnSocket(interest: interest, timeoutMs: timeoutMs, execWakeID: execWakeID)
         try Task.checkCancellation()
         guard lifecycle == .connecting || lifecycle == .connected else { throw SSHError.closed }
-        if let deadline, ContinuousClock.now > effectiveDeadline(deadline) {
+        if let deadline, ContinuousClock.now > effectiveDeadline(deadline, allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace) {
             throw SSHError.timeout
         }
     }
 
     /// Runs `op` until it stops returning EAGAIN, releasing the libssh2 lock while waiting on socket readiness.
-    private func perform(deadline: ContinuousClock.Instant? = nil, _ op: () -> Int) async throws -> (rc: Int, error: SSHError?) {
+    private func perform(
+        deadline: ContinuousClock.Instant? = nil,
+        execWakeID: UUID? = nil,
+        allowKeyboardInteractiveGrace: Bool = true,
+        _ op: () -> Int
+    ) async throws -> (rc: Int, error: SSHError?) {
         while true {
             try Task.checkCancellation()
             try await acquireLock(.libssh2, deadline: deadline)
             let rc: Int
             let error: SSHError?
             let interest: SocketPoller.Interest
+            let receivedBefore = callbacks.received
             do {
                 guard lifecycle == .connecting || lifecycle == .connected else {
                     releaseLock(.libssh2)
@@ -1805,39 +2281,75 @@ public actor SSHConnection: Session {
                 rc = op()
                 if rc != Int(LIBSSH2_ERROR_EAGAIN) {
                     error = rc < 0 ? lastError() : nil
+                    let receivedAfter = callbacks.received
                     releaseLock(.libssh2)
+                    if receivedAfter != receivedBefore {
+                        wakeChannelWaiters(excludingExecID: execWakeID)
+                    }
                     return (rc, error)
                 }
                 interest = blockInterest()
             }
+            let receivedAfter = callbacks.received
             releaseLock(.libssh2)
-            try await waitSocket(interest: interest, deadline: deadline)
+            if receivedAfter != receivedBefore {
+                wakeChannelWaiters(excludingExecID: execWakeID)
+            }
+            try await waitSocket(
+                interest: interest,
+                deadline: deadline,
+                execWakeID: execWakeID,
+                allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace
+            )
         }
     }
 
-    private func performPointer(deadline: ContinuousClock.Instant? = nil, _ op: () -> OpaquePointer?) async throws -> OpaquePointer {
+    private func performPointer(
+        deadline: ContinuousClock.Instant? = nil,
+        execWakeID: UUID? = nil,
+        allowKeyboardInteractiveGrace: Bool = true,
+        _ op: () -> OpaquePointer?
+    ) async throws -> OpaquePointer {
         while true {
             try Task.checkCancellation()
             try await acquireLock(.libssh2, deadline: deadline)
             let interest: SocketPoller.Interest
+            let receivedBefore = callbacks.received
             do {
                 guard lifecycle == .connecting || lifecycle == .connected else {
                     releaseLock(.libssh2)
                     throw SSHError.closed
                 }
                 if let p = op() {
+                    let receivedAfter = callbacks.received
                     releaseLock(.libssh2)
+                    if receivedAfter != receivedBefore {
+                        wakeChannelWaiters(excludingExecID: execWakeID)
+                    }
                     return p
                 }
                 guard let s = session, libssh2_session_last_errno(s) == LIBSSH2_ERROR_EAGAIN else {
                     let err = lastError()
+                    let receivedAfter = callbacks.received
                     releaseLock(.libssh2)
+                    if receivedAfter != receivedBefore {
+                        wakeChannelWaiters(excludingExecID: execWakeID)
+                    }
                     throw err
                 }
                 interest = blockInterest()
             }
+            let receivedAfter = callbacks.received
             releaseLock(.libssh2)
-            try await waitSocket(interest: interest, deadline: deadline)
+            if receivedAfter != receivedBefore {
+                wakeChannelWaiters(excludingExecID: execWakeID)
+            }
+            try await waitSocket(
+                interest: interest,
+                deadline: deadline,
+                execWakeID: execWakeID,
+                allowKeyboardInteractiveGrace: allowKeyboardInteractiveGrace
+            )
         }
     }
 
@@ -1875,6 +2387,7 @@ public actor SSHConnection: Session {
         if error != nil, fd >= 0 {
             _ = Darwin.shutdown(fd, SHUT_RDWR)
         }
+        for flag in activeExecWakeFlags.values { flag.cancel() }
         for flag in activeSocketWaits.values { flag.cancel() }
         resumeOutputDrainWaiters()
         await readLoopTask?.value
@@ -1887,6 +2400,12 @@ public actor SSHConnection: Session {
 
         if error == nil {
             let bound = ContinuousClock.now + .seconds(2)
+            let execChannels = Array(activeExecChannels)
+            for (execID, execChannel) in execChannels {
+                await drain(until: bound) { libssh2_channel_close(execChannel) }
+                await drain(until: bound) { libssh2_channel_free(execChannel) }
+                activeExecChannels.removeValue(forKey: execID)
+            }
             if let sftp = sftpSession {
                 if await drain(until: bound, { libssh2_sftp_shutdown(sftp) }) == false {
                     if fd >= 0 { _ = Darwin.shutdown(fd, SHUT_RDWR) }
@@ -1914,6 +2433,10 @@ public actor SSHConnection: Session {
         } else {
             // Transport error / timeout: skip the 2 s graceful drain and tear down immediately.
             if fd >= 0 { _ = Darwin.shutdown(fd, SHUT_RDWR) }
+            for execChannel in activeExecChannels.values {
+                _ = libssh2_channel_free(execChannel)
+            }
+            activeExecChannels.removeAll()
             if let sftp = sftpSession {
                 _ = libssh2_sftp_shutdown(sftp)
                 sftpSession = nil
@@ -1928,6 +2451,7 @@ public actor SSHConnection: Session {
             }
         }
 
+        for flag in activeExecWakeFlags.values { flag.cancel() }
         for flag in activeSocketWaits.values { flag.cancel() }
         if fd >= 0 { _ = Darwin.shutdown(fd, SHUT_RDWR) }
         if !activeSocketWaits.isEmpty {

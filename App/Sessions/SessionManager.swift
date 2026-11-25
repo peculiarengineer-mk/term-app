@@ -34,11 +34,31 @@ final class LiveSession: Identifiable {
     var shouldAutoFocus = true
     /// Unsaved SwiftData `Host` when launched via Quick Connect; cleared once saved.
     var ephemeralHost: Host?
+    /// Optional AI agent launch/attach metadata when this session runs a managed AI coding agent.
+    var aiAgentContext: AIAgentLaunchContext?
+    /// One-shot launch/attach command sent once the session is connected, then cleared.
+    var pendingLaunchCommand: String?
+    /// Controls visibility of the docked mobile AI Quick-Action Bar & Prompt Composer.
+    var showAIAgentControls: Bool
+    /// Preserves in-progress multi-line prompt text across tab switches.
+    var aiPromptDraft: String = ""
 
-    init(id: UUID = UUID(), hostID: UUID, title: String, session: any Session, bridge: SessionBridge,
-         algorithms: NegotiatedAlgorithms? = nil, ephemeralHost: Host? = nil) {
+    init(
+        id: UUID = UUID(),
+        hostID: UUID,
+        title: String,
+        session: any Session,
+        bridge: SessionBridge,
+        algorithms: NegotiatedAlgorithms? = nil,
+        ephemeralHost: Host? = nil,
+        aiAgentContext: AIAgentLaunchContext? = nil,
+        pendingLaunchCommand: String? = nil
+    ) {
         self.algorithms = algorithms
         self.ephemeralHost = ephemeralHost
+        self.aiAgentContext = aiAgentContext
+        self.pendingLaunchCommand = pendingLaunchCommand
+        self.showAIAgentControls = aiAgentContext != nil
         self.id = id; self.hostID = hostID; self.title = title
         self.session = session; self.bridge = bridge
         let c = TerminalController(
@@ -50,6 +70,29 @@ final class LiveSession: Identifiable {
         bar.hapticsEnabled = AppearanceSettings.hapticsEnabled()
         bar.onDismissKeyboard = { [weak c] in c?.dismissKeyboard() }
         self.bar = bar
+    }
+
+    /// Dispatches `pendingLaunchCommand` once after the shell connects and clears it so reconnects never re-send.
+    func dispatchPendingLaunchCommandIfReady() {
+        guard connectionStatus == .connected,
+              let rawCommand = pendingLaunchCommand else {
+            return
+        }
+        let command = rawCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingLaunchCommand = nil
+        guard !command.isEmpty else { return }
+
+        let targetBridge = bridge
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled,
+                  let self,
+                  self.connectionStatus == .connected,
+                  self.bridge === targetBridge else {
+                return
+            }
+            targetBridge.send(Array((command + "\r").utf8))
+        }
     }
 
     fileprivate func replace(session: any Session, bridge: SessionBridge, algorithms: NegotiatedAlgorithms?) {
@@ -68,16 +111,30 @@ final class SessionManager {
 
     func session(id: UUID) -> LiveSession? { sessions.first { $0.id == id } }
 
+    func connectedSession(for hostID: UUID) -> LiveSession? {
+        sessions.first { $0.hostID == hostID && $0.connectionStatus == .connected }
+    }
+
     @discardableResult
-    func open(hostID: UUID, title: String, session: any Session, bridge: SessionBridge,
-              algorithms: NegotiatedAlgorithms? = nil, ephemeralHost: Host? = nil) -> LiveSession {
+    func open(
+        hostID: UUID,
+        title: String,
+        session: any Session,
+        bridge: SessionBridge,
+        algorithms: NegotiatedAlgorithms? = nil,
+        ephemeralHost: Host? = nil,
+        aiAgentContext: AIAgentLaunchContext? = nil,
+        pendingLaunchCommand: String? = nil
+    ) -> LiveSession {
         let live = LiveSession(
             hostID: hostID,
             title: title,
             session: session,
             bridge: bridge,
             algorithms: algorithms,
-            ephemeralHost: ephemeralHost
+            ephemeralHost: ephemeralHost,
+            aiAgentContext: aiAgentContext,
+            pendingLaunchCommand: pendingLaunchCommand
         )
         sessions.append(live)
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
@@ -164,6 +221,10 @@ private struct ConnectHostKey: EnvironmentKey {
     static let defaultValue: (@MainActor (Host) -> Void)? = nil
 }
 
+private struct LaunchAIAgentKey: EnvironmentKey {
+    static let defaultValue: (@MainActor (Host, AIAgentLaunchContext, String) -> Void)? = nil
+}
+
 extension EnvironmentValues {
     /// Set by `SessionTabsView`: shows a just-opened session as a tab in this window.
     var openSessionTab: @MainActor (UUID) -> Void {
@@ -175,5 +236,11 @@ extension EnvironmentValues {
     var connectHost: (@MainActor (Host) -> Void)? {
         get { self[ConnectHostKey.self] }
         set { self[ConnectHostKey.self] = newValue }
+    }
+
+    /// Set by `SessionTabsView`: opens a terminal tab and executes an AI agent `tmux` launch/attach command.
+    var launchAIAgent: (@MainActor (Host, AIAgentLaunchContext, String) -> Void)? {
+        get { self[LaunchAIAgentKey.self] }
+        set { self[LaunchAIAgentKey.self] = newValue }
     }
 }

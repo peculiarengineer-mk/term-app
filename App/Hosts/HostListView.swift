@@ -110,20 +110,31 @@ struct QuickConnectTarget: Equatable, Sendable {
 }
 
 struct HostListView: View {
+    private enum SectionTab: String, CaseIterable, Identifiable {
+        case hosts = "Hosts"
+        case agents = "Agents"
+
+        var id: String { rawValue }
+    }
+
     private static let quickConnectAmber = TerminalTheme.appleProDark.accentColor
 
     @Environment(\.modelContext) private var context
     @Environment(SessionManager.self) private var manager
+    @Environment(ProStore.self) private var proStore
     @Environment(\.openSessionTab) private var openSessionTab
     @Environment(\.connectHost) private var connectHost
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
+    @State private var selectedSection: SectionTab = .hosts
     @State private var search = ""
     @State private var selectedTag: String?
     @State private var editing: Host?
     @State private var adding = false
     @State private var importingConfig = false
+    @State private var agentLaunchHost: Host?
+    @State private var showingPaywall = false
     @State private var deleteError: String?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
@@ -169,6 +180,55 @@ struct HostListView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            sectionPickerBar
+
+            switch selectedSection {
+            case .hosts:
+                hostsContent
+            case .agents:
+                AgentsDashboardView()
+            }
+        }
+        .navigationTitle(selectedSection == .hosts ? "Hosts" : "Agents")
+        .sheet(isPresented: $adding) { NavigationStack { HostEditorView(host: nil) } }
+        .sheet(isPresented: $importingConfig) { SSHConfigImportView() }
+        .sheet(item: $editing) { host in NavigationStack { HostEditorView(host: host) } }
+        .sheet(item: $agentLaunchHost) { host in
+            LaunchAIAgentSheet(initialHost: host)
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+        }
+        .sheet(isPresented: $showingPaywall) {
+            ProPaywallView()
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+        }
+        .alert("Error", isPresented: Binding(get: { deleteError != nil }, set: { if !$0 { deleteError = nil } })) {
+            Button("OK") {}
+        } message: { Text(deleteError ?? "") }
+    }
+
+    private var sectionPickerBar: some View {
+        VStack(spacing: 0) {
+            Picker("Section", selection: $selectedSection) {
+                ForEach(SectionTab.allCases) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .onChange(of: selectedSection) { _, _ in
+                AppHaptics.impact(.light)
+            }
+
+            Divider()
+        }
+        .background(.bar)
+    }
+
+    private var hostsContent: some View {
         List {
             if let target = quickConnectTarget {
                 Section("Quick Connect") {
@@ -218,7 +278,6 @@ struct HostListView: View {
             }
         }
         .searchable(text: $search, prompt: "Search or ssh user@host")
-        .navigationTitle("Hosts")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Menu("Add", systemImage: "plus") {
@@ -232,12 +291,6 @@ struct HostListView: View {
                 self.selectedTag = nil
             }
         }
-        .sheet(isPresented: $adding) { NavigationStack { HostEditorView(host: nil) } }
-        .sheet(isPresented: $importingConfig) { SSHConfigImportView() }
-        .sheet(item: $editing) { host in NavigationStack { HostEditorView(host: host) } }
-        .alert("Error", isPresented: Binding(get: { deleteError != nil }, set: { if !$0 { deleteError = nil } })) {
-            Button("OK") {}
-        } message: { Text(deleteError ?? "") }
     }
 
     private func quickConnectRow(for target: QuickConnectTarget) -> some View {
@@ -386,6 +439,10 @@ struct HostListView: View {
                 AppHaptics.impact(.light)
                 connectHost?(host)
             }
+            Button("Launch AI Agent…", systemImage: "sparkles") {
+                AppHaptics.impact(.light)
+                openAIAgentLauncher(for: host)
+            }
             Button("Edit", systemImage: "pencil") { editing = host }
             Button("Delete", systemImage: "trash", role: .destructive) { delete(host) }
         }
@@ -397,6 +454,14 @@ struct HostListView: View {
                 Label("New Session", systemImage: "plus.rectangle.on.rectangle")
             }
             .tint(.green)
+
+            Button {
+                AppHaptics.impact(.light)
+                openAIAgentLauncher(for: host)
+            } label: {
+                Label("AI Agent", systemImage: "sparkles")
+            }
+            .tint(Self.quickConnectAmber)
         }
         .swipeActions(edge: .trailing) {
             Button(role: .destructive) { delete(host) } label: { Label("Delete", systemImage: "trash") }
@@ -487,6 +552,14 @@ struct HostListView: View {
         }
     }
 
+    private func openAIAgentLauncher(for host: Host) {
+        if proStore.isProUnlocked {
+            agentLaunchHost = host
+        } else {
+            showingPaywall = true
+        }
+    }
+
     private func delete(_ host: Host) {
         let hostID = host.id
         context.delete(host)
@@ -494,6 +567,7 @@ struct HostListView: View {
             try context.save()
             HostSecrets.deletePassword(for: hostID)
             PortForwardStore.deleteAll(for: hostID)
+            HostProjectStore.deleteAll(for: hostID)
         } catch {
             context.rollback()
             deleteError = "Could not delete host: \(error.localizedDescription)"

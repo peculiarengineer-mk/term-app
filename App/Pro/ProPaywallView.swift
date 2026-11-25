@@ -87,8 +87,17 @@ struct ProPaywallView: View {
     private var featuresCard: some View {
         VStack(alignment: .leading, spacing: 16) {
             featureRow(
-                icon: "folder.fill",
+                icon: "sparkles",
                 tint: Self.appleProAmber,
+                title: "AI Agent Sessions",
+                subtitle: "Launch & reattach Claude Code, agy, Codex & custom CLIs in persistent tmux sessions with mobile Prompt Composer & quick actions."
+            )
+
+            Divider()
+
+            featureRow(
+                icon: "folder.fill",
+                tint: .blue,
                 title: "SFTP File Browser",
                 subtitle: "Browse remote directories, preview code and logs, upload, download, rename, and delete files."
             )

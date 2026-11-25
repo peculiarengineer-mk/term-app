@@ -140,7 +140,9 @@ final class SSHConnectionTests: XCTestCase {
         let (listener, port) = try makeListeningSocket()
         defer { Darwin.close(listener) }
         let accepted = Task.detached { () -> Int32 in
-            Darwin.accept(listener, nil, nil)
+            var pfd = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+            guard Darwin.poll(&pfd, 1, 2_000) > 0 else { return -1 }
+            return Darwin.accept(listener, nil, nil)
         }
         let conn = SSHConnection(host: "127.0.0.1", port: port, username: "u", auth: .password("p"))
         let states = conn.state
@@ -156,6 +158,8 @@ final class SSHConnectionTests: XCTestCase {
         }
         let didEnterConnecting = await sawConnecting.value
         XCTAssertTrue(didEnterConnecting)
+        let peerFd = await accepted.value
+        XCTAssertGreaterThanOrEqual(peerFd, 0)
         connectTask.cancel()
         do {
             try await connectTask.value
@@ -165,7 +169,6 @@ final class SSHConnectionTests: XCTestCase {
         }
         let hasAuthAfter = await conn.hasAuthForTesting
         XCTAssertFalse(hasAuthAfter)
-        let peerFd = await accepted.value
         if peerFd >= 0 { Darwin.close(peerFd) }
     }
 
