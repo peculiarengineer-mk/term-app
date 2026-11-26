@@ -28,20 +28,103 @@ struct ConnectionStatusDot: View {
     }
 }
 
-/// Floating frosted-glass pill docked above the tab bar when viewing Hosts/Keys/Settings with open sessions.
+/// Floating frosted-glass pill docked above the tab bar when viewing Hosts/Keys/Settings with open or resumable sessions.
 struct ActiveSessionPill: View {
-    let title: String
-    let status: LiveSession.ConnectionStatus
-    var agentActivityState: AgentActivityState = .idle
-    let totalCount: Int
-    let showSwitcher: Bool
+    enum Mode {
+        case live(
+            title: String,
+            status: LiveSession.ConnectionStatus,
+            agentActivityState: AgentActivityState,
+            totalCount: Int,
+            showSwitcher: Bool,
+            onSwitch: () -> Void
+        )
+        case resumable(
+            agentName: String,
+            agentSymbol: String,
+            agentTint: Color,
+            subtitle: String,
+            onDismiss: () -> Void
+        )
+    }
+
+    let mode: Mode
     let isDark: Bool
     let onResume: () -> Void
-    let onSwitch: () -> Void
+
+    init(
+        title: String,
+        status: LiveSession.ConnectionStatus,
+        agentActivityState: AgentActivityState = .idle,
+        totalCount: Int,
+        showSwitcher: Bool,
+        isDark: Bool,
+        onResume: @escaping () -> Void,
+        onSwitch: @escaping () -> Void
+    ) {
+        self.mode = .live(
+            title: title,
+            status: status,
+            agentActivityState: agentActivityState,
+            totalCount: totalCount,
+            showSwitcher: showSwitcher,
+            onSwitch: onSwitch
+        )
+        self.isDark = isDark
+        self.onResume = onResume
+    }
+
+    init(
+        agentName: String,
+        agentSymbol: String,
+        agentTint: Color,
+        subtitle: String,
+        isDark: Bool,
+        onResume: @escaping () -> Void,
+        onDismiss: @escaping () -> Void
+    ) {
+        self.mode = .resumable(
+            agentName: agentName,
+            agentSymbol: agentSymbol,
+            agentTint: agentTint,
+            subtitle: subtitle,
+            onDismiss: onDismiss
+        )
+        self.isDark = isDark
+        self.onResume = onResume
+    }
 
     private var needsApproval: Bool {
-        if case .waitingForApproval = agentActivityState { return true }
+        if case .live(_, _, let agentActivityState, _, _, _) = mode,
+           case .waitingForApproval = agentActivityState {
+            return true
+        }
         return false
+    }
+
+    private var hasTrailingButton: Bool {
+        switch mode {
+        case .live(_, _, _, _, let showSwitcher, _): showSwitcher
+        case .resumable: true
+        }
+    }
+
+    private var accessibilityLabelText: String {
+        switch mode {
+        case .live(let title, _, _, _, _, _):
+            "Active session: \(title)"
+        case .resumable(let agentName, _, _, let subtitle, _):
+            "Resume \(agentName), \(subtitle)"
+        }
+    }
+
+    private var accessibilityValueText: String {
+        switch mode {
+        case .live(_, let status, _, _, _, _):
+            status.accessibilityLabel
+        case .resumable:
+            "Reattach"
+        }
     }
 
     private var strokeGradient: LinearGradient {
@@ -64,35 +147,15 @@ struct ActiveSessionPill: View {
         HStack(spacing: 10) {
             Button(action: onResume) {
                 HStack(spacing: 10) {
-                    ConnectionStatusDot(status: status, size: 8, glow: true)
+                    leadingIcon
 
                     VStack(alignment: .leading, spacing: 1) {
-                        HStack(spacing: 6) {
-                            Text("Active Session")
-                                .font(.caption2.weight(.medium))
-                                .foregroundStyle(.secondary)
-
-                            AgentActivityBadge(state: agentActivityState, showLabel: true)
-                        }
-
-                        HStack(spacing: 4) {
-                            Text(title)
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-
-                            if totalCount > 1 {
-                                Text("· \(totalCount) open")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize()
-                            }
-                        }
+                        textContent
                     }
 
                     Spacer(minLength: 4)
 
-                    if !showSwitcher {
+                    if !hasTrailingButton {
                         Image(systemName: "chevron.right")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.tertiary)
@@ -101,13 +164,89 @@ struct ActiveSessionPill: View {
                 }
                 .padding(.vertical, 10)
                 .padding(.leading, 14)
-                .padding(.trailing, showSwitcher ? 4 : 14)
+                .padding(.trailing, hasTrailingButton ? 4 : 14)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Active session: \(title)")
-            .accessibilityValue(status.accessibilityLabel)
+            .accessibilityLabel(accessibilityLabelText)
+            .accessibilityValue(accessibilityValueText)
 
+            trailingActionButton
+        }
+        .background(.ultraThinMaterial, in: shape)
+        .overlay(shape.strokeBorder(strokeGradient, lineWidth: needsApproval ? 1 : 0.5))
+        .shadow(color: Color.black.opacity(isDark ? 0.42 : 0.14), radius: 14, x: 0, y: 6)
+    }
+
+    @ViewBuilder
+    private var leadingIcon: some View {
+        switch mode {
+        case .live(_, let status, _, _, _, _):
+            ConnectionStatusDot(status: status, size: 8, glow: true)
+        case .resumable(_, let agentSymbol, let agentTint, _, _):
+            ProSquircleIcon(
+                symbolName: agentSymbol,
+                tint: agentTint,
+                size: .compact,
+                isDark: isDark
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var textContent: some View {
+        switch mode {
+        case .live(let title, _, let agentActivityState, let totalCount, _, _):
+            HStack(spacing: 6) {
+                Text("Active Session")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+
+                AgentActivityBadge(state: agentActivityState, showLabel: true)
+            }
+
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                if totalCount > 1 {
+                    Text("· \(totalCount) open")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
+            }
+
+        case .resumable(let agentName, _, let agentTint, let subtitle, _):
+            HStack(spacing: 6) {
+                Text("Resume \(agentName)")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Text("Reattach")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(agentTint)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(agentTint.opacity(isDark ? 0.18 : 0.12), in: Capsule())
+                    .fixedSize()
+            }
+
+            Text(subtitle)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    @ViewBuilder
+    private var trailingActionButton: some View {
+        switch mode {
+        case .live(_, _, _, let totalCount, let showSwitcher, let onSwitch):
             if showSwitcher {
                 Button(action: onSwitch) {
                     Image(systemName: "square.on.square")
@@ -123,10 +262,22 @@ struct ActiveSessionPill: View {
                 .padding(.trailing, 6)
                 .accessibilityLabel("Switch sessions (\(totalCount) open)")
             }
+
+        case .resumable(_, _, _, _, let onDismiss):
+            Button(action: onDismiss) {
+                Image(systemName: "xmark")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .minTapTarget()
+                    .background(
+                        Color.primary.opacity(isDark ? 0.08 : 0.06),
+                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    )
+            }
+            .buttonStyle(.plain)
+            .padding(.trailing, 6)
+            .accessibilityLabel("Dismiss resumable session")
         }
-        .background(.ultraThinMaterial, in: shape)
-        .overlay(shape.strokeBorder(strokeGradient, lineWidth: needsApproval ? 1 : 0.5))
-        .shadow(color: Color.black.opacity(isDark ? 0.42 : 0.14), radius: 14, x: 0, y: 6)
     }
 }
 
@@ -164,6 +315,7 @@ struct SessionTabsView<HostList: View>: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
+    @Query(sort: \Host.label) private var hosts: [Host]
 
     init(
         onFocusHosts: @escaping () -> Void = {},
@@ -288,8 +440,18 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     private var activeSessionPill: ActiveSessionPill? {
-        guard selection == nil, !manager.sessions.isEmpty || !pendingConnections.isEmpty else {
+        guard selection == nil else {
             return nil
+        }
+
+        if manager.sessions.isEmpty && pendingConnections.isEmpty {
+            let _ = manager.cacheRevision
+            guard proStore.isProUnlocked,
+                  let resumable = resumableCachedSessionForSavedHost(),
+                  let host = hosts.first(where: { $0.id == resumable.hostID }) else {
+                return nil
+            }
+            return makeResumableSessionPill(for: resumable, host: host)
         }
 
         let waitingForApprovalSession: LiveSession? = {
@@ -355,6 +517,63 @@ struct SessionTabsView<HostList: View>: View {
         case nil:
             return nil
         }
+    }
+
+    private func resumableCachedSessionForSavedHost() -> CachedAISession? {
+        let hostIDs = Set(hosts.map(\.id))
+        guard !hostIDs.isEmpty else { return nil }
+        if let latest = AISessionCacheStore.lastOpenSession(defaults: manager.cacheDefaults),
+           hostIDs.contains(latest.hostID) {
+            return latest
+        }
+        return AISessionCacheStore.openInAppSessions(defaults: manager.cacheDefaults)
+            .first { hostIDs.contains($0.hostID) }
+    }
+
+    private func makeResumableSessionPill(for resumable: CachedAISession, host: Host) -> ActiveSessionPill {
+        let descriptor = AgentVisuals.agentDescriptor(forSlug: resumable.agentSlug)
+        let hostTitle = host.label.isEmpty ? host.hostname : host.label
+        let project: String = {
+            if !resumable.projectSlug.isEmpty {
+                return resumable.projectSlug
+            }
+            if let path = resumable.currentPath, !path.isEmpty {
+                return path
+            }
+            return resumable.sessionName
+        }()
+        let subtitle = "\(hostTitle) · \(project)"
+        let workingDirectory = resumable.currentPath ?? "~"
+
+        return ActiveSessionPill(
+            agentName: descriptor.name,
+            agentSymbol: AgentVisuals.agentSymbol(for: descriptor),
+            agentTint: AgentVisuals.agentTint(for: descriptor),
+            subtitle: subtitle,
+            isDark: theme.isDark,
+            onResume: {
+                AppHaptics.impact(.light)
+                let context = AIAgentLaunchContext(
+                    agent: descriptor,
+                    sessionName: resumable.sessionName,
+                    workingDirectory: workingDirectory,
+                    hostID: host.id,
+                    isTmuxBacked: true
+                )
+                let command = TMuxSessionHelper.attachCommand(sessionName: resumable.sessionName)
+                launchAIAgent(host: host, context: context, command: command)
+            },
+            onDismiss: {
+                AppHaptics.impact(.light)
+                AISessionCacheStore.markOpenInApp(
+                    false,
+                    hostID: resumable.hostID,
+                    sessionName: resumable.sessionName,
+                    defaults: manager.cacheDefaults
+                )
+                manager.noteCacheChanged()
+            }
+        )
     }
 
     var body: some View {

@@ -10,8 +10,14 @@ struct AgentsDashboardView: View {
         let hostID: UUID
         let hostLabel: String
         let session: TMuxSessionHelper.RemoteAISession
+        var isCached: Bool = false
 
         var id: String { "\(hostID.uuidString)::\(session.sessionName)" }
+    }
+
+    private struct ScanTaskID: Equatable {
+        let hostIDs: [UUID]
+        let isProUnlocked: Bool
     }
 
     enum HostScanStatus: Sendable, Equatable {
@@ -123,6 +129,20 @@ struct AgentsDashboardView: View {
         .navigationTitle("Agents")
         .toolbar {
             if proStore.isProUnlocked {
+                if isScanning {
+                    ToolbarItem(placement: .topBarLeading) {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Syncing…")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityLabel("Syncing remote tmux sessions")
+                    }
+                }
+
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         AppHaptics.impact(.light)
@@ -169,8 +189,13 @@ struct AgentsDashboardView: View {
         } message: {
             Text(killError ?? "")
         }
-        .task(id: hosts.map(\.id)) {
+        .onAppear {
             guard proStore.isProUnlocked else { return }
+            loadCachedSessionsIfNeeded()
+        }
+        .task(id: ScanTaskID(hostIDs: hosts.map(\.id), isProUnlocked: proStore.isProUnlocked)) {
+            guard proStore.isProUnlocked else { return }
+            loadCachedSessionsIfNeeded()
             await scanAllHosts()
         }
     }
@@ -359,6 +384,7 @@ struct AgentsDashboardView: View {
         let descriptor = AgentVisuals.agentDescriptor(forSlug: session.agentSlug)
         let tint = AgentVisuals.agentTint(for: descriptor)
         let badge = session.projectSlug.isEmpty ? session.sessionName : session.projectSlug
+        let statusDescription = item.isCached ? "cached" : (session.isAttached ? "attached" : "idle")
         let subtitle: String = {
             if !session.isTermAppManaged && session.sessionName != badge {
                 let prefix = "\(item.hostLabel) · \(session.sessionName)"
@@ -376,7 +402,7 @@ struct AgentsDashboardView: View {
             badgeText: badge,
             badgeTint: tint,
             subtitle: subtitle,
-            accessibilityDescription: "\(descriptor.name) on \(item.hostLabel), \(session.isAttached ? "attached" : "idle")",
+            accessibilityDescription: "\(descriptor.name) on \(item.hostLabel), \(statusDescription)",
             onAttach: { forceNewTab in attach(item, forceNewTab: forceNewTab) }
         )
     }
@@ -409,7 +435,9 @@ struct AgentsDashboardView: View {
         onAttach: @escaping (Bool) -> Void
     ) -> some View {
         let session = item.session
-        let ledColor = session.isAttached ? palette.healthy : palette.proBrandAmber
+        let ledColor = item.isCached
+            ? palette.neutral
+            : (session.isAttached ? palette.healthy : palette.proBrandAmber)
         let activityDate = session.lastActivityAt ?? session.createdAt
 
         return Button {
@@ -450,9 +478,13 @@ struct AgentsDashboardView: View {
 
                     if dynamicTypeSize.isAccessibilitySize {
                         HStack(spacing: 6) {
-                            Text(session.isAttached ? "Attached" : "Idle")
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(ledColor)
+                            if item.isCached {
+                                cachedBadgePill
+                            } else {
+                                Text(session.isAttached ? "Attached" : "Idle")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(ledColor)
+                            }
 
                             if activityDate != nil {
                                 Text("· \(AgentVisuals.relativeActivityString(from: activityDate))")
@@ -468,9 +500,13 @@ struct AgentsDashboardView: View {
 
                 if !dynamicTypeSize.isAccessibilitySize {
                     VStack(alignment: .trailing, spacing: 2) {
-                        Text(session.isAttached ? "Attached" : "Idle")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(ledColor)
+                        if item.isCached {
+                            cachedBadgePill
+                        } else {
+                            Text(session.isAttached ? "Attached" : "Idle")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(ledColor)
+                        }
 
                         if activityDate != nil {
                             Text(AgentVisuals.relativeActivityString(from: activityDate))
@@ -515,6 +551,15 @@ struct AgentsDashboardView: View {
             }
             .tint(palette.healthy)
         }
+    }
+
+    private var cachedBadgePill: some View {
+        Text("Cached")
+            .font(.caption2.weight(.semibold))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .foregroundStyle(palette.neutral)
+            .background(palette.pillFill(for: palette.neutral), in: Capsule())
     }
 
     private func tmuxBadgePill(_ text: String, tint: Color) -> some View {
@@ -641,10 +686,28 @@ struct AgentsDashboardView: View {
             }
             AppHaptics.notify(.success)
             remoteSessions.removeAll { $0.id == item.id }
+            AISessionCacheStore.remove(
+                hostID: item.hostID,
+                sessionName: item.session.sessionName,
+                defaults: sessionManager.cacheDefaults
+            )
+            sessionManager.noteCacheChanged()
         } catch {
             AppHaptics.notify(.error)
             killError = error.localizedDescription
         }
+    }
+
+    private func loadCachedSessionsIfNeeded() {
+        guard !hasScannedOnce else { return }
+        let hostsByID = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0) })
+        let cached = AISessionCacheStore.load(defaults: sessionManager.cacheDefaults)
+        let hydrated = cached.compactMap { entry -> DiscoveredSession? in
+            guard entry.isAISession, let host = hostsByID[entry.hostID] else { return nil }
+            let label = host.label.isEmpty ? host.hostname : host.label
+            return Self.makeDiscoveredSession(from: entry, hostLabel: label)
+        }
+        remoteSessions = Self.sortedSessions(hydrated)
     }
 
     private func scanAllHosts() async {
@@ -659,6 +722,12 @@ struct AgentsDashboardView: View {
             isScanning = false
             hasScannedOnce = true
             return
+        }
+
+        let targetHostIDs = Set(targets.map(\.id))
+        remoteSessions.removeAll { !targetHostIDs.contains($0.hostID) }
+        if !hasScannedOnce && remoteSessions.isEmpty {
+            loadCachedSessionsIfNeeded()
         }
 
         isScanning = true
@@ -694,12 +763,103 @@ struct AgentsDashboardView: View {
 
         guard !Task.isCancelled, generation == scanGeneration else { return }
 
-        let discovered = outcomes.flatMap { outcome in
-            outcome.sessions.map {
-                DiscoveredSession(hostID: outcome.hostID, hostLabel: outcome.hostLabel, session: $0)
+        let cacheDefaults = sessionManager.cacheDefaults
+        let cachedByHost = Dictionary(
+            grouping: AISessionCacheStore.load(defaults: cacheDefaults),
+            by: \.hostID
+        )
+        let now = Date()
+        var discovered: [DiscoveredSession] = []
+
+        for outcome in outcomes {
+            switch outcome.status {
+            case .ok:
+                let discoveredCached = outcome.sessions
+                    .filter(\.isAISession)
+                    .map { session in
+                        CachedAISession(
+                            hostID: outcome.hostID,
+                            hostLabel: outcome.hostLabel,
+                            sessionName: session.sessionName,
+                            agentSlug: session.agentSlug,
+                            projectSlug: session.projectSlug,
+                            currentPath: session.currentPath,
+                            isTermAppManaged: session.isTermAppManaged,
+                            detectedCommand: session.detectedCommand,
+                            lastSeenAt: session.lastActivityAt ?? session.createdAt ?? now,
+                            wasOpenInApp: false
+                        )
+                    }
+                AISessionCacheStore.replaceRemoteSessions(
+                    for: outcome.hostID,
+                    with: discoveredCached,
+                    defaults: cacheDefaults
+                )
+                for session in outcome.sessions {
+                    discovered.append(
+                        DiscoveredSession(
+                            hostID: outcome.hostID,
+                            hostLabel: outcome.hostLabel,
+                            session: session,
+                            isCached: false
+                        )
+                    )
+                }
+
+            case .tmuxMissing:
+                AISessionCacheStore.removeAll(for: outcome.hostID, defaults: cacheDefaults)
+
+            case .needsAuthOrTrust, .unreachable:
+                let hostCached = (cachedByHost[outcome.hostID] ?? []).filter(\.isAISession)
+                for entry in hostCached {
+                    discovered.append(
+                        Self.makeDiscoveredSession(
+                            from: entry,
+                            hostLabel: outcome.hostLabel
+                        )
+                    )
+                }
             }
         }
-        remoteSessions = discovered.sorted { lhs, rhs in
+
+        sessionManager.noteCacheChanged()
+        remoteSessions = Self.sortedSessions(discovered)
+        scanOutcomes = outcomes
+        hasScannedOnce = true
+    }
+
+    private static func makeDiscoveredSession(
+        from entry: CachedAISession,
+        hostLabel: String
+    ) -> DiscoveredSession {
+        let resolvedLabel = hostLabel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? entry.hostLabel
+            : hostLabel
+        let remote = TMuxSessionHelper.RemoteAISession(
+            sessionName: entry.sessionName,
+            agentSlug: entry.agentSlug,
+            projectSlug: entry.projectSlug,
+            isAttached: false,
+            windowCount: 1,
+            createdAt: nil,
+            lastActivityAt: entry.lastSeenAt,
+            currentPath: entry.currentPath,
+            isTermAppManaged: entry.isTermAppManaged,
+            detectedCommand: entry.detectedCommand
+        )
+        return DiscoveredSession(
+            hostID: entry.hostID,
+            hostLabel: resolvedLabel,
+            session: remote,
+            isCached: true
+        )
+    }
+
+    private static func sortedSessions(_ sessions: [DiscoveredSession]) -> [DiscoveredSession] {
+        sessions.sorted { lhs, rhs in
+            if lhs.isCached != rhs.isCached {
+                return !lhs.isCached && rhs.isCached
+            }
             if lhs.session.isAttached != rhs.session.isAttached {
                 return lhs.session.isAttached && !rhs.session.isAttached
             }
@@ -714,8 +874,6 @@ struct AgentsDashboardView: View {
             }
             return lhs.session.sessionName.localizedCaseInsensitiveCompare(rhs.session.sessionName) == .orderedAscending
         }
-        scanOutcomes = outcomes
-        hasScannedOnce = true
     }
 
     private static func buildKnownCommands() -> [String: String] {

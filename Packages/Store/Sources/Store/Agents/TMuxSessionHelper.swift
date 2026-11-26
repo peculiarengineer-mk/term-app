@@ -213,7 +213,7 @@ public enum TMuxSessionHelper {
         return result.isEmpty ? fallback : result
     }
 
-    private static func projectSlug(from workingDirectory: String) -> String {
+    public static func projectSlug(from workingDirectory: String) -> String {
         var trimmed = workingDirectory
             .replacingOccurrences(of: "\0", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)

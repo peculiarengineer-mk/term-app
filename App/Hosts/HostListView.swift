@@ -600,6 +600,8 @@ struct HostListView: View {
         }
         PortForwardStore.deleteAll(for: hostID)
         HostProjectStore.deleteAll(for: hostID)
+        AISessionCacheStore.removeAll(for: hostID, defaults: manager.cacheDefaults)
+        manager.noteCacheChanged()
         do {
             try HostSecrets.tryDeletePassword(for: hostID)
             AppHaptics.notify(.warning)

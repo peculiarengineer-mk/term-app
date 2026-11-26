@@ -455,7 +455,23 @@ final class SessionManager {
     private(set) var sessions: [LiveSession] = []
     private(set) var pendingMergeBackSessionID: UUID?
     private(set) var pendingNewTabRequestID: UUID?
+    private(set) var cacheRevision: Int = 0
+    let cacheDefaults: UserDefaults
     var onSessionsChanged: (() -> Void)?
+
+    init(cacheDefaults: UserDefaults = .standard) {
+        self.cacheDefaults = cacheDefaults
+    }
+
+    /// Most recently seen cached AI `tmux` session that was still open when the app last ran.
+    var resumableAISession: CachedAISession? {
+        _ = cacheRevision
+        return AISessionCacheStore.lastOpenSession(defaults: cacheDefaults)
+    }
+
+    func noteCacheChanged() {
+        cacheRevision &+= 1
+    }
 
     func session(id: UUID) -> LiveSession? { sessions.first { $0.id == id } }
 
@@ -487,8 +503,13 @@ final class SessionManager {
             isTmuxBacked: isTmuxBacked
         )
         sessions.append(live)
-        if aiAgentContext != nil {
+        if let ctx = live.aiAgentContext {
             AgentNotificationManager.shared.requestAuthorizationIfNeeded()
+            if live.isTmuxBacked {
+                let cached = Self.makeCachedAISession(from: ctx, hostID: hostID, title: title)
+                AISessionCacheStore.upsert(cached, defaults: cacheDefaults)
+                cacheRevision &+= 1
+            }
         }
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
         startAutoPortForwards(for: live, on: session)
@@ -592,12 +613,58 @@ final class SessionManager {
     func close(_ id: UUID) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         let live = sessions.remove(at: i)
+        if let ctx = live.aiAgentContext {
+            AISessionCacheStore.markOpenInApp(
+                false,
+                hostID: live.hostID,
+                sessionName: ctx.sessionName,
+                defaults: cacheDefaults
+            )
+            cacheRevision &+= 1
+        }
         live.autoPortForwardsTask?.cancel()
         live.autoPortForwardsTask = nil
         live.cleanupActivityTracking()
         onSessionsChanged?()
         let session = live.session
         Task { await session.close() }
+    }
+
+    private static func makeCachedAISession(
+        from context: AIAgentLaunchContext,
+        hostID: UUID,
+        title: String
+    ) -> CachedAISession {
+        let agentPrefix = "\(context.agent.name) · "
+        let resolvedHostLabel: String
+        if title.hasPrefix(agentPrefix) {
+            let stripped = String(title.dropFirst(agentPrefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            resolvedHostLabel = stripped.isEmpty ? title : stripped
+        } else {
+            resolvedHostLabel = title
+        }
+
+        let isManaged = context.sessionName.hasPrefix(TMuxSessionHelper.sessionPrefix)
+        let trimmedDir = context.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        let derivedProjectSlug: String
+        if !isManaged && (trimmedDir.isEmpty || trimmedDir == "~" || trimmedDir == "~/") {
+            derivedProjectSlug = context.sessionName
+        } else {
+            derivedProjectSlug = TMuxSessionHelper.projectSlug(from: context.workingDirectory)
+        }
+
+        return CachedAISession(
+            hostID: hostID,
+            hostLabel: resolvedHostLabel,
+            sessionName: context.sessionName,
+            agentSlug: context.agent.slug,
+            projectSlug: derivedProjectSlug,
+            currentPath: trimmedDir.isEmpty ? nil : trimmedDir,
+            isTermAppManaged: isManaged,
+            detectedCommand: context.agent.command.isEmpty ? nil : context.agent.command,
+            lastSeenAt: Date(),
+            wasOpenInApp: true
+        )
     }
 }
 

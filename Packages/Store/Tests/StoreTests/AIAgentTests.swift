@@ -826,4 +826,282 @@ final class AIAgentTests: XCTestCase {
         HostProjectStore.deleteCustomPreset(id: first.id, defaults: defaults)
         XCTAssertEqual(HostProjectStore.customPresets(defaults: defaults), [second])
     }
+
+    // MARK: - AISessionCacheStore
+
+    func testCachedAISessionIdentityIsAISessionAndCodable() throws {
+        let hostID = UUID()
+        let timestamp = Date(timeIntervalSince1970: 1_700_001_000)
+
+        let managed = CachedAISession(
+            hostID: hostID,
+            hostLabel: "Prod Box",
+            sessionName: "termapp-ai-claude-repo",
+            agentSlug: "claude",
+            projectSlug: "repo",
+            currentPath: "~/repo",
+            isTermAppManaged: true,
+            detectedCommand: "claude",
+            lastSeenAt: timestamp,
+            wasOpenInApp: true
+        )
+        XCTAssertEqual(managed.id, "\(hostID.uuidString):termapp-ai-claude-repo")
+        XCTAssertTrue(managed.isAISession)
+
+        let unmanagedAI = CachedAISession(
+            hostID: hostID,
+            hostLabel: "Prod Box",
+            sessionName: "dev",
+            agentSlug: "codex",
+            projectSlug: "api",
+            isTermAppManaged: false,
+            detectedCommand: "codex",
+            lastSeenAt: timestamp
+        )
+        XCTAssertTrue(unmanagedAI.isAISession)
+
+        let generalShell = CachedAISession(
+            hostID: hostID,
+            hostLabel: "Prod Box",
+            sessionName: "main",
+            agentSlug: "",
+            projectSlug: "main",
+            isTermAppManaged: false,
+            detectedCommand: "zsh",
+            lastSeenAt: timestamp
+        )
+        XCTAssertFalse(generalShell.isAISession)
+
+        let encoded = try JSONEncoder().encode(managed)
+        let decoded = try JSONDecoder().decode(CachedAISession.self, from: encoded)
+        XCTAssertEqual(decoded, managed)
+    }
+
+    func testAISessionCacheStoreUpsertSortingAndCorruptFallback() {
+        let (defaults, cleanup) = makeIsolatedDefaults()
+        defer { cleanup() }
+
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults), [])
+        XCTAssertNil(AISessionCacheStore.lastOpenSession(defaults: defaults))
+
+        defaults.set(Data("not-valid-json".utf8), forKey: AISessionCacheStore.storageKey)
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults), [])
+
+        let hostA = UUID()
+        let hostB = UUID()
+        let t1 = Date(timeIntervalSince1970: 1_700_000_100)
+        let t2 = Date(timeIntervalSince1970: 1_700_000_200)
+        let t3 = Date(timeIntervalSince1970: 1_700_000_300)
+
+        let older = CachedAISession(
+            hostID: hostA,
+            hostLabel: "Alpha",
+            sessionName: "termapp-ai-claude-app",
+            agentSlug: "claude",
+            projectSlug: "app",
+            currentPath: "~/app",
+            lastSeenAt: t1,
+            wasOpenInApp: true
+        )
+        let sameNameDifferentHost = CachedAISession(
+            hostID: hostB,
+            hostLabel: "Beta",
+            sessionName: "termapp-ai-claude-app",
+            agentSlug: "claude",
+            projectSlug: "app",
+            currentPath: "/srv/app",
+            lastSeenAt: t2,
+            wasOpenInApp: false
+        )
+
+        AISessionCacheStore.upsert(older, defaults: defaults)
+        AISessionCacheStore.upsert(sameNameDifferentHost, defaults: defaults)
+
+        let loaded = AISessionCacheStore.load(defaults: defaults)
+        XCTAssertEqual(loaded.count, 2)
+        XCTAssertEqual(loaded.map(\.hostID), [hostB, hostA])
+
+        // Upsert with matching (hostID, sessionName) updates in place and re-sorts.
+        var updatedOlder = older
+        updatedOlder.lastSeenAt = t3
+        updatedOlder.currentPath = "~/app-v2"
+        AISessionCacheStore.upsert(updatedOlder, defaults: defaults)
+
+        let reloaded = AISessionCacheStore.load(defaults: defaults)
+        XCTAssertEqual(reloaded.count, 2)
+        XCTAssertEqual(reloaded.first, updatedOlder)
+    }
+
+    func testAISessionCacheStoreReplaceRemoteSessionsPreservesOpenAndPrunesExited() {
+        let (defaults, cleanup) = makeIsolatedDefaults()
+        defer { cleanup() }
+
+        let hostA = UUID()
+        let hostB = UUID()
+        let t1 = Date(timeIntervalSince1970: 1_700_000_100)
+        let t2 = Date(timeIntervalSince1970: 1_700_000_200)
+        let t3 = Date(timeIntervalSince1970: 1_700_000_300)
+
+        let openSurviving = CachedAISession(
+            hostID: hostA,
+            hostLabel: "Host A",
+            sessionName: "termapp-ai-claude-api",
+            agentSlug: "claude",
+            projectSlug: "api",
+            lastSeenAt: t1,
+            wasOpenInApp: true
+        )
+        let openExited = CachedAISession(
+            hostID: hostA,
+            hostLabel: "Host A",
+            sessionName: "termapp-ai-codex-old",
+            agentSlug: "codex",
+            projectSlug: "old",
+            lastSeenAt: t2,
+            wasOpenInApp: true
+        )
+        let otherHostSession = CachedAISession(
+            hostID: hostB,
+            hostLabel: "Host B",
+            sessionName: "termapp-ai-agy-web",
+            agentSlug: "agy",
+            projectSlug: "web",
+            lastSeenAt: t1,
+            wasOpenInApp: true
+        )
+
+        AISessionCacheStore.upsert(openSurviving, defaults: defaults)
+        AISessionCacheStore.upsert(openExited, defaults: defaults)
+        AISessionCacheStore.upsert(otherHostSession, defaults: defaults)
+
+        // Live tmux scan for hostA sees openSurviving (as discovered with wasOpenInApp: false) + a new session.
+        let discoveredSurviving = CachedAISession(
+            hostID: hostA,
+            hostLabel: "Host A",
+            sessionName: "termapp-ai-claude-api",
+            agentSlug: "claude",
+            projectSlug: "api",
+            currentPath: "/srv/api",
+            lastSeenAt: t3,
+            wasOpenInApp: false
+        )
+        let newlyDiscovered = CachedAISession(
+            hostID: hostA,
+            hostLabel: "Host A",
+            sessionName: "termapp-ai-aider-cli",
+            agentSlug: "aider",
+            projectSlug: "cli",
+            lastSeenAt: t2,
+            wasOpenInApp: false
+        )
+        // Cross-host entry accidentally included should be ignored for hostA replacement.
+        let wrongHostEntry = CachedAISession(
+            hostID: hostB,
+            hostLabel: "Host B",
+            sessionName: "should-be-ignored",
+            agentSlug: "claude",
+            projectSlug: "x",
+            lastSeenAt: t3,
+            wasOpenInApp: false
+        )
+
+        AISessionCacheStore.replaceRemoteSessions(
+            for: hostA,
+            with: [discoveredSurviving, newlyDiscovered, wrongHostEntry],
+            defaults: defaults
+        )
+
+        let all = AISessionCacheStore.load(defaults: defaults)
+        XCTAssertEqual(all.count, 3)
+
+        // Exited session on hostA was pruned.
+        XCTAssertFalse(all.contains { $0.hostID == hostA && $0.sessionName == "termapp-ai-codex-old" })
+
+        // Surviving session kept wasOpenInApp = true and updated path/timestamp.
+        let surviving = all.first { $0.hostID == hostA && $0.sessionName == "termapp-ai-claude-api" }
+        XCTAssertEqual(surviving?.wasOpenInApp, true)
+        XCTAssertEqual(surviving?.currentPath, "/srv/api")
+        XCTAssertEqual(surviving?.lastSeenAt, t3)
+
+        // Newly discovered session remains wasOpenInApp = false.
+        let discovered = all.first { $0.hostID == hostA && $0.sessionName == "termapp-ai-aider-cli" }
+        XCTAssertEqual(discovered?.wasOpenInApp, false)
+
+        // Other host's entries were untouched.
+        XCTAssertEqual(all.filter { $0.hostID == hostB }, [otherHostSession])
+
+        // Replacing hostA with [] clears only hostA.
+        AISessionCacheStore.replaceRemoteSessions(for: hostA, with: [], defaults: defaults)
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults), [otherHostSession])
+    }
+
+    func testAISessionCacheStoreMarkOpenRemoveRemoveAllAndLastOpen() {
+        let (defaults, cleanup) = makeIsolatedDefaults()
+        defer { cleanup() }
+
+        let hostA = UUID()
+        let hostB = UUID()
+        let t1 = Date(timeIntervalSince1970: 1_700_000_100)
+        let t2 = Date(timeIntervalSince1970: 1_700_000_200)
+        let t3 = Date(timeIntervalSince1970: 1_700_000_300)
+
+        let s1 = CachedAISession(
+            hostID: hostA,
+            hostLabel: "A",
+            sessionName: "shared-name",
+            agentSlug: "claude",
+            projectSlug: "p1",
+            lastSeenAt: t1,
+            wasOpenInApp: true
+        )
+        let s2 = CachedAISession(
+            hostID: hostA,
+            hostLabel: "A",
+            sessionName: "termapp-ai-codex-p2",
+            agentSlug: "codex",
+            projectSlug: "p2",
+            lastSeenAt: t3,
+            wasOpenInApp: false
+        )
+        let s3 = CachedAISession(
+            hostID: hostB,
+            hostLabel: "B",
+            sessionName: "shared-name",
+            agentSlug: "agy",
+            projectSlug: "p3",
+            lastSeenAt: t2,
+            wasOpenInApp: true
+        )
+
+        AISessionCacheStore.upsert(s1, defaults: defaults)
+        AISessionCacheStore.upsert(s2, defaults: defaults)
+        AISessionCacheStore.upsert(s3, defaults: defaults)
+
+        // Only open-in-app sessions are returned, sorted most-recent first.
+        XCTAssertEqual(AISessionCacheStore.openInAppSessions(defaults: defaults).map(\.hostID), [hostB, hostA])
+        XCTAssertEqual(AISessionCacheStore.lastOpenSession(defaults: defaults), s3)
+
+        // Mark s2 open -> becomes lastOpenSession.
+        AISessionCacheStore.markOpenInApp(true, hostID: hostA, sessionName: "termapp-ai-codex-p2", defaults: defaults)
+        XCTAssertEqual(AISessionCacheStore.lastOpenSession(defaults: defaults)?.sessionName, "termapp-ai-codex-p2")
+
+        // Marking a nonexistent session is a no-op.
+        AISessionCacheStore.markOpenInApp(true, hostID: hostA, sessionName: "does-not-exist", defaults: defaults)
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults).count, 3)
+
+        // Dismiss s2 -> falls back to s3.
+        AISessionCacheStore.markOpenInApp(false, hostID: hostA, sessionName: "termapp-ai-codex-p2", defaults: defaults)
+        XCTAssertEqual(AISessionCacheStore.lastOpenSession(defaults: defaults), s3)
+
+        // Remove only hostB's "shared-name" -> hostA's "shared-name" remains.
+        AISessionCacheStore.remove(hostID: hostB, sessionName: "shared-name", defaults: defaults)
+        XCTAssertEqual(AISessionCacheStore.lastOpenSession(defaults: defaults), s1)
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults).count, 2)
+
+        // Re-add s3 and removeAll for hostA -> only hostB remains.
+        AISessionCacheStore.upsert(s3, defaults: defaults)
+        AISessionCacheStore.removeAll(for: hostA, defaults: defaults)
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults), [s3])
+        XCTAssertEqual(AISessionCacheStore.lastOpenSession(defaults: defaults), s3)
+    }
 }

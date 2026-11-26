@@ -383,6 +383,8 @@ enum CloudHostSync {
             context.delete(host)
             HostSecrets.deletePassword(for: hostID)
             PortForwardStore.deleteAll(for: hostID)
+            HostProjectStore.deleteAll(for: hostID)
+            AISessionCacheStore.removeAll(for: hostID)
             removed += 1
         }
 
@@ -401,6 +403,8 @@ enum CloudHostSync {
             context.delete(host)
             HostSecrets.deletePassword(for: hostID)
             PortForwardStore.deleteAll(for: hostID)
+            HostProjectStore.deleteAll(for: hostID)
+            AISessionCacheStore.removeAll(for: hostID)
         }
         try? context.save()
     }
