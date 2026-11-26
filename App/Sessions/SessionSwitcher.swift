@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Sheet listing every live session across windows.
 struct SessionSwitcher: View {
@@ -6,7 +7,14 @@ struct SessionSwitcher: View {
     let onSelect: (UUID) -> Void
     let onOpenInWindow: (UUID) -> Void
     @Environment(SessionManager.self) private var manager
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dismiss) private var dismiss
+    @State private var closingSession: LiveSession?
+
+    private var canOpenInNewWindow: Bool {
+        UIApplication.shared.supportsMultipleScenes && horizontalSizeClass == .regular
+    }
 
     var body: some View {
         NavigationStack {
@@ -46,19 +54,24 @@ struct SessionSwitcher: View {
                         .accessibilityValue(live.connectionStatus.accessibilityLabel)
                         .accessibilityAddTraits(isSelected ? .isSelected : [])
 
-                        Button {
-                            AppHaptics.impact(.light)
-                            onOpenInWindow(live.id)
-                            dismiss()
-                        } label: {
-                            Label("New window", systemImage: "macwindow.badge.plus")
-                                .labelStyle(.iconOnly)
-                                .frame(minWidth: 40, minHeight: 40)
-                                .contentShape(Rectangle())
+                        if canOpenInNewWindow {
+                            Button {
+                                AppHaptics.impact(.light)
+                                onOpenInWindow(live.id)
+                                dismiss()
+                            } label: {
+                                Label("New window", systemImage: "macwindow.badge.plus")
+                                    .labelStyle(.iconOnly)
+                                    .minTapTarget()
+                            }
                         }
                     }
                     .buttonStyle(.borderless)
-                    .swipeActions { Button("Close", role: .destructive) { manager.close(live.id) } }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button("Close", role: .destructive) {
+                            requestClose(live)
+                        }
+                    }
                 }
             }
             .overlay {
@@ -69,6 +82,36 @@ struct SessionSwitcher: View {
             .navigationTitle("Sessions")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
+            .confirmationDialog(
+                "Close active session?",
+                isPresented: Binding(get: { closingSession != nil }, set: { if !$0 { closingSession = nil } }),
+                titleVisibility: .visible,
+                presenting: closingSession
+            ) { live in
+                if live.ephemeralHost != nil {
+                    Button("Save Host", systemImage: "bookmark.badge.plus") {
+                        manager.saveEphemeralHost(for: live.id, in: modelContext)
+                    }
+                }
+                Button("Close Session", role: .destructive) {
+                    AppHaptics.impact(.light)
+                    closingSession = nil
+                    manager.close(live.id)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { live in
+                Text("Closing \"\(live.title)\" will disconnect the active SSH session.")
+            }
+        }
+    }
+
+    private func requestClose(_ live: LiveSession) {
+        if live.connectionStatus == .connected {
+            AppHaptics.impact(.light)
+            closingSession = live
+        } else {
+            AppHaptics.impact(.light)
+            manager.close(live.id)
         }
     }
 }

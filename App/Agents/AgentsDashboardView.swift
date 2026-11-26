@@ -60,6 +60,7 @@ struct AgentsDashboardView: View {
     @Environment(\.connectHost) private var connectHost
     @Environment(\.launchAIAgent) private var launchAIAgent
     @Environment(\.runTerminalCommand) private var runTerminalCommand
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
 
@@ -74,17 +75,29 @@ struct AgentsDashboardView: View {
     @State private var showingPaywall = false
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
-    private var openAISessions: [LiveSession] {
-        sessionManager.sessions.filter { $0.aiAgentContext != nil }
+    private var liveSessions: [LiveSession] {
+        sessionManager.sessions
+    }
+
+    private var deduplicatedRemoteSessions: [DiscoveredSession] {
+        remoteSessions.filter { !isAlreadyOpen($0) }
     }
 
     private var aiSessions: [DiscoveredSession] {
-        remoteSessions.filter(\.session.isAISession)
+        deduplicatedRemoteSessions.filter(\.session.isAISession)
     }
 
     private var otherTmuxSessions: [DiscoveredSession] {
-        remoteSessions.filter { !$0.session.isAISession }
+        deduplicatedRemoteSessions.filter { !$0.session.isAISession }
+    }
+
+    private func isAlreadyOpen(_ item: DiscoveredSession) -> Bool {
+        sessionManager.sessions.contains { live in
+            live.hostID == item.hostID
+                && live.aiAgentContext?.sessionName == item.session.sessionName
+        }
     }
 
     private var hostScanIssues: [HostScanOutcome] {
@@ -107,6 +120,7 @@ struct AgentsDashboardView: View {
                 proPromptView
             }
         }
+        .navigationTitle("Agents")
         .toolbar {
             if proStore.isProUnlocked {
                 ToolbarItem(placement: .topBarTrailing) {
@@ -124,12 +138,12 @@ struct AgentsDashboardView: View {
         .sheet(isPresented: $showingLaunchSheet) {
             LaunchAIAgentSheet(initialHost: nil)
                 .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                .tint(theme.accentColor)
+                .tint(palette.accent)
         }
         .sheet(isPresented: $showingPaywall) {
             ProPaywallView()
                 .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                .tint(theme.accentColor)
+                .tint(palette.accent)
         }
         .confirmationDialog(
             "Kill remote tmux session?",
@@ -163,10 +177,10 @@ struct AgentsDashboardView: View {
 
     private var dashboardList: some View {
         List {
-            if !openAISessions.isEmpty {
-                Section("Open AI Tabs") {
-                    ForEach(openAISessions) { live in
-                        openTabRow(live)
+            if !liveSessions.isEmpty {
+                Section("Live Sessions") {
+                    ForEach(liveSessions) { live in
+                        liveSessionRow(live)
                     }
                 }
             }
@@ -214,16 +228,17 @@ struct AgentsDashboardView: View {
                 }
             }
         }
+        .listStyle(.insetGrouped)
         .refreshable {
             await scanAllHosts()
         }
         .overlay {
-            if openAISessions.isEmpty && remoteSessions.isEmpty && hostScanIssues.isEmpty && !isScanning {
+            if liveSessions.isEmpty && aiSessions.isEmpty && otherTmuxSessions.isEmpty && hostScanIssues.isEmpty && !isScanning {
                 if hosts.isEmpty {
                     ContentUnavailableView(
                         "No Saved Hosts",
                         systemImage: "server.rack",
-                        description: Text("Add an SSH host in the Hosts segment to launch and discover remote AI agents.")
+                        description: Text("Add an SSH host in the Hosts tab to launch and discover remote AI agents.")
                     )
                 } else if hasScannedOnce {
                     ContentUnavailableView {
@@ -238,7 +253,7 @@ struct AgentsDashboardView: View {
                             Label("Launch AI Agent", systemImage: "plus")
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(AgentVisuals.appleProAmber)
+                        .tint(palette.proBrandAmber)
                     }
                 }
             }
@@ -255,21 +270,22 @@ struct AgentsDashboardView: View {
         }
     }
 
-    private func openTabRow(_ live: LiveSession) -> some View {
+    private func liveSessionRow(_ live: LiveSession) -> some View {
         let context = live.aiAgentContext
-        let tint = context.map { AgentVisuals.agentTint(for: $0.agent) } ?? AgentVisuals.appleProAmber
-        let symbol = context.map { AgentVisuals.agentSymbol(for: $0.agent) } ?? "sparkles"
+        let tint = context.map { AgentVisuals.agentTint(for: $0.agent) } ?? palette.accent
+        let symbol = context.map { AgentVisuals.agentSymbol(for: $0.agent) } ?? "terminal.fill"
+        let subtitle = liveSessionSubtitle(for: live)
 
         return Button {
             AppHaptics.impact(.light)
             openSessionTab(live.id)
         } label: {
             HStack(spacing: 12) {
-                SquircleIcon(
+                ProSquircleIcon(
                     symbolName: symbol,
                     tint: tint,
-                    fillOpacity: theme.isDark ? 0.22 : 0.14,
-                    rimOpacity: 0.38
+                    size: .row,
+                    theme: theme
                 )
 
                 VStack(alignment: .leading, spacing: 3) {
@@ -282,31 +298,60 @@ struct AgentsDashboardView: View {
                         Text(live.title)
                             .font(.headline)
                             .foregroundStyle(.primary)
-                            .lineLimit(1)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                     }
 
-                    if let context {
-                        Text("\(context.workingDirectory) · \(context.sessionName)")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+
+                    if dynamicTypeSize.isAccessibilitySize {
+                        HStack(spacing: 8) {
+                            AgentActivityBadge(state: live.agentActivityState, showLabel: true)
+                            resumePill(tint: tint)
+                        }
+                        .padding(.top, 2)
                     }
                 }
 
-                Spacer(minLength: 8)
+                if !dynamicTypeSize.isAccessibilitySize {
+                    Spacer(minLength: 8)
 
-                Text("Resume")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(tint)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(tint.opacity(theme.isDark ? 0.18 : 0.12), in: Capsule())
+                    HStack(spacing: 8) {
+                        AgentActivityBadge(state: live.agentActivityState, showLabel: true)
+                        resumePill(tint: tint)
+                    }
+                } else {
+                    Spacer(minLength: 0)
+                }
             }
             .padding(.vertical, 2)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Resume \(live.title)")
+    }
+
+    private func resumePill(tint: Color) -> some View {
+        Text("Resume")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(palette.pillFill(for: tint), in: Capsule())
+    }
+
+    private func liveSessionSubtitle(for live: LiveSession) -> String {
+        if let context = live.aiAgentContext {
+            return "\(context.workingDirectory) · \(context.sessionName)"
+        }
+        if let host = hosts.first(where: { $0.id == live.hostID }) ?? live.ephemeralHost {
+            let userPart = host.username.isEmpty ? "" : "\(host.username)@"
+            let portPart = host.port == 22 ? "" : ":\(host.port)"
+            return "\(userPart)\(host.hostname)\(portPart)"
+        }
+        return live.connectionStatus.accessibilityLabel
     }
 
     private func remoteSessionRow(_ item: DiscoveredSession) -> some View {
@@ -342,10 +387,10 @@ struct AgentsDashboardView: View {
         return tmuxSessionRow(
             item: item,
             iconSymbol: "terminal",
-            iconTint: AgentVisuals.slateColor,
+            iconTint: palette.neutral,
             title: session.sessionName,
             badgeText: commandBadge,
-            badgeTint: AgentVisuals.slateColor,
+            badgeTint: palette.neutral,
             subtitle: subtitleLine(hostLabel: item.hostLabel, path: session.currentPath),
             accessibilityDescription: "tmux session \(session.sessionName) on \(item.hostLabel), \(session.isAttached ? "attached" : "idle")",
             onAttach: { _ in attachGeneralSession(item) }
@@ -364,7 +409,7 @@ struct AgentsDashboardView: View {
         onAttach: @escaping (Bool) -> Void
     ) -> some View {
         let session = item.session
-        let ledColor = session.isAttached ? AgentVisuals.activeGreen : AgentVisuals.appleProAmber
+        let ledColor = session.isAttached ? palette.healthy : palette.proBrandAmber
         let activityDate = session.lastActivityAt ?? session.createdAt
 
         return Button {
@@ -372,50 +417,66 @@ struct AgentsDashboardView: View {
             onAttach(false)
         } label: {
             HStack(spacing: 12) {
-                SquircleIcon(
+                ProSquircleIcon(
                     symbolName: iconSymbol,
                     tint: iconTint,
-                    fillOpacity: theme.isDark ? 0.20 : 0.14,
-                    rimOpacity: 0.36
+                    size: .row,
+                    theme: theme
                 )
 
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
-                        CloudStatusLED(color: ledColor, size: 7)
+                        ProStatusLED(color: ledColor, size: 7)
 
                         Text(title)
                             .font(.headline)
                             .foregroundStyle(.primary)
-                            .lineLimit(1)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
 
-                        if !badgeText.isEmpty {
-                            Text(badgeText)
-                                .font(.caption2.monospaced().weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .foregroundStyle(badgeTint)
-                                .background(badgeTint.opacity(theme.isDark ? 0.16 : 0.12), in: Capsule())
+                        if !badgeText.isEmpty && !dynamicTypeSize.isAccessibilitySize {
+                            tmuxBadgePill(badgeText, tint: badgeTint)
                         }
+                    }
+
+                    if !badgeText.isEmpty && dynamicTypeSize.isAccessibilitySize {
+                        tmuxBadgePill(badgeText, tint: badgeTint)
                     }
 
                     Text(subtitle)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                         .truncationMode(.middle)
+
+                    if dynamicTypeSize.isAccessibilitySize {
+                        HStack(spacing: 6) {
+                            Text(session.isAttached ? "Attached" : "Idle")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(ledColor)
+
+                            if activityDate != nil {
+                                Text("· \(AgentVisuals.relativeActivityString(from: activityDate))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .padding(.top, 2)
+                    }
                 }
 
                 Spacer(minLength: 8)
 
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(session.isAttached ? "Attached" : "Idle")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(ledColor)
+                if !dynamicTypeSize.isAccessibilitySize {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(session.isAttached ? "Attached" : "Idle")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(ledColor)
 
-                    if activityDate != nil {
-                        Text(AgentVisuals.relativeActivityString(from: activityDate))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        if activityDate != nil {
+                            Text(AgentVisuals.relativeActivityString(from: activityDate))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 
@@ -452,58 +513,78 @@ struct AgentsDashboardView: View {
             } label: {
                 Label("Attach", systemImage: "terminal")
             }
-            .tint(AgentVisuals.activeGreen)
+            .tint(palette.healthy)
         }
+    }
+
+    private func tmuxBadgePill(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(.caption2.monospaced().weight(.semibold))
+            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .foregroundStyle(tint)
+            .background(palette.pillFill(for: tint), in: Capsule())
     }
 
     private func hostScanStatusRow(_ outcome: HostScanOutcome) -> some View {
         let reason = outcome.status.issueReason ?? ""
         let tint: Color = switch outcome.status {
         case .ok:
-            AgentVisuals.activeGreen
+            palette.healthy
         case .tmuxMissing:
-            AgentVisuals.slateColor
+            palette.neutral
         case .needsAuthOrTrust:
-            AgentVisuals.appleProAmber
+            palette.proBrandAmber
         case .unreachable:
-            Color(red: 0xFF / 255.0, green: 0x45 / 255.0, blue: 0x3A / 255.0)
+            palette.critical
         }
 
         return HStack(spacing: 12) {
-            SquircleIcon(
+            ProSquircleIcon(
                 symbolName: outcome.status.symbolName,
                 tint: tint,
-                fillOpacity: theme.isDark ? 0.18 : 0.12,
-                rimOpacity: 0.34,
-                size: 32
+                size: .compact,
+                theme: theme
             )
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(outcome.hostLabel)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.primary)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
 
                 Text(reason)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+
+                if dynamicTypeSize.isAccessibilitySize,
+                   let host = hosts.first(where: { $0.id == outcome.hostID }) {
+                    connectScanIssueButton(for: host, label: outcome.hostLabel, tint: tint)
+                        .padding(.top, 4)
+                }
             }
 
             Spacer(minLength: 8)
 
-            if let host = hosts.first(where: { $0.id == outcome.hostID }) {
-                Button("Connect") {
-                    AppHaptics.impact(.light)
-                    connectHost?(host)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(tint)
-                .accessibilityLabel("Connect to \(outcome.hostLabel)")
+            if !dynamicTypeSize.isAccessibilitySize,
+               let host = hosts.first(where: { $0.id == outcome.hostID }) {
+                connectScanIssueButton(for: host, label: outcome.hostLabel, tint: tint)
             }
         }
         .padding(.vertical, 2)
+    }
+
+    private func connectScanIssueButton(for host: Host, label: String, tint: Color) -> some View {
+        Button("Connect") {
+            AppHaptics.impact(.light)
+            connectHost?(host)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .tint(tint)
+        .accessibilityLabel("Connect to \(label)")
     }
 
     private func subtitleLine(hostLabel: String, path: String?) -> String {
@@ -734,99 +815,32 @@ struct AgentsDashboardView: View {
     }
 
     private var proPromptView: some View {
-        let cardFill = theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.04)
-        let cardStroke = theme.isDark ? Color.white.opacity(0.12) : Color.black.opacity(0.10)
-
-        return ScrollView {
-            VStack(spacing: 20) {
-                VStack(spacing: 12) {
-                    SquircleIcon(
-                        symbolName: "sparkles",
-                        tint: AgentVisuals.appleProAmber,
-                        fillOpacity: theme.isDark ? 0.22 : 0.14,
-                        rimOpacity: 0.44,
-                        size: 60
-                    )
-
-                    Text("AI Agent Sessions")
-                        .font(.title3.bold())
-
-                    Text("Launch, monitor, and reattach Claude Code, Antigravity, Codex, Aider & OpenCode in persistent tmux sessions.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
-
-                VStack(alignment: .leading, spacing: 14) {
-                    proFeatureRow(
-                        icon: "terminal.fill",
-                        tint: AgentVisuals.appleProAmber,
-                        title: "Persistent tmux Sessions",
-                        detail: "Start or reattach remote coding agents across background drops without losing context."
-                    )
-
-                    Divider()
-
-                    proFeatureRow(
-                        icon: "folder.badge.gearshape",
-                        tint: Color(red: 0x64 / 255.0, green: 0xD2 / 255.0, blue: 0xFF / 255.0),
-                        title: "Remote Folder Picker & Presets",
-                        detail: "Browse server directories, star project favorites, and save custom agent CLIs."
-                    )
-
-                    Divider()
-
-                    proFeatureRow(
-                        icon: "text.bubble.fill",
-                        tint: AgentVisuals.activeGreen,
-                        title: "Quick Actions & Prompt Composer",
-                        detail: "1-tap Approve, Deny, Esc, Shift+Tab, /compact, and multi-line voice-ready prompt pasting."
-                    )
-                }
-                .padding(16)
-                .background(cardFill, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(cardStroke, lineWidth: 1)
-                )
-
-                Button {
-                    AppHaptics.impact(.light)
-                    showingPaywall = true
-                } label: {
-                    Label("Unlock TermApp Pro", systemImage: "sparkles")
-                        .fontWeight(.semibold)
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .tint(AgentVisuals.appleProAmber)
-            }
-            .frame(maxWidth: 460)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 28)
-            .frame(maxWidth: .infinity)
-        }
-    }
-
-    private func proFeatureRow(icon: String, tint: Color, title: String, detail: String) -> some View {
-        HStack(alignment: .top, spacing: 12) {
-            SquircleIcon(
-                symbolName: icon,
-                tint: tint,
-                fillOpacity: theme.isDark ? 0.20 : 0.14,
-                rimOpacity: 0.36,
-                size: 36
-            )
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.headline)
-                Text(detail)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
+        ProFeatureGateView(
+            symbolName: "sparkles",
+            title: "AI Agent Sessions",
+            subtitle: "Launch, monitor, and reattach Claude Code, Antigravity, Codex, Aider & OpenCode in persistent tmux sessions.",
+            features: [
+                ProFeatureItem(
+                    icon: "terminal.fill",
+                    tint: palette.proBrandAmber,
+                    title: "Persistent tmux Sessions",
+                    detail: "Start or reattach remote coding agents across background drops without losing context."
+                ),
+                ProFeatureItem(
+                    icon: "folder.badge.gearshape",
+                    tint: palette.running,
+                    title: "Remote Folder Picker & Presets",
+                    detail: "Browse server directories, star project favorites, and save custom agent CLIs."
+                ),
+                ProFeatureItem(
+                    icon: "text.bubble.fill",
+                    tint: palette.healthy,
+                    title: "Quick Actions & Prompt Composer",
+                    detail: "1-tap Approve, Deny, Esc, Shift+Tab, /compact, and multi-line voice-ready prompt pasting."
+                ),
+            ],
+            theme: theme,
+            onUnlock: { showingPaywall = true }
+        )
     }
 }

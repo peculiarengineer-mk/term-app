@@ -6,6 +6,7 @@ import TermUI
 
 struct KeyListView: View {
     @Environment(ProStore.self) private var proStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
     @State private var keys: [StoredKey] = []
@@ -24,6 +25,7 @@ struct KeyListView: View {
     private let store = KeyStore()
     private var authState: CloudAuthState { CloudAuthState.shared }
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     var body: some View {
         keysList
@@ -100,6 +102,7 @@ struct KeyListView: View {
                 keyListRow(for: key)
             }
         }
+        .listStyle(.insetGrouped)
         .overlay {
             if keys.isEmpty {
                 ContentUnavailableView {
@@ -177,22 +180,38 @@ struct KeyListView: View {
 
     private func keyRow(for key: StoredKey) -> some View {
         let isCopied = copiedKeyID == key.id
+        let isSecureEnclave = key.type == .secureEnclaveP256
+        let keyTypeLabel = isSecureEnclave ? "Secure Enclave P-256" : key.type.rawValue
+
         return VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Text(key.name)
-                    .font(.headline)
+            HStack(spacing: 12) {
+                ProSquircleIcon(
+                    symbolName: isSecureEnclave ? "cpu" : "key.fill",
+                    tint: isSecureEnclave ? palette.healthy : palette.accent,
+                    size: .row,
+                    theme: theme
+                )
 
-                Spacer()
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(key.name)
+                            .font(.headline)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
 
-                Text(key.type == .secureEnclaveP256 ? "Secure Enclave P-256" : key.type.rawValue)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                        if key.isEncrypted {
+                            Image(systemName: "lock.rectangle.fill")
+                                .foregroundStyle(.secondary)
+                                .accessibilityLabel("Passphrase-protected")
+                        }
+                    }
 
-                if key.isEncrypted {
-                    Image(systemName: "lock.rectangle.fill")
+                    Text(keyTypeLabel)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
-                        .accessibilityLabel("Passphrase-protected")
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                 }
+
+                Spacer(minLength: 8)
 
                 if pushingKeyID == key.id {
                     ProgressView()
@@ -227,37 +246,28 @@ struct KeyListView: View {
                     Image(systemName: "ellipsis.circle")
                         .font(.body)
                         .foregroundStyle(.secondary)
-                        .frame(width: 32, height: 32)
-                        .contentShape(Rectangle())
+                        .minTapTarget()
                 }
                 .buttonStyle(.borderless)
                 .accessibilityLabel("Actions for \(key.name)")
             }
 
             if !key.publicKey.isEmpty {
-                HStack(spacing: 10) {
-                    Button {
-                        copyPublicKey(for: key)
-                    } label: {
-                        Label(
-                            isCopied ? "Copied" : "Copy public key",
-                            systemImage: isCopied ? "checkmark" : "doc.on.doc"
-                        )
-                        .foregroundStyle(isCopied ? Color.green : Color.accentColor)
+                Group {
+                    if dynamicTypeSize.isAccessibilitySize {
+                        VStack(alignment: .leading, spacing: 8) {
+                            keyActionButtons(for: key, isCopied: isCopied)
+                        }
+                    } else {
+                        HStack(spacing: 10) {
+                            keyActionButtons(for: key, isCopied: isCopied)
+                        }
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-
-                    ShareLink(item: key.publicKey) {
-                        Label("Share", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
                 }
                 .font(.footnote)
             }
 
-            if key.type == .secureEnclaveP256 {
+            if isSecureEnclave {
                 Label("This device only", systemImage: "iphone")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -270,6 +280,27 @@ struct KeyListView: View {
             }
         }
         .padding(.vertical, 2)
+    }
+
+    @ViewBuilder
+    private func keyActionButtons(for key: StoredKey, isCopied: Bool) -> some View {
+        Button {
+            copyPublicKey(for: key)
+        } label: {
+            Label(
+                isCopied ? "Copied" : "Copy public key",
+                systemImage: isCopied ? "checkmark" : "doc.on.doc"
+            )
+            .foregroundStyle(isCopied ? palette.healthy : palette.accent)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+
+        ShareLink(item: key.publicKey) {
+            Label("Share", systemImage: "square.and.arrow.up")
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
     }
 
     private func deleteWarningMessage(for key: StoredKey) -> String {

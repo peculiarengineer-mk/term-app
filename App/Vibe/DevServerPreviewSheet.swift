@@ -28,6 +28,7 @@ struct DevServerPreviewSheet: View {
     @FocusState private var isCustomPortFocused: Bool
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
     private var sshConnection: SSHConnection? { live.session as? SSHConnection }
     private var devServerPorts: [ListeningPort] { ports.filter(\.isLikelyDevServer) }
     private var otherPorts: [ListeningPort] { ports.filter { !$0.isLikelyDevServer } }
@@ -58,19 +59,19 @@ struct DevServerPreviewSheet: View {
                 }
 
                 if !isLoading && ports.isEmpty && loadError == nil {
-                    Section("Detected Ports") {
-                        HStack(spacing: 10) {
-                            Image(systemName: "network.slash")
-                                .foregroundStyle(.secondary)
-                            Text("No listening TCP ports detected on the remote host.")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 4)
+                    Section {
+                        ContentUnavailableView(
+                            "No Listening Ports",
+                            systemImage: "network.slash",
+                            description: Text("No listening TCP ports detected on the remote host.")
+                        )
+                        .listRowBackground(Color.clear)
                     }
                 }
 
-                customPortSection
+                if !(isLoading && ports.isEmpty) && loadError == nil {
+                    customPortSection
+                }
             }
             .listStyle(.insetGrouped)
             .overlay {
@@ -87,7 +88,7 @@ struct DevServerPreviewSheet: View {
                             Task { await reload() }
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(AgentVisuals.appleProAmber)
+                        .tint(palette.accent)
                     }
                 }
             }
@@ -127,7 +128,8 @@ struct DevServerPreviewSheet: View {
                 await reload()
             }
             .sheet(item: $previewTarget) { target in
-                InAppSafariView(url: target.url, tintColor: theme.accentColor)
+                InAppSafariView(url: target.url, theme: theme)
+                    .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
                     .ignoresSafeArea()
             }
             .alert(
@@ -139,6 +141,8 @@ struct DevServerPreviewSheet: View {
                 Text(actionError ?? "")
             }
         }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 
     private var customPortSection: some View {
@@ -163,7 +167,7 @@ struct DevServerPreviewSheet: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .tint(AgentVisuals.appleProAmber)
+                .tint(palette.accent)
                 .disabled(parsedCustomPort == nil || forwardingPort != nil || sshConnection == nil)
             }
         } header: {
@@ -176,19 +180,20 @@ struct DevServerPreviewSheet: View {
     private func portRow(_ port: ListeningPort) -> some View {
         let existingForward = activeForward(for: port.port)
         let isBusy = forwardingPort == port.port
-        let accent = port.isLikelyDevServer ? AgentVisuals.appleProAmber : Color.secondary
+        let accent = port.isLikelyDevServer ? palette.accent : palette.neutral
 
         return Button {
             AppHaptics.impact(.light)
             Task { await preview(port: port.port, processName: port.processName) }
         } label: {
             HStack(spacing: 12) {
-                SquircleIcon(
+                ProSquircleIcon(
                     symbolName: port.isLikelyDevServer ? "safari.fill" : "network",
                     tint: accent,
-                    fillOpacity: theme.isDark ? 0.20 : 0.12,
-                    rimOpacity: 0.36,
-                    size: 34
+                    size: .row,
+                    emphasis: existingForward != nil ? .selected : .standard,
+                    theme: theme,
+                    statusLED: existingForward != nil ? palette.healthy : nil
                 )
 
                 VStack(alignment: .leading, spacing: 3) {
@@ -203,7 +208,7 @@ struct DevServerPreviewSheet: View {
                             .foregroundStyle(accent)
                             .padding(.horizontal, 7)
                             .padding(.vertical, 2)
-                            .background(accent.opacity(theme.isDark ? 0.18 : 0.12), in: Capsule())
+                            .background(palette.pillFill(for: accent), in: Capsule())
                     }
 
                     HStack(spacing: 6) {
@@ -215,7 +220,7 @@ struct DevServerPreviewSheet: View {
                         if let existingForward {
                             Text("· Tunneled :\(existingForward.boundLocalPort)")
                                 .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.green)
+                                .foregroundStyle(palette.healthy)
                         }
                     }
                 }
@@ -228,7 +233,7 @@ struct DevServerPreviewSheet: View {
                 } else {
                     Image(systemName: "safari")
                         .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(AgentVisuals.appleProAmber)
+                        .foregroundStyle(palette.accent)
                         .accessibilityHidden(true)
                 }
             }
@@ -237,6 +242,15 @@ struct DevServerPreviewSheet: View {
         }
         .buttonStyle(.plain)
         .disabled(forwardingPort != nil || sshConnection == nil)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            if let existingForward {
+                Button(role: .destructive) {
+                    Task { await stopForward(existingForward.id) }
+                } label: {
+                    Label("Stop", systemImage: "stop.circle")
+                }
+            }
+        }
         .contextMenu {
             Button("Open Preview", systemImage: "safari") {
                 Task { await preview(port: port.port, processName: port.processName) }

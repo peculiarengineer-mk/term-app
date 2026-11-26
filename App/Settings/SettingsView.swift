@@ -3,8 +3,6 @@ import CoreText
 import TermUI
 
 struct SettingsView: View {
-    private static let appleProAmber = TerminalTheme.appleProDark.accentColor
-
     @Environment(AppLockManager.self) private var appLock
     @Environment(ProStore.self) private var proStore
     @AppStorage("sync.enabled") private var syncEnabled = false
@@ -19,6 +17,7 @@ struct SettingsView: View {
 
     private var authState: CloudAuthState { CloudAuthState.shared }
     private var currentTheme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: currentTheme) }
 
     private var cloudTokensSummary: String {
         switch (authState.hasDigitalOceanToken, authState.hasCloudflareToken) {
@@ -57,9 +56,9 @@ struct SettingsView: View {
                 NavigationLink {
                     ThemePickerView()
                 } label: {
-                    HStack {
+                    AdaptiveKeyValueRow {
                         Text("Theme")
-                        Spacer()
+                    } trailing: {
                         HStack(spacing: 6) {
                             Circle()
                                 .fill(currentTheme.backgroundColor)
@@ -84,9 +83,9 @@ struct SettingsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 10) {
-                    HStack {
+                    AdaptiveKeyValueRow {
                         Text("Font Size")
-                        Spacer()
+                    } trailing: {
                         Text(AppearanceSettings.formattedFontSize(fontSize))
                             .font(.subheadline.monospaced())
                             .foregroundStyle(.secondary)
@@ -169,9 +168,9 @@ struct SettingsView: View {
                 NavigationLink {
                     CloudTokensView(showsDoneButton: false)
                 } label: {
-                    HStack {
+                    AdaptiveKeyValueRow {
                         Text("Cloud Tokens")
-                        Spacer()
+                    } trailing: {
                         Text(cloudTokensSummary)
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -249,9 +248,9 @@ struct SettingsView: View {
 
     private var aboutLegalSection: some View {
         Section("About & Legal") {
-            HStack {
+            AdaptiveKeyValueRow {
                 Text("Version")
-                Spacer()
+            } trailing: {
                 Text(appVersionSummary)
                     .font(.subheadline.monospaced())
                     .foregroundStyle(.secondary)
@@ -310,11 +309,11 @@ struct SettingsView: View {
                 showingPaywall = true
             } label: {
                 HStack(spacing: 12) {
-                    SquircleIcon(
+                    ProSquircleIcon(
                         symbolName: proStore.isProUnlocked ? "checkmark.seal.fill" : "sparkles",
-                        tint: proStore.isProUnlocked ? .green : Self.appleProAmber,
-                        fillOpacity: currentTheme.isDark ? 0.20 : 0.14,
-                        rimOpacity: 0.36
+                        tint: proStore.isProUnlocked ? palette.healthy : palette.proBrandAmber,
+                        size: .row,
+                        theme: currentTheme
                     )
 
                     VStack(alignment: .leading, spacing: 2) {
@@ -332,7 +331,7 @@ struct SettingsView: View {
                     if !proStore.isProUnlocked, let price = proStore.product?.displayPrice {
                         Text(price)
                             .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(Self.appleProAmber)
+                            .foregroundStyle(palette.proBrandAmber)
                     }
 
                     Image(systemName: "chevron.right")

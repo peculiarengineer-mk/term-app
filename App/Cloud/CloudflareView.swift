@@ -15,10 +15,12 @@ struct CloudflareView: View {
 
     let onOpenTokenSettings: () -> Void
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
 
     private var authState: CloudAuthState { CloudAuthState.shared }
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     @State private var tokenInput = ""
     @State private var isConnectingToken = false
@@ -114,28 +116,34 @@ struct CloudflareView: View {
     }
 
     private func zoneRow(_ zone: CFZone) -> some View {
-        HStack(spacing: 12) {
-            SquircleIcon(
+        let isActive = zone.status.lowercased() == "active"
+        let statusColor = isActive ? palette.healthy : palette.warning
+
+        return HStack(spacing: 12) {
+            ProSquircleIcon(
                 symbolName: "globe",
                 tint: .orange,
-                fillOpacity: theme.isDark ? 0.22 : 0.14,
-                rimOpacity: 0.36
+                size: .row,
+                theme: theme,
+                statusLED: statusColor,
+                statusGlow: isActive
             )
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(zone.name)
                     .font(.headline)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
 
                 HStack(spacing: 6) {
-                    CloudStatusLED(
-                        color: zone.status.lowercased() == "active" ? .green : .orange,
+                    ProStatusLED(
+                        color: statusColor,
                         size: 7,
                         glow: false
                     )
                     Text(zone.status.capitalized)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                 }
             }
         }
@@ -144,35 +152,27 @@ struct CloudflareView: View {
 
     private func tunnelRow(_ tunnel: CFTunnel) -> some View {
         let connectorText = tunnel.connectionCount == 1 ? "1 connector" : "\(tunnel.connectionCount) connectors"
-        let ledColor = Self.tunnelLEDColor(for: tunnel.status)
+        let ledColor = Self.tunnelLEDColor(for: tunnel.status, palette: palette)
 
         return HStack(spacing: 12) {
-            ZStack(alignment: .bottomTrailing) {
-                SquircleIcon(
-                    symbolName: "point.3.connected.trianglepath.dotted",
-                    tint: .teal,
-                    fillOpacity: theme.isDark ? 0.22 : 0.14,
-                    rimOpacity: 0.36
-                )
-
-                Circle()
-                    .fill(Color(.secondarySystemGroupedBackground))
-                    .frame(width: 12, height: 12)
-                    .overlay(
-                        CloudStatusLED(color: ledColor, size: 8, glow: tunnel.status == .healthy)
-                    )
-                    .offset(x: 3, y: 3)
-            }
+            ProSquircleIcon(
+                symbolName: "point.3.connected.trianglepath.dotted",
+                tint: .teal,
+                size: .row,
+                theme: theme,
+                statusLED: ledColor,
+                statusGlow: tunnel.status == .healthy
+            )
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(tunnel.name)
                     .font(.headline)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
 
                 Text("\(tunnel.status.rawValue.capitalized) · \(connectorText)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
             }
         }
         .padding(.vertical, 3)
@@ -294,12 +294,15 @@ struct CloudflareView: View {
         }
     }
 
-    static func tunnelLEDColor(for status: CFTunnelStatus) -> Color {
+    static func tunnelLEDColor(
+        for status: CFTunnelStatus,
+        palette: ProDesign.Palette = ProDesign.Palette()
+    ) -> Color {
         switch status {
-        case .healthy: .green
-        case .degraded: .orange
-        case .inactive, .down: .red
-        case .unknown: .gray
+        case .healthy: palette.healthy
+        case .degraded: palette.warning
+        case .inactive, .down: palette.critical
+        case .unknown: palette.neutral
         }
     }
 }
@@ -327,6 +330,7 @@ struct CloudflareDNSRecordsView: View {
 
     let zone: CFZone
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
 
     @State private var records: [CFDNSRecord] = []
@@ -452,17 +456,17 @@ struct CloudflareDNSRecordsView: View {
                 .frame(minWidth: 42)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 4)
-                .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .background(Color.secondary.opacity(0.14), in: RoundedRectangle(cornerRadius: ProDesign.Radius.tagChip, style: .continuous))
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(record.name)
                     .font(.headline)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
 
                 Text(record.content)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
             }
 
             Spacer(minLength: 8)

@@ -39,8 +39,17 @@ struct ActiveSessionPill: View {
     let onResume: () -> Void
     let onSwitch: () -> Void
 
+    private var needsApproval: Bool {
+        if case .waitingForApproval = agentActivityState { return true }
+        return false
+    }
+
     private var strokeGradient: LinearGradient {
-        LinearGradient(
+        if needsApproval {
+            let amber = AgentVisuals.appleProAmber.opacity(isDark ? 0.65 : 0.72)
+            return LinearGradient(colors: [amber, amber.opacity(0.45)], startPoint: .top, endPoint: .bottom)
+        }
+        return LinearGradient(
             colors: [
                 Color.white.opacity(isDark ? 0.24 : 0.65),
                 Color.white.opacity(isDark ? 0.06 : 0.18),
@@ -104,20 +113,19 @@ struct ActiveSessionPill: View {
                     Image(systemName: "square.on.square")
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(.secondary)
-                        .frame(width: 36, height: 36)
+                        .minTapTarget()
                         .background(
                             Color.primary.opacity(isDark ? 0.08 : 0.06),
                             in: RoundedRectangle(cornerRadius: 10, style: .continuous)
                         )
-                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .padding(.trailing, 8)
+                .padding(.trailing, 6)
                 .accessibilityLabel("Switch sessions (\(totalCount) open)")
             }
         }
         .background(.ultraThinMaterial, in: shape)
-        .overlay(shape.strokeBorder(strokeGradient, lineWidth: 0.5))
+        .overlay(shape.strokeBorder(strokeGradient, lineWidth: needsApproval ? 1 : 0.5))
         .shadow(color: Color.black.opacity(isDark ? 0.42 : 0.14), radius: 14, x: 0, y: 6)
     }
 }
@@ -152,6 +160,7 @@ struct SessionTabsView<HostList: View>: View {
     @Environment(AppLockManager.self) private var appLock
     @Environment(ProStore.self) private var proStore
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
@@ -213,22 +222,43 @@ struct SessionTabsView<HostList: View>: View {
         selectedLive != nil || selectedPending != nil
     }
 
+    private var canOpenInNewWindow: Bool {
+        UIApplication.shared.supportsMultipleScenes && horizontalSizeClass == .regular
+    }
+
+    private var isModalOverSelectedTerminal: Bool {
+        activeToolSheet != nil || switching || inspectingSecurity != nil
+    }
+
     private var activeSessionPill: ActiveSessionPill? {
         guard selection == nil, !manager.sessions.isEmpty || !pendingConnections.isEmpty else {
             return nil
         }
+
+        let waitingForApprovalSession: LiveSession? = {
+            if let lastSelectedID,
+               let lastLive = manager.session(id: lastSelectedID),
+               case .waitingForApproval = lastLive.agentActivityState {
+                return lastLive
+            }
+            return manager.sessions.first {
+                if case .waitingForApproval = $0.agentActivityState { return true }
+                return false
+            }
+        }()
 
         let matchedByLastID: TabEntry? = lastSelectedID.flatMap { id in
             if let live = manager.session(id: id) { return .live(live) }
             if let pending = pendingConnections.first(where: { $0.id == id }) { return .pending(pending) }
             return nil
         }
-        let target: TabEntry? = matchedByLastID
+        let target: TabEntry? = waitingForApprovalSession.map(TabEntry.live)
+            ?? matchedByLastID
             ?? manager.sessions.last.map(TabEntry.live)
             ?? pendingConnections.last.map(TabEntry.pending)
 
         let totalCount = manager.sessions.count + pendingConnections.count
-        let showSwitcher = totalCount > 1 && !manager.sessions.isEmpty
+        let showSwitcher = totalCount > 1
 
         switch target {
         case .live(let live):
@@ -276,7 +306,11 @@ struct SessionTabsView<HostList: View>: View {
                 tabBar
             }
             if let live = selectedLive {
-                TerminalPane(live: live)
+                TerminalPane(
+                    live: live,
+                    onOpenGitDiff: { openGitDiffShortcut() },
+                    onOpenDevPreview: { openDevServerPreviewShortcut() }
+                )
             } else if let pending = selectedPending {
                 HostConnectionView(
                     host: pending.host,
@@ -314,6 +348,17 @@ struct SessionTabsView<HostList: View>: View {
                 lastSelectedID = newSelection
             }
         }
+        .onChange(of: selectedLive?.id) { oldID, newID in
+            if let oldID, oldID != newID {
+                manager.session(id: oldID)?.hasModalSheetPresented = false
+            }
+            if let newID {
+                manager.session(id: newID)?.hasModalSheetPresented = isModalOverSelectedTerminal
+            }
+        }
+        .onChange(of: isModalOverSelectedTerminal) { _, isPresented in
+            selectedLive?.hasModalSheetPresented = isPresented
+        }
         .onChange(of: windowLiveSessions.map(\.id)) { _, liveIDs in
             let liveSet = Set(liveIDs)
             let pendingSet = Set(pendingConnections.map(\.id))
@@ -323,7 +368,19 @@ struct SessionTabsView<HostList: View>: View {
             }
         }
         .onAppear {
+            selectedLive?.hasModalSheetPresented = isModalOverSelectedTerminal
             consumeAndFocusPendingAgentSessionIfUnlocked()
+            consumePendingMergeBackIfNeeded()
+            consumePendingNewTabIfNeeded()
+        }
+        .onDisappear {
+            selectedLive?.hasModalSheetPresented = false
+        }
+        .onChange(of: manager.pendingMergeBackSessionID) { _, _ in
+            consumePendingMergeBackIfNeeded()
+        }
+        .onChange(of: manager.pendingNewTabRequestID) { _, _ in
+            consumePendingNewTabIfNeeded()
         }
         .onChange(of: appLock.isLocked) { _, isLocked in
             if !isLocked {
@@ -341,6 +398,8 @@ struct SessionTabsView<HostList: View>: View {
                 onSelect: { addTab($0) },
                 onOpenInWindow: { moveToWindow($0) }
             )
+            .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+            .tint(theme.accentColor)
         }
         .sessionToolSheets(item: $activeToolSheet, theme: theme)
         .confirmationDialog(
@@ -399,7 +458,7 @@ struct SessionTabsView<HostList: View>: View {
                     }
                 }
 
-                HStack(spacing: 4) {
+                HStack(spacing: 2) {
                     if let selectedLive {
                         SessionToolsMenu(
                             live: selectedLive,
@@ -410,7 +469,7 @@ struct SessionTabsView<HostList: View>: View {
                         }
                     }
 
-                    if let selectedLive, let algorithms = selectedLive.algorithms {
+                    if horizontalSizeClass != .compact, let selectedLive, let algorithms = selectedLive.algorithms {
                         Button {
                             AppHaptics.impact(.light)
                             inspectingSecurity = SecurityInspection(
@@ -422,8 +481,7 @@ struct SessionTabsView<HostList: View>: View {
                             Image(systemName: algorithms.isPostQuantum ? "lock.shield.fill" : "lock.fill")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(algorithms.isPostQuantum ? Color.green : Color.orange)
-                                .frame(width: 40, height: 40)
-                                .contentShape(Rectangle())
+                                .minTapTarget()
                         }
                         .accessibilityLabel(algorithms.isPostQuantum ? "Connection security: Post-quantum" : "Connection security: Classical")
                         .popover(item: $inspectingSecurity) { item in
@@ -437,13 +495,12 @@ struct SessionTabsView<HostList: View>: View {
                             AppHaptics.impact(.light)
                             selection = nil
                         } label: {
-                            Image(systemName: "plus")
+                            Image(systemName: "chevron.down")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(theme.foregroundColor)
-                                .frame(width: 40, height: 40)
-                                .contentShape(Rectangle())
+                                .minTapTarget()
                         }
-                        .accessibilityLabel("New Tab")
+                        .accessibilityLabel("Back to Workspace")
                     }
 
                     Button {
@@ -453,12 +510,11 @@ struct SessionTabsView<HostList: View>: View {
                         Image(systemName: "square.on.square")
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(theme.foregroundColor)
-                            .frame(width: 40, height: 40)
-                            .contentShape(Rectangle())
+                            .minTapTarget()
                     }
                     .accessibilityLabel("Sessions")
                 }
-                .padding(.trailing, 8)
+                .padding(.trailing, 4)
             }
             .padding(.vertical, 4)
 
@@ -509,7 +565,7 @@ struct SessionTabsView<HostList: View>: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(theme.secondaryForegroundColor)
-                        .frame(width: 32, height: 32)
+                        .frame(minWidth: 40, minHeight: 40)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -517,8 +573,8 @@ struct SessionTabsView<HostList: View>: View {
             }
         }
         .padding(.leading, 12)
-        .padding(.trailing, isSelected ? 4 : 12)
-        .padding(.vertical, isSelected ? 2 : 0)
+        .padding(.trailing, isSelected ? 2 : 12)
+        .padding(.vertical, isSelected ? 0 : 1)
         .foregroundStyle(isSelected ? theme.foregroundColor : theme.secondaryForegroundColor)
         .background(
             isSelected
@@ -536,7 +592,9 @@ struct SessionTabsView<HostList: View>: View {
                     manager.saveEphemeralHost(for: live.id, in: modelContext)
                 }
             }
-            Button("Move to New Window", systemImage: "macwindow.badge.plus") { moveToWindow(live.id) }
+            if canOpenInNewWindow {
+                Button("Move to New Window", systemImage: "macwindow.badge.plus") { moveToWindow(live.id) }
+            }
             Button("Close", systemImage: "xmark", role: .destructive) {
                 requestCloseLive(live)
             }
@@ -575,7 +633,7 @@ struct SessionTabsView<HostList: View>: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(theme.secondaryForegroundColor)
-                        .frame(width: 32, height: 32)
+                        .frame(minWidth: 40, minHeight: 40)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -583,8 +641,8 @@ struct SessionTabsView<HostList: View>: View {
             }
         }
         .padding(.leading, 12)
-        .padding(.trailing, isSelected ? 4 : 12)
-        .padding(.vertical, isSelected ? 2 : 0)
+        .padding(.trailing, isSelected ? 2 : 12)
+        .padding(.vertical, isSelected ? 0 : 1)
         .foregroundStyle(isSelected ? theme.foregroundColor : theme.secondaryForegroundColor)
         .background(
             isSelected
@@ -727,6 +785,22 @@ struct SessionTabsView<HostList: View>: View {
         addTab(id)
     }
 
+    private func consumePendingMergeBackIfNeeded() {
+        guard let id = manager.consumePendingMergeBackSessionID(),
+              manager.session(id: id) != nil else {
+            return
+        }
+        addTab(id)
+    }
+
+    private func consumePendingNewTabIfNeeded() {
+        guard manager.consumePendingNewTabRequestID() != nil else { return }
+        newTab()
+        if let scene, scene.activationState != .foregroundActive {
+            UIApplication.shared.requestSceneSessionActivation(scene.session, userActivity: nil, options: nil)
+        }
+    }
+
     private func moveToWindow(_ id: UUID) {
         manager.detach(id)
         tabOrder.removeAll { $0 == id }
@@ -762,8 +836,7 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     private func adjustFontSize(by delta: Double) {
-        let clamped = min(max(fontSize + delta, AppearanceSettings.minFontSize), AppearanceSettings.maxFontSize)
-        fontSize = clamped
+        fontSize = SessionFontShortcuts.adjustedFontSize(from: fontSize, delta: delta)
         AppHaptics.impact(.light)
     }
 
@@ -778,11 +851,11 @@ struct SessionTabsView<HostList: View>: View {
               closingTab == nil,
               inspectingSecurity == nil,
               let live = selectedLive,
-              live.connectionStatus == .connected else {
+              let sheet = SessionToolSheet.gitDiff(for: live, isProUnlocked: proStore.isProUnlocked) else {
             return
         }
         AppHaptics.impact(.light)
-        activeToolSheet = proStore.isProUnlocked ? .gitDiff(live) : .paywall
+        activeToolSheet = sheet
     }
 
     private func openDevServerPreviewShortcut() {
@@ -791,15 +864,11 @@ struct SessionTabsView<HostList: View>: View {
               closingTab == nil,
               inspectingSecurity == nil,
               let live = selectedLive,
-              live.connectionStatus == .connected else {
+              let sheet = SessionToolSheet.devServerPreview(for: live, isProUnlocked: proStore.isProUnlocked) else {
             return
         }
         AppHaptics.impact(.light)
-        if !proStore.isProUnlocked {
-            activeToolSheet = .paywall
-        } else if live.session is SSHConnection {
-            activeToolSheet = .devServerPreview(live)
-        }
+        activeToolSheet = sheet
     }
 
     @ViewBuilder
@@ -807,16 +876,16 @@ struct SessionTabsView<HostList: View>: View {
         let modalFree = activeToolSheet == nil && !switching && closingTab == nil && inspectingSecurity == nil
         ZStack {
             if isTerminalActive && modalFree {
-                shortcutButton("Hosts Quick Connect", key: "t", modifiers: .command) {
+                SessionShortcutButton("Hosts Quick Connect", key: "t", modifiers: .command) {
                     newTab()
                 }
-                shortcutButton("Close Tab", key: "w", modifiers: .command) {
+                SessionShortcutButton("Close Tab", key: "w", modifiers: .command) {
                     closeCurrent()
                 }
 
                 ForEach(1...9, id: \.self) { number in
                     if tabEntries.indices.contains(number - 1) {
-                        shortcutButton(
+                        SessionShortcutButton(
                             "Switch to Tab \(number)",
                             key: KeyEquivalent(Character(String(number))),
                             modifiers: .command
@@ -827,25 +896,25 @@ struct SessionTabsView<HostList: View>: View {
                 }
 
                 if selectedLive != nil {
-                    shortcutButton("Increase Font Size", key: "=", modifiers: .command) {
+                    SessionShortcutButton("Increase Font Size", key: "=", modifiers: .command) {
                         adjustFontSize(by: 1)
                     }
-                    shortcutButton("", key: "+", modifiers: .command) {
+                    SessionShortcutButton("", key: "+", modifiers: .command) {
                         adjustFontSize(by: 1)
                     }
-                    shortcutButton("", key: "+", modifiers: [.command, .shift]) {
+                    SessionShortcutButton("", key: "+", modifiers: [.command, .shift]) {
                         adjustFontSize(by: 1)
                     }
-                    shortcutButton("Decrease Font Size", key: "-", modifiers: .command) {
+                    SessionShortcutButton("Decrease Font Size", key: "-", modifiers: .command) {
                         adjustFontSize(by: -1)
                     }
-                    shortcutButton("Reset Font Size", key: "0", modifiers: .command) {
+                    SessionShortcutButton("Reset Font Size", key: "0", modifiers: .command) {
                         resetFontSize()
                     }
-                    shortcutButton("Git Diff Inspector", key: "d", modifiers: [.command, .shift]) {
+                    SessionShortcutButton("Git Diff Inspector", key: "d", modifiers: [.command, .shift]) {
                         openGitDiffShortcut()
                     }
-                    shortcutButton("Dev Server Preview", key: "p", modifiers: [.command, .shift]) {
+                    SessionShortcutButton("Dev Server Preview", key: "p", modifiers: [.command, .shift]) {
                         openDevServerPreviewShortcut()
                     }
                 }
@@ -855,17 +924,6 @@ struct SessionTabsView<HostList: View>: View {
         .opacity(0)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-    }
-
-    private func shortcutButton(
-        _ title: String,
-        key: KeyEquivalent,
-        modifiers: EventModifiers,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(title, action: action)
-            .buttonStyle(.plain)
-            .keyboardShortcut(key, modifiers: modifiers)
     }
 }
 
@@ -975,12 +1033,39 @@ struct SceneReader: UIViewRepresentable {
     func updateUIView(_ uiView: Probe, context: Context) {}
 }
 
+enum SessionFontShortcuts {
+    static func adjustedFontSize(from current: Double, delta: Double) -> Double {
+        min(max(current + delta, AppearanceSettings.minFontSize), AppearanceSettings.maxFontSize)
+    }
+}
+
+struct SessionShortcutButton: View {
+    let title: String
+    let key: KeyEquivalent
+    let modifiers: EventModifiers
+    let action: () -> Void
+
+    init(_ title: String, key: KeyEquivalent, modifiers: EventModifiers, action: @escaping () -> Void) {
+        self.title = title
+        self.key = key
+        self.modifiers = modifiers
+        self.action = action
+    }
+
+    var body: some View {
+        Button(title, action: action)
+            .buttonStyle(.plain)
+            .keyboardShortcut(key, modifiers: modifiers)
+    }
+}
+
 enum SessionToolSheet: Identifiable {
     case snippets(LiveSession)
     case sftp(LiveSession, SSHConnection)
     case portForwards(LiveSession, SSHConnection)
     case gitDiff(LiveSession)
     case devServerPreview(LiveSession)
+    case security(LiveSession, NegotiatedAlgorithms)
     case paywall
 
     var id: String {
@@ -990,12 +1075,29 @@ enum SessionToolSheet: Identifiable {
         case .portForwards(let live, _): "forwards-\(live.id)"
         case .gitDiff(let live): "gitdiff-\(live.id)"
         case .devServerPreview(let live): "preview-\(live.id)"
+        case .security(let live, _): "security-\(live.id)"
         case .paywall: "paywall"
         }
     }
+
+    @MainActor
+    static func gitDiff(for live: LiveSession, isProUnlocked: Bool) -> SessionToolSheet? {
+        guard live.connectionStatus == .connected else { return nil }
+        return isProUnlocked ? .gitDiff(live) : .paywall
+    }
+
+    @MainActor
+    static func devServerPreview(for live: LiveSession, isProUnlocked: Bool) -> SessionToolSheet? {
+        guard live.connectionStatus == .connected else { return nil }
+        if !isProUnlocked {
+            return .paywall
+        }
+        guard live.session is SSHConnection else { return nil }
+        return .devServerPreview(live)
+    }
 }
 
-/// Shared 40x40 tools menu for Snippets, SFTP Files, Port Forwards, Git Diff, and Dev Server Preview.
+/// Shared 44×44 tools menu for Snippets, SFTP Files, Port Forwards, Git Diff, Dev Server Preview, and Security.
 struct SessionToolsMenu: View {
     let live: LiveSession
     let isProUnlocked: Bool
@@ -1076,12 +1178,25 @@ struct SessionToolsMenu: View {
                     systemImage: live.showAIAgentControls ? "sparkles.rectangle.stack.fill" : "sparkles"
                 )
             }
+
+            if let algorithms = live.algorithms {
+                Divider()
+
+                Button {
+                    AppHaptics.impact(.light)
+                    onSelect(.security(live, algorithms))
+                } label: {
+                    Label(
+                        algorithms.isPostQuantum ? "Security: Post-Quantum" : "Security: Classical",
+                        systemImage: algorithms.isPostQuantum ? "lock.shield.fill" : "lock.fill"
+                    )
+                }
+            }
         } label: {
             Image(systemName: "square.grid.2x2")
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(foregroundColor)
-                .frame(width: 40, height: 40)
-                .contentShape(Rectangle())
+                .minTapTarget()
         }
         .accessibilityLabel("Session Tools")
     }
@@ -1108,6 +1223,8 @@ private struct SessionToolSheetsModifier: ViewModifier {
                         GitDiffInspectorSheet(live: live)
                     case .devServerPreview(let live):
                         DevServerPreviewSheet(live: live)
+                    case .security(let live, let algorithms):
+                        ConnectionSecuritySheet(title: live.title, algorithms: algorithms)
                     case .paywall:
                         ProPaywallView()
                     }

@@ -13,6 +13,7 @@ struct LaunchAIAgentSheet: View {
     @Environment(ProStore.self) private var proStore
     @Environment(\.launchAIAgent) private var launchAIAgent
     @Environment(\.runTerminalCommand) private var runTerminalCommand
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
 
@@ -36,6 +37,7 @@ struct LaunchAIAgentSheet: View {
     @State private var tmuxInstallTask: Task<Void, Never>?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     private var availableHosts: [Host] {
         if let initialHost, !hosts.contains(where: { $0.id == initialHost.id }) {
@@ -201,7 +203,7 @@ struct LaunchAIAgentSheet: View {
         host: Host,
         availability: TMuxSessionHelper.TMuxAvailability
     ) -> some View {
-        let amber = AgentVisuals.appleProAmber
+        let amber = palette.proBrandAmber
         let fill = amber.opacity(theme.isDark ? 0.14 : 0.10)
         let stroke = amber.opacity(0.45)
 
@@ -228,7 +230,7 @@ struct LaunchAIAgentSheet: View {
                 if let tmuxInstallError {
                     Text(tmuxInstallError)
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(tmuxRequiresInteractiveInstall ? amber : Color.red)
+                        .foregroundStyle(tmuxRequiresInteractiveInstall ? amber : palette.critical)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
@@ -289,7 +291,7 @@ struct LaunchAIAgentSheet: View {
     }
 
     private var tmuxConfirmedCard: some View {
-        let green = AgentVisuals.activeGreen
+        let green = palette.healthy
         let fill = green.opacity(theme.isDark ? 0.14 : 0.10)
         let stroke = green.opacity(0.45)
 
@@ -356,10 +358,10 @@ struct LaunchAIAgentSheet: View {
             Spacer()
             if sessionManager.connectedSession(for: host.id) != nil {
                 HStack(spacing: 5) {
-                    CloudStatusLED(color: AgentVisuals.activeGreen, size: 7)
+                    ProStatusLED(color: palette.healthy, size: 7)
                     Text("Connected")
                         .font(.caption.weight(.medium))
-                        .foregroundStyle(AgentVisuals.activeGreen)
+                        .foregroundStyle(palette.healthy)
                 }
             }
         }
@@ -403,10 +405,10 @@ struct LaunchAIAgentSheet: View {
         let tint = AgentVisuals.agentTint(for: preset)
         let cardFill = isSelected
             ? tint.opacity(theme.isDark ? 0.22 : 0.14)
-            : (theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.04))
+            : palette.cardFill
         let cardStroke = isSelected
             ? tint.opacity(0.75)
-            : (theme.isDark ? Color.white.opacity(0.12) : Color.black.opacity(0.10))
+            : palette.borderSubtle
 
         return Button {
             AppHaptics.impact(.light)
@@ -414,12 +416,12 @@ struct LaunchAIAgentSheet: View {
         } label: {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    SquircleIcon(
+                    ProSquircleIcon(
                         symbolName: AgentVisuals.agentSymbol(for: preset),
                         tint: tint,
-                        fillOpacity: theme.isDark ? 0.24 : 0.16,
-                        rimOpacity: 0.40,
-                        size: 32
+                        size: .compact,
+                        emphasis: isSelected ? .selected : .standard,
+                        theme: theme
                     )
                     Spacer(minLength: 4)
                     if isSelected {
@@ -433,19 +435,23 @@ struct LaunchAIAgentSheet: View {
                     Text(preset.name)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
-                        .lineLimit(1)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
 
                     Text(preset.command)
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                 }
             }
-            .frame(width: 118, alignment: .leading)
+            .frame(
+                minWidth: dynamicTypeSize.isAccessibilitySize ? 140 : 118,
+                maxWidth: dynamicTypeSize.isAccessibilitySize ? nil : 118,
+                alignment: .leading
+            )
             .padding(10)
-            .background(cardFill, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(cardFill, in: RoundedRectangle(cornerRadius: ProDesign.Radius.innerCard, style: .continuous))
             .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                RoundedRectangle(cornerRadius: ProDesign.Radius.innerCard, style: .continuous)
                     .strokeBorder(cardStroke, lineWidth: isSelected ? 1.5 : 1)
             )
         }
@@ -469,7 +475,7 @@ struct LaunchAIAgentSheet: View {
         Section {
             HStack(spacing: 10) {
                 Image(systemName: "folder.fill")
-                    .foregroundStyle(AgentVisuals.appleProAmber)
+                    .foregroundStyle(palette.proBrandAmber)
                     .accessibilityHidden(true)
 
                 TextField("~/projects/my-app", text: $workingDirectory)
@@ -482,9 +488,8 @@ struct LaunchAIAgentSheet: View {
                 } label: {
                     Image(systemName: isFavoriteDirectory ? "star.fill" : "star")
                         .font(.body)
-                        .foregroundStyle(isFavoriteDirectory ? AgentVisuals.appleProAmber : .secondary)
-                        .frame(width: 32, height: 32)
-                        .contentShape(Rectangle())
+                        .foregroundStyle(isFavoriteDirectory ? palette.proBrandAmber : .secondary)
+                        .minTapTarget()
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(isFavoriteDirectory ? "Remove favorite folder" : "Add favorite folder")
@@ -503,7 +508,7 @@ struct LaunchAIAgentSheet: View {
                     Text("Favorites")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    pathChipStrip(paths: favorites, icon: "star.fill", iconColor: AgentVisuals.appleProAmber)
+                    pathChipStrip(paths: favorites, icon: "star.fill", iconColor: palette.proBrandAmber)
                 }
                 .padding(.vertical, 2)
             }
@@ -534,24 +539,24 @@ struct LaunchAIAgentSheet: View {
                         HStack(spacing: 5) {
                             Image(systemName: icon)
                                 .font(.caption2)
-                                .foregroundStyle(isSelected ? AgentVisuals.appleProAmber : iconColor)
+                                .foregroundStyle(isSelected ? palette.proBrandAmber : iconColor)
                             Text(path)
                                 .font(.system(.caption, design: .monospaced))
                                 .lineLimit(1)
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
-                        .foregroundStyle(isSelected ? AgentVisuals.appleProAmber : .primary)
+                        .foregroundStyle(isSelected ? palette.proBrandAmber : .primary)
                         .background(
                             isSelected
-                                ? AgentVisuals.appleProAmber.opacity(theme.isDark ? 0.20 : 0.14)
+                                ? palette.pillFill(for: palette.proBrandAmber)
                                 : Color.secondary.opacity(0.12),
                             in: Capsule()
                         )
                         .overlay(
                             Capsule()
                                 .strokeBorder(
-                                    isSelected ? AgentVisuals.appleProAmber.opacity(0.55) : Color.clear,
+                                    isSelected ? palette.proBrandAmber.opacity(0.55) : Color.clear,
                                     lineWidth: 1
                                 )
                         )
@@ -574,14 +579,14 @@ struct LaunchAIAgentSheet: View {
                     .multilineTextAlignment(.trailing)
             }
 
-            HStack(spacing: 10) {
+            AdaptiveKeyValueRow(spacing: 10) {
                 Text("tmux Session")
                     .foregroundStyle(.secondary)
-                Spacer()
+            } trailing: {
                 Text(computedSessionName)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                     .truncationMode(.middle)
             }
         } header: {
@@ -873,12 +878,16 @@ struct RemoteFolderPickerSheet: View {
     let onSelect: (String) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @State private var browsingPath: String
     @State private var resolvedPath: String = ""
     @State private var directories: [String] = []
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var loadGeneration = 0
+
+    private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     init(target: AgentHostTarget, initialPath: String, onSelect: @escaping (String) -> Void) {
         self.target = target
@@ -914,7 +923,7 @@ struct RemoteFolderPickerSheet: View {
                     } label: {
                         HStack(spacing: 10) {
                             Image(systemName: "arrow.up.left.square.fill")
-                                .foregroundStyle(AgentVisuals.appleProAmber)
+                                .foregroundStyle(palette.proBrandAmber)
                             Text("..")
                                 .font(.system(.body, design: .monospaced).weight(.semibold))
                             Spacer()
@@ -935,7 +944,7 @@ struct RemoteFolderPickerSheet: View {
                     } label: {
                         HStack(spacing: 10) {
                             Image(systemName: "folder.fill")
-                                .foregroundStyle(AgentVisuals.appleProAmber)
+                                .foregroundStyle(palette.proBrandAmber)
                             Text(folder)
                                 .font(.system(.subheadline, design: .monospaced))
                                 .foregroundStyle(.primary)
@@ -985,7 +994,7 @@ struct RemoteFolderPickerSheet: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .tint(AgentVisuals.appleProAmber)
+                    .tint(palette.proBrandAmber)
                     .disabled(isLoading && resolvedPath.isEmpty)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
@@ -1090,11 +1099,15 @@ struct CustomPresetEditorSheet: View {
     let onDelete: (UUID) -> Void
 
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @State private var name = ""
     @State private var command = ""
     @State private var defaultArgs = ""
     @State private var symbolName = "terminal"
     @State private var customPresets: [CustomAIAgentPreset] = HostProjectStore.customPresets()
+
+    private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     private static let symbolChoices = [
         "terminal", "sparkles", "wand.and.stars", "cpu", "bolt.fill", "wrench.and.screwdriver", "brain",
@@ -1127,12 +1140,12 @@ struct CustomPresetEditorSheet: View {
                                     AppHaptics.impact(.light)
                                     symbolName = symbol
                                 } label: {
-                                    SquircleIcon(
+                                    ProSquircleIcon(
                                         symbolName: symbol,
-                                        tint: selected ? AgentVisuals.appleProAmber : AgentVisuals.slateColor,
-                                        fillOpacity: selected ? 0.24 : 0.12,
-                                        rimOpacity: selected ? 0.55 : 0.25,
-                                        size: 36
+                                        tint: selected ? palette.proBrandAmber : palette.neutral,
+                                        size: .row,
+                                        emphasis: selected ? .selected : .standard,
+                                        theme: theme
                                     )
                                 }
                                 .buttonStyle(.plain)
@@ -1159,7 +1172,7 @@ struct CustomPresetEditorSheet: View {
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                    .tint(AgentVisuals.appleProAmber)
+                    .tint(palette.proBrandAmber)
                     .disabled(!canSave)
                 }
 
@@ -1167,12 +1180,11 @@ struct CustomPresetEditorSheet: View {
                     Section("Saved Custom Presets") {
                         ForEach(customPresets) { preset in
                             HStack(spacing: 12) {
-                                SquircleIcon(
+                                ProSquircleIcon(
                                     symbolName: preset.symbolName,
-                                    tint: AgentVisuals.slateColor,
-                                    fillOpacity: 0.18,
-                                    rimOpacity: 0.34,
-                                    size: 32
+                                    tint: palette.neutral,
+                                    size: .compact,
+                                    theme: theme
                                 )
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(preset.name)

@@ -63,15 +63,22 @@ enum AppearanceSettings {
 }
 
 struct ThemePickerView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @AppStorage(AppearanceSettings.themeKey) private var selectedThemeName = AppearanceSettings.defaultThemeName
 
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: 12) {
-                ForEach(TerminalTheme.allPresets, id: \.name) { theme in
-                    ThemePreviewCard(theme: theme, isSelected: theme.name == selectedThemeName) {
-                        AppHaptics.impact(.light)
-                        selectedThemeName = theme.name
+            Group {
+                if horizontalSizeClass == .regular {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 14)],
+                        spacing: 14
+                    ) {
+                        themeCards
+                    }
+                } else {
+                    LazyVStack(spacing: 12) {
+                        themeCards
                     }
                 }
             }
@@ -80,6 +87,16 @@ struct ThemePickerView: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Theme")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    @ViewBuilder
+    private var themeCards: some View {
+        ForEach(TerminalTheme.allPresets, id: \.name) { theme in
+            ThemePreviewCard(theme: theme, isSelected: theme.name == selectedThemeName) {
+                AppHaptics.impact(.light)
+                selectedThemeName = theme.name
+            }
+        }
     }
 }
 
@@ -148,6 +165,7 @@ private struct ThemePreviewCard: View {
                 )
             }
             .padding(14)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .background(theme.backgroundColor, in: RoundedRectangle(cornerRadius: 14))
             .overlay(
                 RoundedRectangle(cornerRadius: 14)

@@ -9,6 +9,8 @@ import TermUI
 /// bridge rebuilds the terminal view.
 struct TerminalPane: View {
     let live: LiveSession
+    var onOpenGitDiff: (() -> Void)? = nil
+    var onOpenDevPreview: (() -> Void)? = nil
     @Environment(ProStore.self) private var proStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
@@ -31,6 +33,21 @@ struct TerminalPane: View {
             VStack(spacing: 0) {
                 if live.overlay == nil, let a = live.algorithms, a.isPostQuantum == false, !live.quantumNoticeDismissed {
                     quantumNoticeBanner(algorithms: a)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .task(id: live.id) {
+                            try? await Task.sleep(for: .seconds(4))
+                            while inspectingSecurity && !Task.isCancelled {
+                                try? await Task.sleep(for: .milliseconds(250))
+                            }
+                            guard !Task.isCancelled, !live.quantumNoticeDismissed else { return }
+                            if reduceMotion {
+                                live.quantumNoticeDismissed = true
+                            } else {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    live.quantumNoticeDismissed = true
+                                }
+                            }
+                        }
                 }
 
                 TerminalHostView(
@@ -51,9 +68,19 @@ struct TerminalPane: View {
                         showZoomHUD(for: updated)
                     }
                 )
+                .simultaneousGesture(
+                    TapGesture().onEnded {
+                        live.recordTerminalFocusInteraction()
+                    }
+                )
 
                 if proStore.isProUnlocked, live.showAIAgentControls, live.overlay == nil {
-                    AITerminalControlsOverlay(live: live, theme: theme)
+                    AITerminalControlsOverlay(
+                        live: live,
+                        theme: theme,
+                        onOpenGitDiff: onOpenGitDiff,
+                        onOpenDevPreview: onOpenDevPreview
+                    )
                 }
             }
 
@@ -83,13 +110,18 @@ struct TerminalPane: View {
         .onAppear {
             isVisible = true
             live.terminalAppeared()
+            live.hasInlineModalPresented = inspectingSecurity
             syncExtraKeysBar()
         }
         .onDisappear {
             isVisible = false
             live.terminalDisappeared()
+            live.hasInlineModalPresented = false
             zoomHUDTask?.cancel()
             zoomHUDTask = nil
+        }
+        .onChange(of: inspectingSecurity) { _, isPresented in
+            live.hasInlineModalPresented = isPresented
         }
         .onChange(of: themeName) { _, _ in syncExtraKeysBar() }
         .onChange(of: hapticsEnabled) { _, _ in syncExtraKeysBar() }
@@ -98,9 +130,19 @@ struct TerminalPane: View {
                 live.dispatchPendingLaunchCommandIfReady()
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            DispatchQueue.main.async {
+                if isVisible, live.overlay == nil, !inspectingSecurity, live.bar.window != nil {
+                    live.recordTerminalFocusInteraction()
+                }
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
             if isVisible, live.overlay == nil, !inspectingSecurity {
                 live.shouldAutoFocus = true
+                if live.bar.window != nil {
+                    live.recordTerminalFocusInteraction()
+                }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
@@ -213,9 +255,11 @@ struct SessionSceneView: View {
     static let windowGroupID = "session"
     let id: UUID?
     @Environment(\.modelContext) private var modelContext
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(SessionManager.self) private var manager
     @Environment(ProStore.self) private var proStore
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
+    @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
     @State private var windowID = UUID()
     @State private var scene: UIWindowScene?
     /// Set once this window has asked to close; it then never claims a session again.
@@ -225,6 +269,18 @@ struct SessionSceneView: View {
     @State private var confirmingClose = false
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+
+    private var ownedLiveSession: LiveSession? {
+        guard !dismissing, let id, let live = manager.session(id: id),
+              live.windowID == windowID || live.windowID == nil else {
+            return nil
+        }
+        return live
+    }
+
+    private var isModalOverTerminal: Bool {
+        activeToolSheet != nil || inspectingSecurity
+    }
 
     var body: some View {
         Group {
@@ -237,7 +293,11 @@ struct SessionSceneView: View {
                     if live.windowID == windowID || live.windowID == nil {
                         VStack(spacing: 0) {
                             windowHeaderBar(for: live)
-                            TerminalPane(live: live)
+                            TerminalPane(
+                                live: live,
+                                onOpenGitDiff: { openGitDiffShortcut(for: live) },
+                                onOpenDevPreview: { openDevServerPreviewShortcut(for: live) }
+                            )
                         }
                     } else {
                         ContentUnavailableView {
@@ -247,13 +307,29 @@ struct SessionSceneView: View {
                         }
                     }
                 }
-                .onAppear { if !dismissing { manager.show(live.id, in: windowID) } }
+                .onAppear {
+                    if !dismissing {
+                        manager.show(live.id, in: windowID)
+                        live.hasModalSheetPresented = isModalOverTerminal
+                    }
+                }
+                .onDisappear {
+                    if live.windowID == windowID {
+                        live.hasModalSheetPresented = false
+                    }
+                }
                 .onChange(of: live.windowID) { _, w in
                     if dismissing { return }
                     if w == nil {
                         manager.show(live.id, in: windowID) // detached to reopen here: claim it
                     } else if w != windowID {
+                        live.hasModalSheetPresented = false
                         dismissSelf() // another window took the session
+                    }
+                }
+                .onChange(of: isModalOverTerminal) { _, isPresented in
+                    if !dismissing, live.windowID == windowID {
+                        live.hasModalSheetPresented = isPresented
                     }
                 }
                 .confirmationDialog(
@@ -289,9 +365,14 @@ struct SessionSceneView: View {
         }
         .background {
             if let scene {
-                CloseShortcut(scene: scene) { requestCloseWindow() }
+                SceneNotifications(
+                    scene: scene,
+                    onNewTab: { requestNewTabInMainWindow() },
+                    onCloseTab: { requestCloseWindow() }
+                )
             }
         }
+        .background { keyboardShortcutsLayer }
     }
 
     private func windowHeaderBar(for live: LiveSession) -> some View {
@@ -321,7 +402,7 @@ struct SessionSceneView: View {
 
                 Spacer(minLength: 8)
 
-                HStack(spacing: 4) {
+                HStack(spacing: 2) {
                     SessionToolsMenu(
                         live: live,
                         isProUnlocked: proStore.isProUnlocked,
@@ -330,7 +411,7 @@ struct SessionSceneView: View {
                         activeToolSheet = tool
                     }
 
-                    if let algorithms = live.algorithms {
+                    if horizontalSizeClass != .compact, let algorithms = live.algorithms {
                         Button {
                             AppHaptics.impact(.light)
                             inspectingSecurity = true
@@ -338,8 +419,7 @@ struct SessionSceneView: View {
                             Image(systemName: algorithms.isPostQuantum ? "lock.shield.fill" : "lock.fill")
                                 .font(.subheadline.weight(.semibold))
                                 .foregroundStyle(algorithms.isPostQuantum ? Color.green : Color.orange)
-                                .frame(width: 40, height: 40)
-                                .contentShape(Rectangle())
+                                .minTapTarget()
                         }
                         .accessibilityLabel(algorithms.isPostQuantum ? "Connection security: Post-quantum" : "Connection security: Classical")
                         .popover(isPresented: $inspectingSecurity) {
@@ -349,14 +429,23 @@ struct SessionSceneView: View {
                     }
 
                     Button {
+                        mergeBackToMainWindow()
+                    } label: {
+                        Image(systemName: "arrow.down.right.and.arrow.up.left")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(theme.foregroundColor)
+                            .minTapTarget()
+                    }
+                    .accessibilityLabel("Merge Back to Main Window")
+
+                    Button {
                         AppHaptics.impact(.light)
                         requestCloseWindow()
                     } label: {
                         Image(systemName: "xmark")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(theme.secondaryForegroundColor)
-                            .frame(width: 40, height: 40)
-                            .contentShape(Rectangle())
+                            .minTapTarget()
                     }
                     .accessibilityLabel("Close \(live.title)")
                 }
@@ -369,6 +458,96 @@ struct SessionSceneView: View {
                 .frame(height: 1)
         }
         .background(theme.backgroundColor.ignoresSafeArea(.container, edges: .top))
+    }
+
+    private func mergeBackToMainWindow() {
+        guard !dismissing, let id else { return }
+        AppHaptics.impact(.light)
+        manager.session(id: id)?.hasModalSheetPresented = false
+        dismissSelf()
+        manager.requestMergeBack(id)
+    }
+
+    private func requestNewTabInMainWindow() {
+        guard activeToolSheet == nil, !inspectingSecurity, !confirmingClose else { return }
+        AppHaptics.impact(.light)
+        manager.requestNewTabInMainWindow()
+        let hasOtherScene = UIApplication.shared.connectedScenes.contains { $0 !== scene }
+        if !hasOtherScene {
+            UIApplication.shared.requestSceneSessionActivation(nil, userActivity: nil, options: nil)
+        }
+    }
+
+    private func adjustFontSize(by delta: Double) {
+        fontSize = SessionFontShortcuts.adjustedFontSize(from: fontSize, delta: delta)
+        AppHaptics.impact(.light)
+    }
+
+    private func resetFontSize() {
+        fontSize = AppearanceSettings.defaultFontSize
+        AppHaptics.impact(.light)
+    }
+
+    private func openGitDiffShortcut(for live: LiveSession) {
+        guard activeToolSheet == nil,
+              !inspectingSecurity,
+              !confirmingClose,
+              let sheet = SessionToolSheet.gitDiff(for: live, isProUnlocked: proStore.isProUnlocked) else {
+            return
+        }
+        AppHaptics.impact(.light)
+        activeToolSheet = sheet
+    }
+
+    private func openDevServerPreviewShortcut(for live: LiveSession) {
+        guard activeToolSheet == nil,
+              !inspectingSecurity,
+              !confirmingClose,
+              let sheet = SessionToolSheet.devServerPreview(for: live, isProUnlocked: proStore.isProUnlocked) else {
+            return
+        }
+        AppHaptics.impact(.light)
+        activeToolSheet = sheet
+    }
+
+    @ViewBuilder
+    private var keyboardShortcutsLayer: some View {
+        let modalFree = activeToolSheet == nil && !inspectingSecurity && !confirmingClose
+        ZStack {
+            if let live = ownedLiveSession, modalFree {
+                SessionShortcutButton("Hosts Quick Connect", key: "t", modifiers: .command) {
+                    requestNewTabInMainWindow()
+                }
+                SessionShortcutButton("Close Window", key: "w", modifiers: .command) {
+                    requestCloseWindow()
+                }
+                SessionShortcutButton("Increase Font Size", key: "=", modifiers: .command) {
+                    adjustFontSize(by: 1)
+                }
+                SessionShortcutButton("", key: "+", modifiers: .command) {
+                    adjustFontSize(by: 1)
+                }
+                SessionShortcutButton("", key: "+", modifiers: [.command, .shift]) {
+                    adjustFontSize(by: 1)
+                }
+                SessionShortcutButton("Decrease Font Size", key: "-", modifiers: .command) {
+                    adjustFontSize(by: -1)
+                }
+                SessionShortcutButton("Reset Font Size", key: "0", modifiers: .command) {
+                    resetFontSize()
+                }
+                SessionShortcutButton("Git Diff Inspector", key: "d", modifiers: [.command, .shift]) {
+                    openGitDiffShortcut(for: live)
+                }
+                SessionShortcutButton("Dev Server Preview", key: "p", modifiers: [.command, .shift]) {
+                    openDevServerPreviewShortcut(for: live)
+                }
+            }
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private func requestCloseWindow() {
@@ -394,14 +573,17 @@ struct SessionSceneView: View {
     }
 }
 
-/// Cmd+W closes this window, and the session too when this window shows it (see closeWindow).
-private struct CloseShortcut: View {
+/// Observes HardwareKeyCommands window-scoped notifications (`Cmd+T` / `Cmd+W`) for this secondary scene.
+private struct SceneNotifications: View {
     let scene: UIWindowScene
-    let action: () -> Void
+    let onNewTab: () -> Void
+    let onCloseTab: () -> Void
+    private let center = NotificationCenter.default
 
     var body: some View {
         Color.clear
-            .onReceive(NotificationCenter.default.publisher(for: .termCloseTab, object: scene)) { _ in action() }
+            .onReceive(center.publisher(for: .termNewTab, object: scene)) { _ in onNewTab() }
+            .onReceive(center.publisher(for: .termCloseTab, object: scene)) { _ in onCloseTab() }
             .allowsHitTesting(false)
     }
 }

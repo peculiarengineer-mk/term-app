@@ -12,37 +12,29 @@ struct SFTPBrowserView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
 
-    @State private var currentPath = ""
-    @State private var entries: [SFTPEntry] = []
-    @State private var isLoading = false
+    @State private var rootPath = ""
+    @State private var navigationPath: [String] = []
+    @State private var directoryRefreshTokens: [String: Int] = [:]
     @State private var workingStatus: String?
-    @State private var loadError: String?
-    @State private var actionError: String?
+    @State private var activeTransferTask: Task<Void, Never>?
+    @State private var mutationGeneration = 0
     @State private var previewEntry: SFTPEntry?
     @State private var showingImporter = false
+    @State private var importerTargetDirectory = ""
     @State private var showingNewFolderAlert = false
+    @State private var newFolderTargetDirectory = ""
     @State private var newFolderName = ""
     @State private var renamingEntry: SFTPEntry?
+    @State private var renameSourceDirectory = ""
     @State private var renameText = ""
     @State private var showingRenameAlert = false
     @State private var deletingEntry: SFTPEntry?
-    @State private var loadGeneration = 0
-    @State private var didInitialLoad = false
+    @State private var deleteSourceDirectory = ""
+    @State private var actionError: String?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
     private var isMutating: Bool { workingStatus != nil }
-
-    private static let byteFormatter: ByteCountFormatter = {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter
-    }()
-
-    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter
-    }()
 
     private static let textExtensions: Set<String> = [
         "log", "txt", "md", "markdown", "json", "yml", "yaml", "swift", "py", "sh",
@@ -55,387 +47,182 @@ struct SFTPBrowserView: View {
         "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst", "lz4", "dmg", "pkg", "deb", "rpm",
     ]
 
-    private static let imageExtensions: Set<String> = [
+    static let imageExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "webp", "svg", "heic", "heif", "bmp", "tiff", "ico", "raw",
     ]
 
     var body: some View {
-        NavigationStack {
-            directoryList
-                .sheet(item: $previewEntry) { entry in
-                    SFTPFileDetailSheet(entry: entry, connection: connection)
-                        .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                        .tint(theme.accentColor)
+        NavigationStack(path: $navigationPath) {
+            directoryScreen(path: rootPath, isRoot: true)
+                .navigationDestination(for: String.self) { path in
+                    directoryScreen(path: path, isRoot: false)
                 }
-                .fileImporter(
-                    isPresented: $showingImporter,
-                    allowedContentTypes: [.item]
-                ) { result in
-                    handleFileImport(result)
-                }
-                .modifier(
-                    SFTPAlertsModifier(
-                        currentPath: currentPath,
-                        showingNewFolderAlert: $showingNewFolderAlert,
-                        newFolderName: $newFolderName,
-                        showingRenameAlert: $showingRenameAlert,
-                        renamingEntry: $renamingEntry,
-                        renameText: $renameText,
-                        deletingEntry: $deletingEntry,
-                        actionError: $actionError,
-                        onCreateFolder: { name in Task { await createFolder(named: name) } },
-                        onRename: { entry, name in Task { await renameEntry(entry, to: name) } },
-                        onDelete: { entry in Task { await deleteEntry(entry) } }
-                    )
-                )
-        }
-    }
-
-    private var directoryList: some View {
-        List {
-            ForEach(entries) { entry in
-                entryRowView(entry)
-            }
-        }
-        .listStyle(.insetGrouped)
-        .safeAreaInset(edge: .top, spacing: 0) {
-            if !currentPath.isEmpty {
-                breadcrumbBar
-            }
         }
         .overlay {
-            stateOverlay
+            workingStatusOverlay
         }
-        .refreshable {
-            guard !currentPath.isEmpty else {
-                await loadInitialDirectory()
-                return
-            }
-            await loadDirectory(path: currentPath, isRefresh: true)
+        .sheet(item: $previewEntry) { entry in
+            SFTPFileDetailSheet(entry: entry, connection: connection)
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(palette.accent)
         }
-        .navigationTitle(hostTitle.isEmpty ? "SFTP Files" : hostTitle)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("Done") { dismiss() }
-            }
-
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                Button {
-                    AppHaptics.impact(.light)
-                    newFolderName = ""
-                    showingNewFolderAlert = true
-                } label: {
-                    Label("New Folder", systemImage: "folder.badge.plus")
-                }
-                .disabled(currentPath.isEmpty || isLoading || isMutating)
-
-                Button {
-                    AppHaptics.impact(.light)
-                    showingImporter = true
-                } label: {
-                    Label("Upload File", systemImage: "arrow.up.doc")
-                }
-                .disabled(currentPath.isEmpty || isLoading || isMutating)
-            }
+        .fileImporter(
+            isPresented: $showingImporter,
+            allowedContentTypes: [.item]
+        ) { result in
+            handleFileImport(result, targetDirectory: importerTargetDirectory)
         }
-        .task {
-            guard !didInitialLoad else { return }
-            didInitialLoad = true
-            await loadInitialDirectory()
+        .modifier(
+            SFTPAlertsModifier(
+                currentPath: newFolderTargetDirectory,
+                showingNewFolderAlert: $showingNewFolderAlert,
+                newFolderName: $newFolderName,
+                showingRenameAlert: $showingRenameAlert,
+                renamingEntry: $renamingEntry,
+                renameText: $renameText,
+                deletingEntry: $deletingEntry,
+                actionError: $actionError,
+                onCreateFolder: { name in createFolder(named: name, in: newFolderTargetDirectory) },
+                onRename: { entry, name in renameEntry(entry, to: name, in: renameSourceDirectory) },
+                onDelete: { entry in deleteEntry(entry, in: deleteSourceDirectory) }
+            )
+        )
+        .onDisappear {
+            activeTransferTask?.cancel()
+            activeTransferTask = nil
         }
     }
 
-    private func entryRowView(_ entry: SFTPEntry) -> some View {
-        entryRow(entry)
-            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                Button(role: .destructive) {
-                    deletingEntry = entry
-                } label: {
-                    Label("Delete", systemImage: "trash")
-                }
-                Button {
-                    beginRename(entry)
-                } label: {
-                    Label("Rename", systemImage: "pencil")
-                }
-                .tint(.blue)
+    private func directoryScreen(path: String, isRoot: Bool) -> some View {
+        SFTPDirectoryView(
+            directoryPath: path,
+            isRoot: isRoot,
+            hostTitle: hostTitle,
+            connection: connection,
+            theme: theme,
+            isMutating: isMutating,
+            refreshToken: directoryRefreshTokens[path] ?? 0,
+            onResolvedRootPath: { resolved in
+                rootPath = resolved
+            },
+            onNavigateToDirectory: { targetPath in
+                navigateToDirectory(targetPath)
+            },
+            onPreviewFile: { entry in
+                previewEntry = entry
+            },
+            onNewFolder: { targetDir in
+                newFolderTargetDirectory = targetDir
+                newFolderName = ""
+                showingNewFolderAlert = true
+            },
+            onUploadFile: { targetDir in
+                importerTargetDirectory = targetDir
+                showingImporter = true
+            },
+            onRenameEntry: { entry, currentDir in
+                renameSourceDirectory = currentDir
+                renamingEntry = entry
+                renameText = entry.name
+                showingRenameAlert = true
+            },
+            onDeleteEntry: { entry, currentDir in
+                deleteSourceDirectory = currentDir
+                deletingEntry = entry
+            },
+            onActionError: { message in
+                actionError = message
+            },
+            onDismiss: {
+                dismiss()
             }
-            .contextMenu {
-                if !entry.isDirectory {
-                    Button("Preview / Download", systemImage: "doc.text.magnifyingglass") {
-                        previewEntry = entry
-                    }
-                }
-                Button("Rename", systemImage: "pencil") {
-                    beginRename(entry)
-                }
-                Button("Copy Path", systemImage: "doc.on.doc") {
-                    UIPasteboard.general.string = entry.path
-                    AppHaptics.notify(.success)
-                }
-                Divider()
-                Button("Delete", systemImage: "trash", role: .destructive) {
-                    deletingEntry = entry
-                }
-            }
+        )
     }
 
     @ViewBuilder
-    private var stateOverlay: some View {
+    private var workingStatusOverlay: some View {
         if let workingStatus {
             ZStack {
                 Color.black.opacity(0.28).ignoresSafeArea()
-                VStack(spacing: 12) {
+                VStack(spacing: 14) {
                     ProgressView()
                         .controlSize(.large)
                     Text(workingStatus)
                         .font(.subheadline.weight(.medium))
                         .foregroundStyle(.primary)
+                        .multilineTextAlignment(.center)
+                    Button("Cancel", role: .cancel) {
+                        cancelActiveTransfer()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .minTapTarget()
                 }
                 .padding(22)
-                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            }
-        } else if isLoading && entries.isEmpty {
-            ProgressView("Loading directory…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let loadError, entries.isEmpty {
-            ContentUnavailableView {
-                Label("Could Not Load Directory", systemImage: "exclamationmark.triangle")
-            } description: {
-                Text(loadError)
-            } actions: {
-                Button("Retry") {
-                    Task {
-                        if currentPath.isEmpty {
-                            await loadInitialDirectory()
-                        } else {
-                            await loadDirectory(path: currentPath, isRefresh: false)
-                        }
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-            }
-        } else if !isLoading && entries.isEmpty && !currentPath.isEmpty {
-            ContentUnavailableView {
-                Label("Empty Directory", systemImage: "folder")
-            } description: {
-                Text("There are no files in \(currentPath).")
+                .frame(maxWidth: ProDesign.Layout.readableOverlayWidth)
+                .background(
+                    .ultraThinMaterial,
+                    in: RoundedRectangle(cornerRadius: ProDesign.Radius.card, style: .continuous)
+                )
+                .padding(.horizontal, 24)
             }
         }
     }
 
-    private var breadcrumbBar: some View {
-        let components = Self.pathComponents(for: currentPath)
-
-        return VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                if currentPath != "/" {
-                    Button {
-                        AppHaptics.impact(.light)
-                        let parent = SFTPPath.parent(of: currentPath)
-                        Task { await loadDirectory(path: parent, isRefresh: false) }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.turn.up.left")
-                                .font(.caption2.weight(.semibold))
-                            Text("..")
-                                .font(.system(.caption, design: .monospaced).weight(.semibold))
-                        }
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 5)
-                        .foregroundStyle(theme.accentColor)
-                        .background(
-                            theme.accentColor.opacity(theme.isDark ? 0.16 : 0.12),
-                            in: Capsule()
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isMutating)
-                    .accessibilityLabel("Parent directory")
-                }
-
-                ScrollViewReader { proxy in
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 4) {
-                            ForEach(Array(components.enumerated()), id: \.element.path) { index, component in
-                                if index > 0 {
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption2.weight(.semibold))
-                                        .foregroundStyle(.tertiary)
-                                        .accessibilityHidden(true)
-                                }
-
-                                let isCurrent = component.path == currentPath
-                                Button {
-                                    guard !isCurrent else { return }
-                                    AppHaptics.impact(.light)
-                                    Task { await loadDirectory(path: component.path, isRefresh: false) }
-                                } label: {
-                                    Text(component.name)
-                                        .font(.system(.caption, design: .monospaced).weight(isCurrent ? .semibold : .regular))
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 5)
-                                        .foregroundStyle(isCurrent ? theme.accentColor : Color.primary)
-                                        .background(
-                                            isCurrent
-                                                ? theme.accentColor.opacity(theme.isDark ? 0.18 : 0.12)
-                                                : Color.secondary.opacity(0.10),
-                                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
-                                        )
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(isCurrent || isMutating)
-                                .id(component.path)
-                            }
-                        }
-                        .padding(.vertical, 8)
-                    }
-                    .onChange(of: currentPath) { _, newPath in
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            proxy.scrollTo(newPath, anchor: .trailing)
-                        }
-                    }
-                    .onAppear {
-                        proxy.scrollTo(currentPath, anchor: .trailing)
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .background(.bar)
-
-            Divider()
-        }
-    }
-
-    private func entryRow(_ entry: SFTPEntry) -> some View {
-        Button {
-            AppHaptics.impact(.light)
-            if entry.isDirectory {
-                Task { await loadDirectory(path: entry.path, isRefresh: false) }
-            } else {
-                previewEntry = entry
-            }
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: Self.iconName(for: entry))
-                    .font(.title3)
-                    .foregroundStyle(entry.isDirectory ? theme.accentColor : Color.secondary)
-                    .frame(width: 28, alignment: .center)
-                    .accessibilityHidden(true)
-
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(entry.name)
-                        .font(.body)
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-
-                    let subtitle = entrySubtitle(for: entry)
-                    if !subtitle.isEmpty {
-                        Text(subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-
-                Spacer(minLength: 8)
-
-                if entry.isDirectory {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.tertiary)
-                        .accessibilityHidden(true)
-                }
-            }
-            .padding(.vertical, 2)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .disabled(isMutating)
-    }
-
-    private func entrySubtitle(for entry: SFTPEntry) -> String {
-        var parts: [String] = []
-        if !entry.isDirectory {
-            parts.append(Self.byteFormatter.string(fromByteCount: Int64(clamping: entry.size)))
+    private func navigateToDirectory(_ targetPath: String) {
+        let normalized = targetPath.isEmpty ? "/" : targetPath
+        if normalized == rootPath {
+            navigationPath.removeAll()
+        } else if let index = navigationPath.firstIndex(of: normalized) {
+            navigationPath = Array(navigationPath.prefix(index + 1))
         } else {
-            parts.append("Folder")
+            rootPath = normalized
+            navigationPath.removeAll()
         }
-        if entry.isSymlink {
-            parts.append("Symlink")
-        }
-        if let modifiedAt = entry.modifiedAt {
-            parts.append(Self.relativeDateFormatter.localizedString(for: modifiedAt, relativeTo: .now))
-        }
-        return parts.joined(separator: " · ")
     }
 
-    private func beginRename(_ entry: SFTPEntry) {
-        renamingEntry = entry
-        renameText = entry.name
-        showingRenameAlert = true
+    private func triggerRefresh(for directory: String) {
+        directoryRefreshTokens[directory, default: 0] += 1
     }
 
-    private func loadInitialDirectory() async {
-        loadGeneration += 1
-        let generation = loadGeneration
-        isLoading = true
-        loadError = nil
+    private func cancelActiveTransfer() {
+        AppHaptics.impact(.light)
+        mutationGeneration += 1
+        activeTransferTask?.cancel()
+        activeTransferTask = nil
+        workingStatus = nil
+    }
 
-        do {
-            let resolved = try await connection.sftpResolvePath(".")
-            guard generation == loadGeneration else { return }
-            currentPath = resolved
-            let listing = try await connection.sftpListDirectory(path: resolved)
-            guard generation == loadGeneration else { return }
-            entries = listing
-            isLoading = false
-        } catch is CancellationError {
-            if generation == loadGeneration {
-                isLoading = false
+    private func startMutation(
+        status: String,
+        failurePrefix: String,
+        operation: @escaping @MainActor () async throws -> Void
+    ) {
+        activeTransferTask?.cancel()
+        mutationGeneration += 1
+        let generation = mutationGeneration
+        workingStatus = status
+
+        activeTransferTask = Task { @MainActor in
+            defer {
+                if generation == mutationGeneration {
+                    workingStatus = nil
+                    activeTransferTask = nil
+                }
             }
-        } catch {
-            guard generation == loadGeneration else { return }
-            isLoading = false
-            loadError = error.localizedDescription
-        }
-    }
-
-    private func loadDirectory(path: String, isRefresh: Bool) async {
-        loadGeneration += 1
-        let generation = loadGeneration
-        let targetPath = path.isEmpty ? "/" : path
-
-        if !isRefresh {
-            currentPath = targetPath
-            entries = []
-        }
-        isLoading = true
-        loadError = nil
-
-        do {
-            let listing = try await connection.sftpListDirectory(path: targetPath)
-            guard generation == loadGeneration else { return }
-            entries = listing
-            isLoading = false
-        } catch is CancellationError {
-            if generation == loadGeneration {
-                isLoading = false
-            }
-        } catch {
-            guard generation == loadGeneration else { return }
-            isLoading = false
-            if isRefresh && !entries.isEmpty {
-                actionError = error.localizedDescription
-            } else {
-                loadError = error.localizedDescription
+            do {
+                try await operation()
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, generation == mutationGeneration else { return }
+                AppHaptics.notify(.error)
+                actionError = "\(failurePrefix): \(error.localizedDescription)"
             }
         }
     }
 
-    private func handleFileImport(_ result: Result<URL, any Error>) {
+    private func handleFileImport(_ result: Result<URL, any Error>, targetDirectory: String) {
         switch result {
         case .success(let url):
             let scoped = url.startAccessingSecurityScopedResource()
@@ -451,7 +238,7 @@ struct SFTPBrowserView: View {
                     actionError = "Selected file has an invalid filename."
                     return
                 }
-                Task { await uploadFile(data: data, fileName: fileName) }
+                uploadFile(data: data, fileName: fileName, in: targetDirectory)
             } catch {
                 actionError = "Could not read selected file: \(error.localizedDescription)"
             }
@@ -460,46 +247,34 @@ struct SFTPBrowserView: View {
         }
     }
 
-    private func uploadFile(data: Data, fileName: String) async {
-        guard !currentPath.isEmpty else { return }
-        let targetDir = currentPath
+    private func uploadFile(data: Data, fileName: String, in targetDir: String) {
+        guard !targetDir.isEmpty else { return }
         let remotePath = SFTPPath.join(targetDir, fileName)
-        workingStatus = "Uploading \(fileName)…"
-        defer { workingStatus = nil }
-
-        do {
+        startMutation(status: "Uploading \(fileName)…", failurePrefix: "Upload failed") {
             try await connection.sftpUploadFile(data: data, remotePath: remotePath)
+            guard !Task.isCancelled else { return }
             AppHaptics.notify(.success)
-            await loadDirectory(path: targetDir, isRefresh: true)
-        } catch {
-            AppHaptics.notify(.error)
-            actionError = "Upload failed: \(error.localizedDescription)"
+            triggerRefresh(for: targetDir)
         }
     }
 
-    private func createFolder(named rawName: String) async {
+    private func createFolder(named rawName: String, in targetDir: String) {
         let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isValidEntryName(trimmed) else {
             actionError = "Please enter a valid folder name without '/'."
             return
         }
-        guard !currentPath.isEmpty else { return }
-        let targetDir = currentPath
+        guard !targetDir.isEmpty else { return }
         let folderPath = SFTPPath.join(targetDir, trimmed)
-        workingStatus = "Creating folder…"
-        defer { workingStatus = nil }
-
-        do {
+        startMutation(status: "Creating folder…", failurePrefix: "Could not create folder") {
             try await connection.sftpMakeDirectory(path: folderPath)
+            guard !Task.isCancelled else { return }
             AppHaptics.notify(.success)
-            await loadDirectory(path: targetDir, isRefresh: true)
-        } catch {
-            AppHaptics.notify(.error)
-            actionError = "Could not create folder: \(error.localizedDescription)"
+            triggerRefresh(for: targetDir)
         }
     }
 
-    private func renameEntry(_ entry: SFTPEntry, to rawName: String) async {
+    private func renameEntry(_ entry: SFTPEntry, to rawName: String, in targetDir: String) {
         renamingEntry = nil
         let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isValidEntryName(trimmed) else {
@@ -508,30 +283,20 @@ struct SFTPBrowserView: View {
         }
         guard trimmed != entry.name else { return }
         let destination = SFTPPath.join(SFTPPath.parent(of: entry.path), trimmed)
-        workingStatus = "Renaming…"
-        defer { workingStatus = nil }
-
-        do {
+        startMutation(status: "Renaming…", failurePrefix: "Rename failed") {
             try await connection.sftpRename(from: entry.path, to: destination)
+            guard !Task.isCancelled else { return }
             AppHaptics.notify(.success)
-            await loadDirectory(path: currentPath, isRefresh: true)
-        } catch {
-            AppHaptics.notify(.error)
-            actionError = "Rename failed: \(error.localizedDescription)"
+            triggerRefresh(for: targetDir)
         }
     }
 
-    private func deleteEntry(_ entry: SFTPEntry) async {
-        workingStatus = "Deleting…"
-        defer { workingStatus = nil }
-
-        do {
+    private func deleteEntry(_ entry: SFTPEntry, in targetDir: String) {
+        startMutation(status: "Deleting…", failurePrefix: "Delete failed") {
             try await connection.sftpDelete(path: entry.path, isDirectory: entry.isDirectory)
+            guard !Task.isCancelled else { return }
             AppHaptics.notify(.warning)
-            await loadDirectory(path: currentPath, isRefresh: true)
-        } catch {
-            AppHaptics.notify(.error)
-            actionError = "Delete failed: \(error.localizedDescription)"
+            triggerRefresh(for: targetDir)
         }
     }
 
@@ -575,6 +340,411 @@ struct SFTPBrowserView: View {
     }
 }
 
+/// Directory listing page pushed on `SFTPBrowserView`'s `NavigationStack` for native swipe-back navigation.
+private struct SFTPDirectoryView: View {
+    let directoryPath: String
+    let isRoot: Bool
+    let hostTitle: String
+    let connection: SSHConnection
+    let theme: TerminalTheme
+    let isMutating: Bool
+    let refreshToken: Int
+    let onResolvedRootPath: (String) -> Void
+    let onNavigateToDirectory: (String) -> Void
+    let onPreviewFile: (SFTPEntry) -> Void
+    let onNewFolder: (String) -> Void
+    let onUploadFile: (String) -> Void
+    let onRenameEntry: (SFTPEntry, String) -> Void
+    let onDeleteEntry: (SFTPEntry, String) -> Void
+    let onActionError: (String) -> Void
+    let onDismiss: () -> Void
+
+    @State private var loadedPath = ""
+    @State private var entries: [SFTPEntry] = []
+    @State private var isLoading = false
+    @State private var loadError: String?
+    @State private var loadGeneration = 0
+    @State private var searchQuery = ""
+
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
+    }()
+
+    private var palette: ProDesign.Palette {
+        ProDesign.Palette(theme: theme)
+    }
+
+    private var displayPath: String {
+        if !directoryPath.isEmpty {
+            return directoryPath
+        }
+        return loadedPath
+    }
+
+    private var navigationTitleText: String {
+        if isRoot {
+            return hostTitle.isEmpty ? "SFTP Files" : hostTitle
+        }
+        let leaf = URL(fileURLWithPath: displayPath).lastPathComponent
+        return leaf.isEmpty ? "/" : leaf
+    }
+
+    private var filteredEntries: [SFTPEntry] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return entries }
+        return entries.filter { $0.name.localizedCaseInsensitiveContains(query) }
+    }
+
+    var body: some View {
+        List {
+            ForEach(filteredEntries) { entry in
+                entryRowView(entry)
+            }
+        }
+        .listStyle(.insetGrouped)
+        .searchable(text: $searchQuery, prompt: "Filter files")
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if !displayPath.isEmpty {
+                breadcrumbBar(for: displayPath)
+            }
+        }
+        .overlay {
+            stateOverlay
+        }
+        .refreshable {
+            if displayPath.isEmpty {
+                await loadInitialDirectory()
+            } else {
+                await loadDirectory(path: displayPath, isRefresh: true)
+            }
+        }
+        .navigationTitle(navigationTitleText)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            if isRoot {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { onDismiss() }
+                }
+            }
+
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    AppHaptics.impact(.light)
+                    onNewFolder(displayPath)
+                } label: {
+                    Label("New Folder", systemImage: "folder.badge.plus")
+                }
+                .disabled(displayPath.isEmpty || isLoading || isMutating)
+
+                Button {
+                    AppHaptics.impact(.light)
+                    onUploadFile(displayPath)
+                } label: {
+                    Label("Upload File", systemImage: "arrow.up.doc")
+                }
+                .disabled(displayPath.isEmpty || isLoading || isMutating)
+            }
+        }
+        .task(id: directoryPath) {
+            if directoryPath.isEmpty {
+                guard loadedPath.isEmpty else { return }
+                await loadInitialDirectory()
+            } else {
+                guard loadedPath != directoryPath else { return }
+                await loadDirectory(path: directoryPath, isRefresh: false)
+            }
+        }
+        .onChange(of: refreshToken) { _, _ in
+            guard !displayPath.isEmpty else { return }
+            Task { await loadDirectory(path: displayPath, isRefresh: true) }
+        }
+    }
+
+    private func entryRowView(_ entry: SFTPEntry) -> some View {
+        entryRow(entry)
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button(role: .destructive) {
+                    onDeleteEntry(entry, displayPath)
+                } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                Button {
+                    onRenameEntry(entry, displayPath)
+                } label: {
+                    Label("Rename", systemImage: "pencil")
+                }
+                .tint(.blue)
+            }
+            .contextMenu {
+                if !entry.isDirectory {
+                    Button("Preview / Download", systemImage: "doc.text.magnifyingglass") {
+                        onPreviewFile(entry)
+                    }
+                }
+                Button("Rename", systemImage: "pencil") {
+                    onRenameEntry(entry, displayPath)
+                }
+                Button("Copy Path", systemImage: "doc.on.doc") {
+                    UIPasteboard.general.string = entry.path
+                    AppHaptics.notify(.success)
+                }
+                Divider()
+                Button("Delete", systemImage: "trash", role: .destructive) {
+                    onDeleteEntry(entry, displayPath)
+                }
+            }
+    }
+
+    @ViewBuilder
+    private func entryRow(_ entry: SFTPEntry) -> some View {
+        if entry.isDirectory {
+            NavigationLink(value: entry.path) {
+                entryLabelContent(entry)
+            }
+            .disabled(isMutating)
+        } else {
+            Button {
+                AppHaptics.impact(.light)
+                onPreviewFile(entry)
+            } label: {
+                entryLabelContent(entry)
+            }
+            .buttonStyle(.plain)
+            .disabled(isMutating)
+        }
+    }
+
+    private func entryLabelContent(_ entry: SFTPEntry) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: SFTPBrowserView.iconName(for: entry))
+                .font(.title3)
+                .foregroundStyle(entry.isDirectory ? palette.accent : Color.secondary)
+                .frame(width: 28, alignment: .center)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(entry.name)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                let subtitle = entrySubtitle(for: entry)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+
+            Spacer(minLength: 8)
+        }
+        .padding(.vertical, 2)
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private var stateOverlay: some View {
+        if isLoading && entries.isEmpty {
+            ProgressView("Loading directory…")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let loadError, entries.isEmpty {
+            ContentUnavailableView {
+                Label("Could Not Load Directory", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(loadError)
+            } actions: {
+                Button("Retry") {
+                    Task {
+                        if displayPath.isEmpty {
+                            await loadInitialDirectory()
+                        } else {
+                            await loadDirectory(path: displayPath, isRefresh: false)
+                        }
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(palette.accent)
+            }
+        } else if !isLoading && entries.isEmpty && !displayPath.isEmpty {
+            ContentUnavailableView {
+                Label("Empty Directory", systemImage: "folder")
+            } description: {
+                Text("There are no files in \(displayPath).")
+            }
+        } else if !isLoading && !entries.isEmpty && filteredEntries.isEmpty {
+            ContentUnavailableView.search(text: searchQuery)
+        }
+    }
+
+    private func breadcrumbBar(for path: String) -> some View {
+        let components = SFTPBrowserView.pathComponents(for: path)
+
+        return VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                if path != "/" {
+                    Button {
+                        AppHaptics.impact(.light)
+                        let parent = SFTPPath.parent(of: path)
+                        onNavigateToDirectory(parent)
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.turn.up.left")
+                                .font(.caption2.weight(.semibold))
+                            Text("..")
+                                .font(.system(.caption, design: .monospaced).weight(.semibold))
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .foregroundStyle(palette.accent)
+                        .background(
+                            palette.pillFill(for: palette.accent),
+                            in: Capsule()
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isMutating)
+                    .accessibilityLabel("Parent directory")
+                }
+
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 4) {
+                            ForEach(Array(components.enumerated()), id: \.element.path) { index, component in
+                                if index > 0 {
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(.tertiary)
+                                        .accessibilityHidden(true)
+                                }
+
+                                let isCurrent = component.path == path
+                                Button {
+                                    guard !isCurrent else { return }
+                                    AppHaptics.impact(.light)
+                                    onNavigateToDirectory(component.path)
+                                } label: {
+                                    Text(component.name)
+                                        .font(.system(.caption, design: .monospaced).weight(isCurrent ? .semibold : .regular))
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 5)
+                                        .foregroundStyle(isCurrent ? palette.accent : Color.primary)
+                                        .background(
+                                            isCurrent
+                                                ? palette.pillFill(for: palette.accent)
+                                                : Color.secondary.opacity(0.10),
+                                            in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(isCurrent || isMutating)
+                                .id(component.path)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    .onChange(of: path) { _, newPath in
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            proxy.scrollTo(newPath, anchor: .trailing)
+                        }
+                    }
+                    .onAppear {
+                        proxy.scrollTo(path, anchor: .trailing)
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .background(.bar)
+
+            Divider()
+        }
+    }
+
+    private func entrySubtitle(for entry: SFTPEntry) -> String {
+        var parts: [String] = []
+        if !entry.isDirectory {
+            parts.append(Self.byteFormatter.string(fromByteCount: Int64(clamping: entry.size)))
+        } else {
+            parts.append("Folder")
+        }
+        if entry.isSymlink {
+            parts.append("Symlink")
+        }
+        if let modifiedAt = entry.modifiedAt {
+            parts.append(Self.relativeDateFormatter.localizedString(for: modifiedAt, relativeTo: .now))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func loadInitialDirectory() async {
+        loadGeneration += 1
+        let generation = loadGeneration
+        isLoading = true
+        loadError = nil
+
+        do {
+            let resolved = try await connection.sftpResolvePath(".")
+            guard !Task.isCancelled, generation == loadGeneration else { return }
+            let listing = try await connection.sftpListDirectory(path: resolved)
+            guard !Task.isCancelled, generation == loadGeneration else { return }
+            loadedPath = resolved
+            entries = listing
+            isLoading = false
+            onResolvedRootPath(resolved)
+        } catch is CancellationError {
+            if generation == loadGeneration {
+                isLoading = false
+            }
+        } catch {
+            guard generation == loadGeneration else { return }
+            isLoading = false
+            loadError = error.localizedDescription
+        }
+    }
+
+    private func loadDirectory(path: String, isRefresh: Bool) async {
+        loadGeneration += 1
+        let generation = loadGeneration
+        let targetPath = path.isEmpty ? "/" : path
+
+        if !isRefresh {
+            loadedPath = targetPath
+            entries = []
+        }
+        isLoading = true
+        loadError = nil
+
+        do {
+            let listing = try await connection.sftpListDirectory(path: targetPath)
+            guard !Task.isCancelled, generation == loadGeneration else { return }
+            loadedPath = targetPath
+            entries = listing
+            isLoading = false
+        } catch is CancellationError {
+            if generation == loadGeneration {
+                isLoading = false
+            }
+        } catch {
+            guard generation == loadGeneration else { return }
+            isLoading = false
+            if isRefresh && !entries.isEmpty {
+                onActionError(error.localizedDescription)
+            } else {
+                loadError = error.localizedDescription
+            }
+        }
+    }
+}
+
 /// Lightweight `FileDocument` wrapper for exporting downloaded SFTP data via `.fileExporter`.
 struct SFTPExportDocument: FileDocument {
     static let readableContentTypes: [UTType] = [.data]
@@ -594,9 +764,10 @@ struct SFTPExportDocument: FileDocument {
     }
 }
 
-/// File detail / text preview / export sheet opened when tapping a remote file in `SFTPBrowserView`.
+/// File detail / image & text preview / export sheet opened when tapping a remote file in `SFTPBrowserView`.
 private struct SFTPFileDetailSheet: View {
-    private static let previewByteLimit: UInt64 = 512 * 1024
+    private static let textPreviewByteLimit: UInt64 = 512 * 1024
+    private static let imagePreviewByteLimit: UInt64 = 5 * 1024 * 1024
 
     let entry: SFTPEntry
     let connection: SSHConnection
@@ -605,6 +776,7 @@ private struct SFTPFileDetailSheet: View {
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
 
     @State private var downloadedData: Data?
+    @State private var previewImage: UIImage?
     @State private var previewText: String?
     @State private var isLoadingPreview = false
     @State private var isDownloadingForExport = false
@@ -616,7 +788,11 @@ private struct SFTPFileDetailSheet: View {
     @State private var didStartInitialLoad = false
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
-    private var canPreviewInline: Bool { entry.size <= Self.previewByteLimit }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
+    private var fileExtension: String { URL(fileURLWithPath: entry.name).pathExtension.lowercased() }
+    private var isImageFile: Bool { SFTPBrowserView.imageExtensions.contains(fileExtension) }
+    private var previewByteLimit: UInt64 { isImageFile ? Self.imagePreviewByteLimit : Self.textPreviewByteLimit }
+    private var canPreviewInline: Bool { entry.size <= previewByteLimit }
 
     private static let byteFormatter: ByteCountFormatter = {
         let formatter = ByteCountFormatter()
@@ -627,7 +803,9 @@ private struct SFTPFileDetailSheet: View {
     var body: some View {
         NavigationStack {
             Group {
-                if let previewText {
+                if let previewImage {
+                    imagePreviewContent(previewImage)
+                } else if let previewText {
                     textPreviewContent(previewText)
                 } else {
                     metadataView
@@ -684,6 +862,36 @@ private struct SFTPFileDetailSheet: View {
                 case .failure(let error):
                     errorMessage = "Export failed: \(error.localizedDescription)"
                 }
+            }
+        }
+    }
+
+    private func imagePreviewContent(_ image: UIImage) -> some View {
+        VStack(spacing: 0) {
+            metadataBanner
+            Divider()
+            ScrollView {
+                VStack(spacing: 12) {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(maxWidth: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: ProDesign.Radius.innerCard, style: .continuous))
+                        .padding(14)
+                        .background(
+                            Color(red: 0x0E / 255.0, green: 0x10 / 255.0, blue: 0x15 / 255.0),
+                            in: RoundedRectangle(cornerRadius: ProDesign.Radius.card, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: ProDesign.Radius.card, style: .continuous)
+                                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+                        )
+
+                    Text("\(Int((image.size.width * image.scale).rounded())) × \(Int((image.size.height * image.scale).rounded())) px")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(16)
             }
         }
     }
@@ -766,7 +974,7 @@ private struct SFTPFileDetailSheet: View {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(errorMessage)
                             .font(.footnote)
-                            .foregroundStyle(.red)
+                            .foregroundStyle(palette.critical)
                         if canPreviewInline {
                             Button("Retry") {
                                 Task { await loadInlinePreview() }
@@ -780,7 +988,7 @@ private struct SFTPFileDetailSheet: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("Files larger than 512 KB are not previewed inline. Download to view or save to Files.")
+                    Text("Files larger than \(Self.byteFormatter.string(fromByteCount: Int64(previewByteLimit))) are not previewed inline. Download to view or save to Files.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
@@ -825,14 +1033,21 @@ private struct SFTPFileDetailSheet: View {
         do {
             let data = try await connection.sftpDownloadFile(
                 remotePath: entry.path,
-                maxBytes: Int(Self.previewByteLimit)
+                maxBytes: Int(previewByteLimit)
             )
             downloadedData = data
-            if !data.contains(0), let text = String(data: data, encoding: .utf8) {
+            if isImageFile, let image = UIImage(data: data) {
+                previewImage = image
+                previewText = nil
+            } else if !data.contains(0), let text = String(data: data, encoding: .utf8) {
+                previewImage = nil
                 previewText = text
             } else {
+                previewImage = nil
                 previewText = nil
             }
+        } catch is CancellationError {
+            return
         } catch {
             errorMessage = error.localizedDescription
         }

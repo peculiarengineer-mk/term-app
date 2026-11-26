@@ -21,6 +21,7 @@ struct DigitalOceanView: View {
 
     private var authState: CloudAuthState { CloudAuthState.shared }
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     @State private var tokenInput = ""
     @State private var isConnectingToken = false
@@ -340,32 +341,24 @@ struct DigitalOceanView: View {
     }
 
     private func dropletIcon(for droplet: DODroplet) -> some View {
-        ZStack(alignment: .bottomTrailing) {
-            SquircleIcon(
-                symbolName: "drop.fill",
-                tint: .blue,
-                fillOpacity: theme.isDark ? 0.22 : 0.14,
-                rimOpacity: 0.36
-            )
-
-            Circle()
-                .fill(Color(.secondarySystemGroupedBackground))
-                .frame(width: 12, height: 12)
-                .overlay(
-                    CloudStatusLED(color: ledColor(for: droplet.status), size: 8, glow: droplet.isActive)
-                )
-                .offset(x: 3, y: 3)
-        }
+        ProSquircleIcon(
+            symbolName: "drop.fill",
+            tint: .blue,
+            size: .row,
+            theme: theme,
+            statusLED: ledColor(for: droplet.status),
+            statusGlow: droplet.isActive
+        )
     }
 
     private func ledColor(for status: String) -> Color {
         switch status.lowercased() {
         case "active":
-            return .green
+            palette.healthy
         case "new":
-            return .orange
+            palette.warning
         default:
-            return .gray
+            palette.neutral
         }
     }
 

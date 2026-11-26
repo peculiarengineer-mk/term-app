@@ -77,6 +77,16 @@ final class LiveSession: Identifiable {
     @ObservationIgnored private var outputTailData = Data()
     @ObservationIgnored nonisolated(unsafe) private var completionDebounceTask: Task<Void, Never>?
     @ObservationIgnored private var visibleTerminalCount = 0
+    @ObservationIgnored private var suppressedDirectInputCount = 0
+
+    /// True while a modal tool sheet, switcher, or security sheet covers this session's terminal.
+    var hasModalSheetPresented = false
+    /// True while an inline popover/fallback sheet inside `TerminalPane` or `AITerminalControlsOverlay` is presented.
+    var hasInlineModalPresented = false
+    /// Incremented whenever direct keyboard/bar input (not quick actions) is sent on `bridge`.
+    private(set) var directInputSequence: UInt64 = 0
+    /// Incremented when the user taps or refocuses the terminal viewport.
+    private(set) var terminalFocusSequence: UInt64 = 0
 
     private static let maxOutputTailBytes = 2048
     private static let completionDebounceDuration: Duration = .seconds(4)
@@ -86,7 +96,7 @@ final class LiveSession: Identifiable {
     }
 
     var isTerminalVisible: Bool {
-        visibleTerminalCount > 0
+        visibleTerminalCount > 0 && !hasModalSheetPresented && !hasInlineModalPresented
     }
 
     private var activityAgentName: String {
@@ -133,9 +143,24 @@ final class LiveSession: Identifiable {
         visibleTerminalCount = max(0, visibleTerminalCount - 1)
     }
 
+    /// Signals that the user interacted with or refocused the terminal viewport.
+    func recordTerminalFocusInteraction() {
+        terminalFocusSequence &+= 1
+    }
+
+    /// Sends quick-action deck bytes without treating them as direct terminal keyboard typing.
+    func sendQuickAction(_ bytes: [UInt8]) {
+        guard !bytes.isEmpty else { return }
+        if bridge.onUserInput != nil {
+            suppressedDirectInputCount += 1
+        }
+        bridge.send(bytes)
+    }
+
     func cleanupActivityTracking() {
         completionDebounceTask?.cancel()
         completionDebounceTask = nil
+        suppressedDirectInputCount = 0
         outputTailData.removeAll(keepingCapacity: false)
         bridge.onOutputChunk = nil
         bridge.onUserInput = nil
@@ -160,6 +185,9 @@ final class LiveSession: Identifiable {
                   self.bridge === targetBridge else {
                 return
             }
+            if targetBridge.onUserInput != nil {
+                self.suppressedDirectInputCount += 1
+            }
             targetBridge.send(Array((command + "\r").utf8))
         }
     }
@@ -170,6 +198,8 @@ final class LiveSession: Identifiable {
         self.algorithms = algorithms
         connectionStatus = .connected
         quantumNoticeDismissed = false
+        hasModalSheetPresented = false
+        hasInlineModalPresented = false
         agentActivityState = .idle
         attachActivityObservers(to: bridge)
     }
@@ -231,6 +261,12 @@ final class LiveSession: Identifiable {
     private func handleUserInput(_ bytes: [UInt8]) {
         guard !bytes.isEmpty, !Self.isTerminalQueryResponse(bytes) else { return }
 
+        if suppressedDirectInputCount > 0 {
+            suppressedDirectInputCount -= 1
+        } else {
+            directInputSequence &+= 1
+        }
+
         outputTailData.removeAll(keepingCapacity: true)
         completionDebounceTask?.cancel()
         completionDebounceTask = nil
@@ -288,6 +324,8 @@ final class LiveSession: Identifiable {
 @MainActor @Observable
 final class SessionManager {
     private(set) var sessions: [LiveSession] = []
+    private(set) var pendingMergeBackSessionID: UUID?
+    private(set) var pendingNewTabRequestID: UUID?
     var onSessionsChanged: (() -> Void)?
 
     func session(id: UUID) -> LiveSession? { sessions.first { $0.id == id } }
@@ -376,6 +414,30 @@ final class SessionManager {
 
     /// Detaches the session from its window (it is about to be shown elsewhere).
     func detach(_ id: UUID) { session(id: id)?.windowID = nil }
+
+    /// Detaches `id` from a secondary window and queues it to reopen in the main window's tab bar.
+    func requestMergeBack(_ id: UUID) {
+        guard session(id: id) != nil else { return }
+        detach(id)
+        pendingMergeBackSessionID = id
+    }
+
+    /// Returns and clears any pending merge-back session ID for the main window.
+    func consumePendingMergeBackSessionID() -> UUID? {
+        defer { pendingMergeBackSessionID = nil }
+        return pendingMergeBackSessionID
+    }
+
+    /// Requests that the main window switch to the Hosts tab for a new connection (e.g. Cmd+T from a secondary window).
+    func requestNewTabInMainWindow() {
+        pendingNewTabRequestID = UUID()
+    }
+
+    /// Returns and clears any pending new-tab navigation request for the main window.
+    func consumePendingNewTabRequestID() -> UUID? {
+        defer { pendingNewTabRequestID = nil }
+        return pendingNewTabRequestID
+    }
 
     /// Swaps the connection and bridge in place (same id); views keyed by the bridge follow.
     /// The previous connection is closed.

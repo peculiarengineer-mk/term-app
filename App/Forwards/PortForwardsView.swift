@@ -34,32 +34,40 @@ struct PortForwardsView: View {
 
     @State private var savedRules: [SavedPortForward] = []
     @State private var activeForwards: [ActivePortForward] = []
+    @State private var isLoading = true
     @State private var busyRuleIDs: Set<UUID> = []
     @State private var editorTarget: EditorTarget?
     @State private var errorMessage: String?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     private var activeByID: [UUID: ActivePortForward] {
         Dictionary(uniqueKeysWithValues: activeForwards.map { ($0.id, $0) })
     }
 
-    private var sortedActiveForwards: [ActivePortForward] {
-        activeForwards.sorted { lhs, rhs in
-            let leftName = displayTitle(for: lhs.rule)
-            let rightName = displayTitle(for: rhs.rule)
-            let cmp = leftName.localizedCaseInsensitiveCompare(rightName)
-            if cmp != .orderedSame { return cmp == .orderedAscending }
-            return lhs.boundLocalPort < rhs.boundLocalPort
-        }
+    private var savedRuleIDs: Set<UUID> {
+        Set(savedRules.map(\.id))
+    }
+
+    private var sortedAdHocActiveForwards: [ActivePortForward] {
+        activeForwards
+            .filter { !savedRuleIDs.contains($0.id) }
+            .sorted { lhs, rhs in
+                let leftName = displayTitle(for: lhs.rule)
+                let rightName = displayTitle(for: rhs.rule)
+                let cmp = leftName.localizedCaseInsensitiveCompare(rightName)
+                if cmp != .orderedSame { return cmp == .orderedAscending }
+                return lhs.boundLocalPort < rhs.boundLocalPort
+            }
     }
 
     var body: some View {
         NavigationStack {
             List {
-                if !sortedActiveForwards.isEmpty {
-                    Section("Active Forwards") {
-                        ForEach(sortedActiveForwards) { active in
+                if !sortedAdHocActiveForwards.isEmpty {
+                    Section("Active Tunnels") {
+                        ForEach(sortedAdHocActiveForwards) { active in
                             activeForwardRow(active)
                         }
                     }
@@ -75,7 +83,10 @@ struct PortForwardsView: View {
             }
             .listStyle(.insetGrouped)
             .overlay {
-                if sortedActiveForwards.isEmpty && savedRules.isEmpty {
+                if isLoading && activeForwards.isEmpty && savedRules.isEmpty {
+                    ProgressView("Loading Port Forwards…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if !isLoading && sortedAdHocActiveForwards.isEmpty && savedRules.isEmpty {
                     ContentUnavailableView {
                         Label("No Port Forwards", systemImage: "arrow.left.arrow.right")
                     } description: {
@@ -86,6 +97,7 @@ struct PortForwardsView: View {
                             editorTarget = .new
                         }
                         .buttonStyle(.borderedProminent)
+                        .tint(palette.accent)
                     }
                 }
             }
@@ -99,13 +111,16 @@ struct PortForwardsView: View {
                     Button("Done") { dismiss() }
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .bottomBar) {
                     Button {
                         AppHaptics.impact(.light)
                         editorTarget = .new
                     } label: {
-                        Label("New Port Forward", systemImage: "plus")
+                        Label("Add Forward", systemImage: "plus.circle.fill")
+                            .fontWeight(.semibold)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(palette.accent)
                 }
             }
             .task {
@@ -116,7 +131,7 @@ struct PortForwardsView: View {
                     Task { await handleSavedRule(saved, previous: target.existingRule) }
                 }
                 .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                .tint(theme.accentColor)
+                .tint(palette.accent)
             }
             .alert(
                 "Port Forward Error",
@@ -130,17 +145,15 @@ struct PortForwardsView: View {
                 Text(errorMessage ?? "")
             }
         }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 
     private func activeForwardRow(_ active: ActivePortForward) -> some View {
         let isBusy = busyRuleIDs.contains(active.id)
         return VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 8, height: 8)
-                    .shadow(color: Color.green.opacity(0.65), radius: 3)
-                    .accessibilityHidden(true)
+                ProStatusLED(color: palette.healthy, size: 8, glow: true)
 
                 Text(displayTitle(for: active.rule))
                     .font(.headline)
@@ -196,11 +209,7 @@ struct PortForwardsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     if isRunning {
-                        Circle()
-                            .fill(Color.green)
-                            .frame(width: 7, height: 7)
-                            .shadow(color: Color.green.opacity(0.65), radius: 3)
-                            .accessibilityHidden(true)
+                        ProStatusLED(color: palette.healthy, size: 7, glow: true)
                     }
 
                     Text(rule.displayTitle)
@@ -212,9 +221,9 @@ struct PortForwardsView: View {
                             .font(.caption2.weight(.semibold))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)
-                            .foregroundStyle(theme.accentColor)
+                            .foregroundStyle(palette.accent)
                             .background(
-                                theme.accentColor.opacity(theme.isDark ? 0.18 : 0.12),
+                                palette.pillFill(for: palette.accent),
                                 in: Capsule()
                             )
                     }
@@ -228,28 +237,42 @@ struct PortForwardsView: View {
 
             Spacer(minLength: 8)
 
-            Button {
-                AppHaptics.impact(.light)
-                Task {
-                    if isRunning {
-                        await stopForward(id: rule.id)
+            HStack(spacing: 8) {
+                if let url = active?.localURL {
+                    Button {
+                        AppHaptics.impact(.light)
+                        openURL(url)
+                    } label: {
+                        Image(systemName: "safari")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel("Open in Safari")
+                }
+
+                Button {
+                    AppHaptics.impact(.light)
+                    Task {
+                        if isRunning {
+                            await stopForward(id: rule.id)
+                        } else {
+                            await startForward(from: rule)
+                        }
+                    }
+                } label: {
+                    if isBusy {
+                        ProgressView()
+                            .controlSize(.small)
                     } else {
-                        await startForward(from: rule)
+                        Text(isRunning ? "Stop" : "Start")
+                            .fontWeight(.medium)
                     }
                 }
-            } label: {
-                if isBusy {
-                    ProgressView()
-                        .controlSize(.small)
-                } else {
-                    Text(isRunning ? "Stop" : "Start")
-                        .fontWeight(.medium)
-                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(isRunning ? palette.critical : palette.accent)
+                .disabled(isBusy)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .tint(isRunning ? .red : theme.accentColor)
-            .disabled(isBusy)
         }
         .padding(.vertical, 2)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
@@ -308,6 +331,7 @@ struct PortForwardsView: View {
     private func reload() async {
         savedRules = PortForwardStore.list(for: hostID)
         activeForwards = await connection.activePortForwards()
+        isLoading = false
     }
 
     private func startForward(from rule: SavedPortForward) async {

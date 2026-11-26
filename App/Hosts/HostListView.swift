@@ -110,15 +110,6 @@ struct QuickConnectTarget: Equatable, Sendable {
 }
 
 struct HostListView: View {
-    private enum SectionTab: String, CaseIterable, Identifiable {
-        case hosts = "Hosts"
-        case agents = "Agents"
-
-        var id: String { rawValue }
-    }
-
-    private static let quickConnectAmber = TerminalTheme.appleProDark.accentColor
-
     @Environment(\.modelContext) private var context
     @Environment(SessionManager.self) private var manager
     @Environment(ProStore.self) private var proStore
@@ -127,7 +118,6 @@ struct HostListView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @Query(sort: \Host.label) private var hosts: [Host]
-    @State private var selectedSection: SectionTab = .hosts
     @State private var search = ""
     @State private var selectedTag: String?
     @State private var editing: Host?
@@ -135,9 +125,11 @@ struct HostListView: View {
     @State private var importingConfig = false
     @State private var agentLaunchHost: Host?
     @State private var showingPaywall = false
+    @State private var deletingHost: Host?
     @State private var deleteError: String?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     private var quickConnectTarget: QuickConnectTarget? {
         QuickConnectTarget.parse(search)
@@ -180,52 +172,41 @@ struct HostListView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            sectionPickerBar
-
-            switch selectedSection {
-            case .hosts:
-                hostsContent
-            case .agents:
-                AgentsDashboardView()
+        hostsContent
+            .navigationTitle("Hosts")
+            .sheet(isPresented: $adding) { NavigationStack { HostEditorView(host: nil) } }
+            .sheet(isPresented: $importingConfig) { SSHConfigImportView() }
+            .sheet(item: $editing) { host in NavigationStack { HostEditorView(host: host) } }
+            .sheet(item: $agentLaunchHost) { host in
+                LaunchAIAgentSheet(initialHost: host)
+                    .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                    .tint(palette.accent)
             }
-        }
-        .navigationTitle(selectedSection == .hosts ? "Hosts" : "Agents")
-        .sheet(isPresented: $adding) { NavigationStack { HostEditorView(host: nil) } }
-        .sheet(isPresented: $importingConfig) { SSHConfigImportView() }
-        .sheet(item: $editing) { host in NavigationStack { HostEditorView(host: host) } }
-        .sheet(item: $agentLaunchHost) { host in
-            LaunchAIAgentSheet(initialHost: host)
-                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                .tint(theme.accentColor)
-        }
-        .sheet(isPresented: $showingPaywall) {
-            ProPaywallView()
-                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                .tint(theme.accentColor)
-        }
-        .alert("Error", isPresented: Binding(get: { deleteError != nil }, set: { if !$0 { deleteError = nil } })) {
-            Button("OK") {}
-        } message: { Text(deleteError ?? "") }
-    }
-
-    private var sectionPickerBar: some View {
-        VStack(spacing: 0) {
-            Picker("Section", selection: $selectedSection) {
-                ForEach(SectionTab.allCases) { tab in
-                    Text(tab.rawValue).tag(tab)
+            .sheet(isPresented: $showingPaywall) {
+                ProPaywallView()
+                    .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                    .tint(palette.accent)
+            }
+            .alert("Error", isPresented: Binding(get: { deleteError != nil }, set: { if !$0 { deleteError = nil } })) {
+                Button("OK") {}
+            } message: { Text(deleteError ?? "") }
+            .confirmationDialog(
+                "Delete host?",
+                isPresented: Binding(
+                    get: { deletingHost != nil },
+                    set: { if !$0 { deletingHost = nil } }
+                ),
+                titleVisibility: .visible,
+                presenting: deletingHost
+            ) { host in
+                Button("Delete Host", role: .destructive) {
+                    delete(host)
                 }
+                Button("Cancel", role: .cancel) {}
+            } message: { host in
+                let name = host.label.isEmpty ? host.hostname : host.label
+                Text("Deleting \"\(name)\" will also remove its saved password, port-forward rules, and project presets.")
             }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .onChange(of: selectedSection) { _, _ in
-                AppHaptics.impact(.light)
-            }
-
-            Divider()
-        }
-        .background(.bar)
     }
 
     private var hostsContent: some View {
@@ -255,6 +236,7 @@ struct HostListView: View {
                 }
             }
         }
+        .listStyle(.insetGrouped)
         .safeAreaInset(edge: .top, spacing: 0) {
             if !allTags.isEmpty {
                 tagFilterBar
@@ -263,11 +245,28 @@ struct HostListView: View {
         .overlay {
             if quickConnectTarget == nil {
                 if hosts.isEmpty {
-                    ContentUnavailableView(
-                        "No hosts",
-                        systemImage: "server.rack",
-                        description: Text("Tap + to add a host.")
-                    )
+                    ContentUnavailableView {
+                        Label("No Hosts", systemImage: "server.rack")
+                    } description: {
+                        Text("Add an SSH server manually or import your existing ~/.ssh/config.")
+                    } actions: {
+                        Button {
+                            AppHaptics.impact(.light)
+                            adding = true
+                        } label: {
+                            Label("Add Host", systemImage: "plus")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(palette.accent)
+
+                        Button {
+                            AppHaptics.impact(.light)
+                            importingConfig = true
+                        } label: {
+                            Label("Import ~/.ssh/config", systemImage: "doc.text")
+                        }
+                        .buttonStyle(.bordered)
+                    }
                 } else if filtered.isEmpty {
                     ContentUnavailableView(
                         "No matching hosts",
@@ -306,11 +305,11 @@ struct HostListView: View {
             connectHost?(ephemeral)
         } label: {
             HStack(spacing: 12) {
-                SquircleIcon(
+                ProSquircleIcon(
                     symbolName: "terminal.fill",
-                    tint: Self.quickConnectAmber,
-                    fillOpacity: theme.isDark ? 0.20 : 0.14,
-                    rimOpacity: 0.36
+                    tint: palette.proBrandAmber,
+                    size: .row,
+                    theme: theme
                 )
 
                 VStack(alignment: .leading, spacing: 2) {
@@ -327,7 +326,7 @@ struct HostListView: View {
 
                 Image(systemName: "arrow.right.circle.fill")
                     .font(.title3)
-                    .foregroundStyle(Self.quickConnectAmber)
+                    .foregroundStyle(palette.proBrandAmber)
                     .accessibilityHidden(true)
             }
             .padding(.vertical, 4)
@@ -365,16 +364,16 @@ struct HostListView: View {
                 .font(.caption.weight(isSelected ? .semibold : .medium))
                 .padding(.horizontal, 12)
                 .padding(.vertical, 6)
-                .foregroundStyle(isSelected ? theme.accentColor : Color.primary)
+                .foregroundStyle(isSelected ? palette.accent : Color.primary)
                 .background(
                     isSelected
-                        ? theme.accentColor.opacity(theme.isDark ? 0.22 : 0.16)
+                        ? palette.pillFill(for: palette.accent)
                         : Color.secondary.opacity(0.12),
                     in: Capsule()
                 )
                 .overlay(
                     Capsule()
-                        .strokeBorder(isSelected ? theme.accentColor.opacity(0.55) : Color.clear, lineWidth: 1)
+                        .strokeBorder(isSelected ? palette.accent.opacity(0.55) : Color.clear, lineWidth: 1)
                 )
         }
         .buttonStyle(.plain)
@@ -384,6 +383,7 @@ struct HostListView: View {
     private func hostRow(_ host: Host, liveSessions: [LiveSession]) -> some View {
         let tags = normalizedTags(for: host)
         let status = aggregateStatus(for: liveSessions)
+        let activityState = prioritizedAgentActivityState(for: liveSessions)
 
         return Button {
             AppHaptics.impact(.light)
@@ -397,9 +397,16 @@ struct HostListView: View {
                 HostEnvironmentIcon(host: host)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(host.label.isEmpty ? host.hostname : host.label)
-                        .font(.headline)
-                        .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+                    HStack(spacing: 6) {
+                        Text(host.label.isEmpty ? host.hostname : host.label)
+                            .font(.headline)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+
+                        if activityState != .idle {
+                            AgentActivityBadge(state: activityState)
+                                .fixedSize()
+                        }
+                    }
 
                     Text(connectionSubtitle(for: host))
                         .font(.system(.caption, design: .monospaced))
@@ -444,7 +451,7 @@ struct HostListView: View {
                 openAIAgentLauncher(for: host)
             }
             Button("Edit", systemImage: "pencil") { editing = host }
-            Button("Delete", systemImage: "trash", role: .destructive) { delete(host) }
+            Button("Delete", systemImage: "trash", role: .destructive) { deletingHost = host }
         }
         .swipeActions(edge: .leading, allowsFullSwipe: false) {
             Button {
@@ -453,7 +460,7 @@ struct HostListView: View {
             } label: {
                 Label("New Session", systemImage: "plus.rectangle.on.rectangle")
             }
-            .tint(.green)
+            .tint(palette.healthy)
 
             Button {
                 AppHaptics.impact(.light)
@@ -461,12 +468,28 @@ struct HostListView: View {
             } label: {
                 Label("AI Agent", systemImage: "sparkles")
             }
-            .tint(Self.quickConnectAmber)
+            .tint(palette.proBrandAmber)
         }
-        .swipeActions(edge: .trailing) {
-            Button(role: .destructive) { delete(host) } label: { Label("Delete", systemImage: "trash") }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) { deletingHost = host } label: { Label("Delete", systemImage: "trash") }
             Button { editing = host } label: { Label("Edit", systemImage: "pencil") }.tint(.blue)
         }
+    }
+
+    private func prioritizedAgentActivityState(for sessions: [LiveSession]) -> AgentActivityState {
+        if let approval = sessions.first(where: {
+            if case .waitingForApproval = $0.agentActivityState { return true }
+            return false
+        }) {
+            return approval.agentActivityState
+        }
+        if sessions.contains(where: { $0.agentActivityState == .running }) {
+            return .running
+        }
+        if sessions.contains(where: { $0.agentActivityState == .completed }) {
+            return .completed
+        }
+        return .idle
     }
 
     private func statusIndicator(
@@ -498,9 +521,9 @@ struct HostListView: View {
 
     private func statusColor(for status: LiveSession.ConnectionStatus) -> Color {
         switch status {
-        case .connected: .green
-        case .reconnecting: .orange
-        case .disconnected: .red
+        case .connected: palette.healthy
+        case .reconnecting: palette.warning
+        case .disconnected: palette.critical
         }
     }
 
@@ -561,6 +584,7 @@ struct HostListView: View {
     }
 
     private func delete(_ host: Host) {
+        deletingHost = nil
         let hostID = host.id
         context.delete(host)
         do {
@@ -568,6 +592,7 @@ struct HostListView: View {
             HostSecrets.deletePassword(for: hostID)
             PortForwardStore.deleteAll(for: hostID)
             HostProjectStore.deleteAll(for: hostID)
+            AppHaptics.notify(.warning)
         } catch {
             context.rollback()
             deleteError = "Could not delete host: \(error.localizedDescription)"

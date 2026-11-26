@@ -39,6 +39,7 @@ struct GitDiffInspectorSheet: View {
     }
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     private var diffsByPath: [String: GitFileDiff] {
         guard let snapshot else { return [:] }
@@ -118,12 +119,19 @@ struct GitDiffInspectorSheet: View {
                         )
                     }
                     .disabled((snapshot?.rawDiff.isEmpty ?? true) || isLoading)
+                }
 
-                    Button("Commit All…") {
+                ToolbarItem(placement: .bottomBar) {
+                    Button {
                         AppHaptics.impact(.light)
                         commitError = nil
                         showingCommitSheet = true
+                    } label: {
+                        Label("Commit All…", systemImage: "checkmark.circle.fill")
+                            .fontWeight(.semibold)
                     }
+                    .buttonStyle(.borderedProminent)
+                    .tint(palette.accent)
                     .disabled(!canCommit)
                 }
             }
@@ -176,7 +184,7 @@ struct GitDiffInspectorSheet: View {
             HStack(spacing: 8) {
                 Image(systemName: "folder.fill")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(AgentVisuals.appleProAmber)
+                    .foregroundStyle(palette.accent)
                     .accessibilityHidden(true)
 
                 TextField("Repository path (e.g. ~/projects/app)", text: $directoryInput)
@@ -196,7 +204,7 @@ struct GitDiffInspectorSheet: View {
                     .font(.caption.weight(.semibold))
                     .buttonStyle(.borderedProminent)
                     .controlSize(.mini)
-                    .tint(AgentVisuals.appleProAmber)
+                    .tint(palette.accent)
                     .disabled(isLoading || isMutating)
                 } else if isLoading {
                     ProgressView()
@@ -221,20 +229,20 @@ struct GitDiffInspectorSheet: View {
                         .font(.system(.caption, design: .monospaced).weight(.semibold))
                         .lineLimit(1)
                 }
-                .foregroundStyle(AgentVisuals.appleProAmber)
+                .foregroundStyle(palette.accent)
                 .padding(.horizontal, 9)
                 .padding(.vertical, 5)
                 .background(
-                    AgentVisuals.appleProAmber.opacity(theme.isDark ? 0.18 : 0.12),
+                    palette.pillFill(for: palette.accent),
                     in: Capsule()
                 )
 
                 if totalAdditions > 0 || totalDeletions > 0 {
                     HStack(spacing: 6) {
                         Text("+\(totalAdditions)")
-                            .foregroundStyle(.green)
+                            .foregroundStyle(palette.healthy)
                         Text("-\(totalDeletions)")
-                            .foregroundStyle(.red)
+                            .foregroundStyle(palette.critical)
                     }
                     .font(.system(.caption, design: .monospaced).weight(.semibold))
                 }
@@ -306,18 +314,18 @@ struct GitDiffInspectorSheet: View {
                                 HStack(spacing: 5) {
                                     if matchingDiff.additions > 0 {
                                         Text("+\(matchingDiff.additions)")
-                                            .foregroundStyle(.green)
+                                            .foregroundStyle(palette.healthy)
                                     }
                                     if matchingDiff.deletions > 0 {
                                         Text("-\(matchingDiff.deletions)")
-                                            .foregroundStyle(.red)
+                                            .foregroundStyle(palette.critical)
                                     }
                                 }
                                 .font(.system(.caption, design: .monospaced).weight(.semibold))
                             } else if file.isUntracked {
                                 Text("New")
                                     .font(.caption2.weight(.semibold))
-                                    .foregroundStyle(.green)
+                                    .foregroundStyle(palette.healthy)
                             }
 
                             Image(systemName: matchingDiff != nil ? "arrow.down.to.line.compact" : "chevron.right")
@@ -340,6 +348,14 @@ struct GitDiffInspectorSheet: View {
                             .padding(.leading, 34)
                     }
                 }
+                .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                    Button {
+                        insertPathInPrompt(file.path)
+                    } label: {
+                        Label("Prompt", systemImage: "text.badge.plus")
+                    }
+                    .tint(palette.accent)
+                }
                 .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                     Button(role: .destructive) {
                         discardingFile = file
@@ -355,6 +371,9 @@ struct GitDiffInspectorSheet: View {
                                 scrollProxy.scrollTo(diffAnchorID(for: file.path), anchor: .top)
                             }
                         }
+                    }
+                    Button("Insert Path in Agent Prompt", systemImage: "text.badge.plus") {
+                        insertPathInPrompt(file.path)
                     }
                     Button("Copy Path", systemImage: "doc.on.doc") {
                         UIPasteboard.general.string = file.path
@@ -419,11 +438,11 @@ struct GitDiffInspectorSheet: View {
                     HStack(spacing: 5) {
                         if fileDiff.additions > 0 {
                             Text("+\(fileDiff.additions)")
-                                .foregroundStyle(.green)
+                                .foregroundStyle(palette.healthy)
                         }
                         if fileDiff.deletions > 0 {
                             Text("-\(fileDiff.deletions)")
-                                .foregroundStyle(.red)
+                                .foregroundStyle(palette.critical)
                         }
                     }
                     .font(.system(.caption2, design: .monospaced).weight(.semibold))
@@ -431,6 +450,15 @@ struct GitDiffInspectorSheet: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .contextMenu {
+                Button("Insert Path in Agent Prompt", systemImage: "text.badge.plus") {
+                    insertPathInPrompt(fileDiff.path)
+                }
+                Button("Copy Path", systemImage: "doc.on.doc") {
+                    UIPasteboard.general.string = fileDiff.path
+                    AppHaptics.notify(.success)
+                }
+            }
 
             if isExpanded {
                 diffLinesBlock(fileDiff.lines)
@@ -441,7 +469,7 @@ struct GitDiffInspectorSheet: View {
 
     private func diffLinesBlock(_ lines: [GitDiffLine]) -> some View {
         ScrollView(.horizontal, showsIndicators: true) {
-            VStack(alignment: .leading, spacing: 0) {
+            LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(lines) { line in
                     Text(line.text.isEmpty ? " " : line.text)
                         .font(.system(.caption2, design: .monospaced))
@@ -455,13 +483,13 @@ struct GitDiffInspectorSheet: View {
             .textSelection(.enabled)
         }
         .background(
-            theme.isDark ? Color.black.opacity(0.32) : Color.black.opacity(0.03),
+            palette.isDark ? Color.black.opacity(0.32) : Color.black.opacity(0.03),
             in: RoundedRectangle(cornerRadius: 8, style: .continuous)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(
-                    theme.isDark ? Color.white.opacity(0.10) : Color.black.opacity(0.10),
+                    palette.borderSubtle,
                     lineWidth: 0.75
                 )
         )
@@ -475,23 +503,23 @@ struct GitDiffInspectorSheet: View {
             .frame(minWidth: 24)
             .padding(.horizontal, 4)
             .padding(.vertical, 3)
-            .background(tint.opacity(theme.isDark ? 0.20 : 0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .background(palette.badgeFill(for: tint), in: RoundedRectangle(cornerRadius: ProDesign.Radius.tagChip, style: .continuous))
     }
 
     private func badgeColor(for file: GitChangedFile) -> Color {
         switch file.displayBadge {
-        case "A", "??": .green
-        case "D": .red
-        case "R": .cyan
-        default: AgentVisuals.appleProAmber
+        case "A", "??": palette.healthy
+        case "D": palette.critical
+        case "R": palette.running
+        default: palette.accent
         }
     }
 
     private func diffLineForeground(for kind: GitDiffLineKind) -> Color {
         switch kind {
-        case .added: .green
-        case .removed: .red
-        case .hunk: .cyan
+        case .added: palette.healthy
+        case .removed: palette.critical
+        case .hunk: palette.running
         case .header: .secondary
         case .context: .primary
         }
@@ -499,10 +527,10 @@ struct GitDiffInspectorSheet: View {
 
     private func diffLineBackground(for kind: GitDiffLineKind) -> Color {
         switch kind {
-        case .added: Color.green.opacity(theme.isDark ? 0.16 : 0.11)
-        case .removed: Color.red.opacity(theme.isDark ? 0.16 : 0.11)
-        case .hunk: Color.cyan.opacity(theme.isDark ? 0.14 : 0.09)
-        case .header: Color.secondary.opacity(theme.isDark ? 0.10 : 0.06)
+        case .added: palette.healthy.opacity(palette.isDark ? 0.16 : 0.11)
+        case .removed: palette.critical.opacity(palette.isDark ? 0.16 : 0.11)
+        case .hunk: palette.running.opacity(palette.isDark ? 0.14 : 0.09)
+        case .header: Color.secondary.opacity(palette.isDark ? 0.10 : 0.06)
         case .context: .clear
         }
     }
@@ -534,7 +562,7 @@ struct GitDiffInspectorSheet: View {
                     Task { await reloadSnapshot(preserveExpansions: false) }
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(AgentVisuals.appleProAmber)
+                .tint(palette.accent)
             }
         } else if let snapshot, !snapshot.isGitRepo {
             ContentUnavailableView {
@@ -606,7 +634,8 @@ struct GitDiffInspectorSheet: View {
                 }
             }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 
     // MARK: - Actions
@@ -625,6 +654,10 @@ struct GitDiffInspectorSheet: View {
         let next = normalizedDirectory(directoryInput)
         directoryInput = next
         activeDirectory = next
+        snapshot = nil
+        expandedDiffPaths = []
+        expandedUntrackedPaths = []
+        loadError = nil
         Task { await reloadSnapshot(preserveExpansions: false) }
     }
 
@@ -663,12 +696,25 @@ struct GitDiffInspectorSheet: View {
         } catch {
             guard generation == loadGeneration else { return }
             isLoading = false
-            if snapshot != nil {
-                actionError = error.localizedDescription
-            } else {
+            if !preserveExpansions || snapshot == nil {
+                snapshot = nil
                 loadError = error.localizedDescription
+            } else {
+                actionError = error.localizedDescription
             }
         }
+    }
+
+    private func insertPathInPrompt(_ path: String) {
+        live.aiPromptDraft = RemoteAttachmentHelper.promptInsertion(
+            forRemotePath: path,
+            existingPrompt: live.aiPromptDraft
+        )
+        if !live.showAIAgentControls {
+            live.showAIAgentControls = true
+        }
+        AppHaptics.notify(.success)
+        dismiss()
     }
 
     private func defaultExpandedPaths(for diffs: [GitFileDiff]) -> Set<String> {
