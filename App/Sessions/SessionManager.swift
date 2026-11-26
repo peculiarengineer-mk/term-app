@@ -151,12 +151,14 @@ final class LiveSession: Identifiable {
     /// Controls visibility of the docked mobile AI Quick-Action Bar & Prompt Composer.
     var showAIAgentControls: Bool {
         didSet {
+            guard showAIAgentControls != oldValue else { return }
             if showAIAgentControls {
-                AgentNotificationManager.shared.requestAuthorizationIfNeeded()
+                notificationManager.requestAuthorizationIfNeeded()
                 syncOutputTracking()
             } else if !isAgentActivityTracked {
                 syncOutputTracking()
                 outputTailData.removeAll(keepingCapacity: false)
+                resetTurnState()
                 agentActivityState = .idle
             }
         }
@@ -189,6 +191,18 @@ final class LiveSession: Identifiable {
     @ObservationIgnored nonisolated(unsafe) private var outputCoalescer: OutputChunkCoalescer?
     @ObservationIgnored private var visibleTerminalCount = 0
     @ObservationIgnored private var suppressedDirectInputCount = 0
+    @ObservationIgnored private var suppressedTurnArmCount = 0
+    @ObservationIgnored private var hasSubmittedUserTurn = false
+    @ObservationIgnored private var turnMeaningfulChars = 0
+    @ObservationIgnored private var hasNotifiedCompletionForTurn = false
+    @ObservationIgnored private var lastNotifiedApprovalPrompt: String?
+    @ObservationIgnored private var lastApprovalNotificationAt: Date?
+
+    @ObservationIgnored private let completionDebounceDuration: Duration
+    @ObservationIgnored private let outputCoalesceInterval: Duration
+    @ObservationIgnored private let approvalCooldownInterval: TimeInterval
+    @ObservationIgnored private let nowProvider: @Sendable () -> Date
+    @ObservationIgnored private let notificationManager: AgentNotificationManager
 
     /// True while a modal tool sheet, switcher, or security sheet covers this session's terminal.
     var hasModalSheetPresented = false
@@ -200,7 +214,10 @@ final class LiveSession: Identifiable {
     private(set) var terminalFocusSequence: UInt64 = 0
 
     private static let maxOutputTailBytes = 2048
-    private static let completionDebounceDuration: Duration = .seconds(4)
+    static let completionDebounceDuration: Duration = .seconds(12)
+    private static let minTurnMeaningfulCharsForCompletion = 24
+    private static let bracketedPasteStart: [UInt8] = [0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E]
+    private static let bracketedPasteEnd: [UInt8] = [0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E]
 
     var isAgentActivityTracked: Bool {
         aiAgentContext != nil || showAIAgentControls
@@ -224,7 +241,12 @@ final class LiveSession: Identifiable {
         ephemeralHost: Host? = nil,
         aiAgentContext: AIAgentLaunchContext? = nil,
         pendingLaunchCommand: String? = nil,
-        isTmuxBacked: Bool? = nil
+        isTmuxBacked: Bool? = nil,
+        completionDebounceDuration: Duration = LiveSession.completionDebounceDuration,
+        outputCoalesceInterval: Duration = .milliseconds(150),
+        approvalCooldownDuration: Duration = .seconds(15),
+        nowProvider: @escaping @Sendable () -> Date = Date.init,
+        notificationManager: AgentNotificationManager = .shared
     ) {
         self.algorithms = algorithms
         self.ephemeralHost = ephemeralHost
@@ -232,6 +254,11 @@ final class LiveSession: Identifiable {
         self.isTmuxBacked = isTmuxBacked ?? aiAgentContext?.isTmuxBacked ?? true
         self.pendingLaunchCommand = pendingLaunchCommand
         self.showAIAgentControls = aiAgentContext != nil
+        self.completionDebounceDuration = completionDebounceDuration
+        self.outputCoalesceInterval = outputCoalesceInterval
+        self.approvalCooldownInterval = Self.timeInterval(for: approvalCooldownDuration)
+        self.nowProvider = nowProvider
+        self.notificationManager = notificationManager
         self.id = id; self.hostID = hostID; self.title = title
         self.session = session; self.bridge = bridge
         let c = TerminalController(
@@ -283,9 +310,21 @@ final class LiveSession: Identifiable {
         outputCoalescer?.stop()
         outputCoalescer = nil
         suppressedDirectInputCount = 0
+        suppressedTurnArmCount = 0
         outputTailData.removeAll(keepingCapacity: false)
+        resetTurnState()
         bridge.onOutputChunk = nil
         bridge.onUserInput = nil
+    }
+
+    /// Sends a programmatic `tmux` attach command without arming a user-turn completion notification.
+    func sendProgrammaticTmuxAttach(_ command: String?) {
+        guard TmuxAttach.line(for: command) != nil else { return }
+        if bridge.onUserInput != nil {
+            suppressedDirectInputCount += 1
+            suppressedTurnArmCount += 1
+        }
+        TmuxAttach.send(command, via: bridge)
     }
 
     /// Dispatches `pendingLaunchCommand` once after the shell connects and clears it so reconnects never re-send.
@@ -310,6 +349,7 @@ final class LiveSession: Identifiable {
             }
             if targetBridge.onUserInput != nil {
                 self.suppressedDirectInputCount += 1
+                self.suppressedTurnArmCount += 1
             }
             targetBridge.send(Array((command + "\r").utf8))
         }
@@ -325,8 +365,16 @@ final class LiveSession: Identifiable {
         quantumNoticeDismissed = false
         hasModalSheetPresented = false
         hasInlineModalPresented = false
+        resetTurnState()
         agentActivityState = .idle
         attachActivityObservers(to: bridge)
+    }
+
+    private func resetTurnState() {
+        hasSubmittedUserTurn = false
+        turnMeaningfulChars = 0
+        hasNotifiedCompletionForTurn = false
+        lastNotifiedApprovalPrompt = nil
     }
 
     private func attachActivityObservers(to targetBridge: SessionBridge) {
@@ -347,7 +395,10 @@ final class LiveSession: Identifiable {
             activeBridge.onOutputChunk = nil
             return
         }
-        let coalescer = OutputChunkCoalescer { [weak self, weak activeBridge] data in
+        if targetBridge == nil, outputCoalescer != nil {
+            return
+        }
+        let coalescer = OutputChunkCoalescer(interval: outputCoalesceInterval) { [weak self, weak activeBridge] data in
             Task { @MainActor [weak self] in
                 guard let self, let activeBridge, self.bridge === activeBridge else { return }
                 self.handleOutputChunk(data)
@@ -379,7 +430,16 @@ final class LiveSession: Identifiable {
             let nextState = AgentActivityState.waitingForApproval(prompt: approvalPrompt)
             if agentActivityState != nextState {
                 agentActivityState = nextState
-                AgentNotificationManager.shared.notifyIfNeeded(
+            }
+            let now = nowProvider()
+            let isNewPrompt = approvalPrompt != lastNotifiedApprovalPrompt
+            let isPastCooldown = lastApprovalNotificationAt.map {
+                now.timeIntervalSince($0) >= approvalCooldownInterval
+            } ?? true
+            if isNewPrompt && isPastCooldown {
+                lastNotifiedApprovalPrompt = approvalPrompt
+                lastApprovalNotificationAt = now
+                notificationManager.notifyIfNeeded(
                     sessionTitle: title,
                     agentName: activityAgentName,
                     state: nextState,
@@ -391,12 +451,18 @@ final class LiveSession: Identifiable {
         }
 
         let chunkText = String(decoding: chunk, as: UTF8.self)
-        guard AgentActivityDetector.isMeaningfulOutput(chunkText) else { return }
+        let count = AgentActivityDetector.meaningfulCharacterCount(chunkText)
+        guard count >= 2 else { return }
 
+        guard hasSubmittedUserTurn, !hasNotifiedCompletionForTurn else { return }
+
+        turnMeaningfulChars += count
         if agentActivityState != .running {
             agentActivityState = .running
         }
-        scheduleCompletionDebounce()
+        if turnMeaningfulChars >= Self.minTurnMeaningfulCharsForCompletion {
+            scheduleCompletionDebounce()
+        }
     }
 
     private func handleUserInput(_ bytes: [UInt8]) {
@@ -413,25 +479,40 @@ final class LiveSession: Identifiable {
         completionDebounceTask?.cancel()
         completionDebounceTask = nil
 
-        let resetState: AgentActivityState = isAgentActivityTracked ? .running : .idle
-        if agentActivityState != resetState {
-            agentActivityState = resetState
+        if suppressedTurnArmCount > 0 {
+            suppressedTurnArmCount -= 1
+            return
+        }
+
+        guard isAgentActivityTracked, Self.containsSubmissionNewline(bytes) else { return }
+
+        hasSubmittedUserTurn = true
+        turnMeaningfulChars = 0
+        hasNotifiedCompletionForTurn = false
+        lastNotifiedApprovalPrompt = nil
+        if agentActivityState != .idle {
+            agentActivityState = .idle
         }
     }
 
     private func scheduleCompletionDebounce() {
         completionDebounceTask?.cancel()
+        let debounceDuration = completionDebounceDuration
         completionDebounceTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: Self.completionDebounceDuration)
+            try? await Task.sleep(for: debounceDuration)
             guard !Task.isCancelled,
                   let self,
                   self.isAgentActivityTracked,
                   self.connectionStatus == .connected,
-                  case .running = self.agentActivityState else {
+                  case .running = self.agentActivityState,
+                  self.hasSubmittedUserTurn,
+                  !self.hasNotifiedCompletionForTurn,
+                  self.turnMeaningfulChars >= Self.minTurnMeaningfulCharsForCompletion else {
                 return
             }
+            self.hasNotifiedCompletionForTurn = true
             self.agentActivityState = .completed
-            AgentNotificationManager.shared.notifyIfNeeded(
+            self.notificationManager.notifyIfNeeded(
                 sessionTitle: self.title,
                 agentName: self.activityAgentName,
                 state: .completed,
@@ -439,6 +520,37 @@ final class LiveSession: Identifiable {
                 sessionID: self.id
             )
         }
+    }
+
+    private static func containsSubmissionNewline(_ bytes: [UInt8]) -> Bool {
+        var inBracketedPaste = false
+        var index = 0
+        while index < bytes.count {
+            if !inBracketedPaste {
+                if bytes[index...].starts(with: bracketedPasteStart) {
+                    inBracketedPaste = true
+                    index += bracketedPasteStart.count
+                    continue
+                }
+                if bytes[index] == 0x0D || bytes[index] == 0x0A {
+                    return true
+                }
+                index += 1
+            } else {
+                if bytes[index...].starts(with: bracketedPasteEnd) {
+                    inBracketedPaste = false
+                    index += bracketedPasteEnd.count
+                    continue
+                }
+                index += 1
+            }
+        }
+        return false
+    }
+
+    private static func timeInterval(for duration: Duration) -> TimeInterval {
+        let components = duration.components
+        return TimeInterval(components.seconds) + (TimeInterval(components.attoseconds) / 1_000_000_000_000_000_000)
     }
 
     private static func isTerminalQueryResponse(_ bytes: [UInt8]) -> Bool {

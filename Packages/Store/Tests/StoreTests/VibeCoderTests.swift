@@ -474,12 +474,51 @@ final class VibeCoderTests: XCTestCase {
     }
 
     func testIsMeaningfulOutputAndStateEquatable() {
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount(""), 0)
         XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput(""))
+
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("   \t\r\n  "), 0)
         XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("   \t\r\n  "))
+
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("\u{1B}[?25h\u{1B}[?25l"), 0)
         XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("\u{1B}[?25h\u{1B}[?25l"))
+
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("\u{1B}]0;termapp — zsh\u{07}\u{1B}[2K\u{1B}[1G"), 0)
         XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("\u{1B}]0;termapp — zsh\u{07}\u{1B}[2K\u{1B}[1G"))
-        XCTAssertTrue(AgentActivityDetector.isMeaningfulOutput("\u{1B}[32m✓\u{1B}[0m"))
+
+        // Pure punctuation / symbols (including ✓ and dingbat digits) do not count as substantive output.
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("\u{1B}[32m✓\u{1B}[0m"), 0)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("\u{1B}[32m✓\u{1B}[0m"))
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount(".,!?;:-_=+/\\()[]{}<>"), 0)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput(".,!?;:-_=+/\\()[]{}<>"))
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("❶➁➊"), 0)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("❶➁➊"))
+
+        // Braille, geometric, dingbat spinners and box-drawing/block redraws return 0 and false.
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"), 0)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"))
+
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("◐◓◑◒✶✸✹✺✻✽✳✢·•…"), 0)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("◐◓◑◒✶✸✹✺✻✽✳✢·•…"))
+
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("╭──╮│╰──╯▀▄█"), 0)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("╭──╮│╰──╯▀▄█"))
+
+        // Single-character echoes count as 1 but remain below the >= 2 threshold.
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("a"), 1)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("a"))
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("7"), 1)
+        XCTAssertFalse(AgentActivityDetector.isMeaningfulOutput("7"))
+
+        // Substantive agent output counts exact alphanumeric characters and returns true.
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("\u{1B}[32m✓\u{1B}[0m Tests passed"), 11)
+        XCTAssertTrue(AgentActivityDetector.isMeaningfulOutput("\u{1B}[32m✓\u{1B}[0m Tests passed"))
+
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("\u{1B}[1;1HRunning tests..."), 12)
         XCTAssertTrue(AgentActivityDetector.isMeaningfulOutput("\u{1B}[1;1HRunning tests..."))
+
+        XCTAssertEqual(AgentActivityDetector.meaningfulCharacterCount("200 OK"), 5)
+        XCTAssertTrue(AgentActivityDetector.isMeaningfulOutput("200 OK"))
 
         XCTAssertEqual(AgentActivityState.waitingForApproval(prompt: "Approve?"), .waitingForApproval(prompt: "Approve?"))
         XCTAssertNotEqual(AgentActivityState.idle, .running)

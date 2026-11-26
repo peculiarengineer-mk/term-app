@@ -265,11 +265,11 @@ final class ReconnectCoordinator {
                               current.bridge === targetBridge else {
                             return
                         }
-                        TmuxAttach.send(tmux, via: targetBridge)
+                        current.sendProgrammaticTmuxAttach(tmux)
                     }
                 }
             } else {
-                TmuxAttach.send(entry.tmuxCommand, via: bridge)
+                self.manager.session(id: id)?.sendProgrammaticTmuxAttach(entry.tmuxCommand)
             }
             self.watchSessions()
         }

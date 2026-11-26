@@ -88,10 +88,26 @@ public struct AgentActivityDetector: Sendable {
         return nil
     }
 
-    /// Returns `true` when `chunk` contains visible non-whitespace content after ANSI/control stripping.
-    public static func isMeaningfulOutput(_ chunk: String) -> Bool {
+    /// Counts visible alphanumeric characters after stripping ANSI escapes and terminal chrome/spinner glyphs.
+    public static func meaningfulCharacterCount(_ chunk: String) -> Int {
         let stripped = stripANSI(chunk)
-        return !stripped.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard !stripped.isEmpty else { return 0 }
+
+        var count = 0
+        for character in stripped {
+            if character.unicodeScalars.contains(where: isIgnoredChromeScalar) {
+                continue
+            }
+            if character.isLetter || character.isNumber {
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// Returns `true` when `chunk` contains at least two meaningful alphanumeric characters after stripping ANSI and chrome glyphs.
+    public static func isMeaningfulOutput(_ chunk: String) -> Bool {
+        meaningfulCharacterCount(chunk) >= 2
     }
 
     // MARK: - Private Helpers
@@ -173,6 +189,21 @@ public struct AgentActivityDetector: Sendable {
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
         return collapsed.trimmingCharacters(in: borderChars)
+    }
+
+    private static func isIgnoredChromeScalar(_ scalar: UnicodeScalar) -> Bool {
+        switch scalar.value {
+        case 0x2500...0x259F, // Box Drawing & Block Elements
+             0x25A0...0x25FF, // Geometric Shapes (e.g. ◐◓◑◒)
+             0x2700...0x27BF, // Dingbats (e.g. ✶✸✹✺✻✽✳✢, ✓, dingbat numbers)
+             0x2800...0x28FF, // Braille Patterns (e.g. ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏)
+             0x00B7,          // Middle dot (·)
+             0x2022,          // Bullet (•)
+             0x2026:          // Horizontal ellipsis (…)
+            return true
+        default:
+            return false
+        }
     }
 
     private static func truncateSnippet(_ line: String, limit: Int) -> String {

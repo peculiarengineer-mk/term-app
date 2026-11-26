@@ -44,6 +44,17 @@ private final class NotificationCenterDelegateProxy: NSObject, UNUserNotificatio
 /// Manages local notifications and haptics when AI coding agents wait for approval or finish responding.
 @MainActor
 final class AgentNotificationManager {
+    struct DispatchedNotification: Equatable, Sendable {
+        let sessionTitle: String
+        let agentName: String
+        let state: AgentActivityState
+        let title: String
+        let subtitle: String?
+        let body: String
+        let isActiveVisibleTab: Bool
+        let sessionID: UUID?
+    }
+
     static let shared = AgentNotificationManager()
     static let notificationsEnabledKey = "agents.notificationsEnabled"
     nonisolated static let requestIdentifierPrefix = "termapp.agent."
@@ -52,16 +63,24 @@ final class AgentNotificationManager {
 
     private let delegateProxy = NotificationCenterDelegateProxy()
     private let notificationCenter: NotificationCenter
+    private let defaults: UserDefaults
+    private let deliveryHandler: (@MainActor (DispatchedNotification) -> Void)?
     private var isDelegateConfigured = false
     private var isRequestingAuthorization = false
     private(set) var pendingFocusSessionID: UUID?
 
     var isEnabled: Bool {
-        UserDefaults.standard.object(forKey: Self.notificationsEnabledKey) as? Bool ?? true
+        defaults.object(forKey: Self.notificationsEnabledKey) as? Bool ?? true
     }
 
-    init(notificationCenter: NotificationCenter = .default) {
+    init(
+        notificationCenter: NotificationCenter = .default,
+        defaults: UserDefaults = .standard,
+        deliveryHandler: (@MainActor (DispatchedNotification) -> Void)? = nil
+    ) {
         self.notificationCenter = notificationCenter
+        self.defaults = defaults
+        self.deliveryHandler = deliveryHandler
     }
 
     func configureDelegate() {
@@ -72,7 +91,7 @@ final class AgentNotificationManager {
 
     /// Requests local notification authorization once if `notificationsEnabled` is on and permission is undetermined.
     func requestAuthorizationIfNeeded() {
-        guard isEnabled, !isRequestingAuthorization else { return }
+        guard isEnabled, !isRequestingAuthorization, deliveryHandler == nil else { return }
         configureDelegate()
         isRequestingAuthorization = true
 
@@ -126,6 +145,22 @@ final class AgentNotificationManager {
         }
 
         guard let payload else { return }
+
+        if let deliveryHandler {
+            deliveryHandler(
+                DispatchedNotification(
+                    sessionTitle: sessionTitle,
+                    agentName: resolvedAgent,
+                    state: state,
+                    title: payload.title,
+                    subtitle: payload.subtitle,
+                    body: payload.body,
+                    isActiveVisibleTab: isActiveVisibleTab,
+                    sessionID: sessionID
+                )
+            )
+            return
+        }
 
         let isAppActive = UIApplication.shared.applicationState == .active
         if isAppActive {
