@@ -6,7 +6,7 @@ import TermUI
 
 /// Dashboard listing open AI terminal tabs and live/detached remote `tmux` sessions across saved hosts.
 struct AgentsDashboardView: View {
-    private struct DiscoveredSession: Identifiable, Hashable {
+    struct DiscoveredSession: Identifiable, Hashable {
         let hostID: UUID
         let hostLabel: String
         let session: TMuxSessionHelper.RemoteAISession
@@ -51,7 +51,7 @@ struct AgentsDashboardView: View {
         }
     }
 
-    private struct HostScanOutcome: Sendable, Identifiable {
+    struct HostScanOutcome: Sendable, Identifiable {
         let hostID: UUID
         let hostLabel: String
         let sessions: [TMuxSessionHelper.RemoteAISession]
@@ -668,7 +668,7 @@ struct AgentsDashboardView: View {
 
     private func killSession(_ item: DiscoveredSession) async {
         guard let host = hosts.first(where: { $0.id == item.hostID }) else { return }
-        let target = AgentHostTarget(host: host, sessionManager: sessionManager)
+        let target = AgentHostTarget(host: host, sessionManager: sessionManager, allHosts: hosts)
         do {
             let result = try await AgentAuthHelper.exec(
                 TMuxSessionHelper.killSessionCommand(sessionName: item.session.sessionName),
@@ -713,7 +713,7 @@ struct AgentsDashboardView: View {
     private func scanAllHosts() async {
         scanGeneration += 1
         let generation = scanGeneration
-        let targets = hosts.map { AgentHostTarget(host: $0, sessionManager: sessionManager) }
+        let targets = hosts.map { AgentHostTarget(host: $0, sessionManager: sessionManager, allHosts: hosts) }
         let knownCommands = Self.buildKnownCommands()
 
         guard !targets.isEmpty else {
@@ -763,12 +763,25 @@ struct AgentsDashboardView: View {
 
         guard !Task.isCancelled, generation == scanGeneration else { return }
 
-        let cacheDefaults = sessionManager.cacheDefaults
+        let discovered = Self.applyScanOutcomes(
+            outcomes,
+            cacheDefaults: sessionManager.cacheDefaults
+        )
+        sessionManager.noteCacheChanged()
+        remoteSessions = discovered
+        scanOutcomes = outcomes
+        hasScannedOnce = true
+    }
+
+    static func applyScanOutcomes(
+        _ outcomes: [HostScanOutcome],
+        cacheDefaults: UserDefaults,
+        now: Date = .now
+    ) -> [DiscoveredSession] {
         let cachedByHost = Dictionary(
             grouping: AISessionCacheStore.load(defaults: cacheDefaults),
             by: \.hostID
         )
-        let now = Date()
         var discovered: [DiscoveredSession] = []
 
         for outcome in outcomes {
@@ -813,7 +826,7 @@ struct AgentsDashboardView: View {
                 let hostCached = (cachedByHost[outcome.hostID] ?? []).filter(\.isAISession)
                 for entry in hostCached {
                     discovered.append(
-                        Self.makeDiscoveredSession(
+                        makeDiscoveredSession(
                             from: entry,
                             hostLabel: outcome.hostLabel
                         )
@@ -822,10 +835,7 @@ struct AgentsDashboardView: View {
             }
         }
 
-        sessionManager.noteCacheChanged()
-        remoteSessions = Self.sortedSessions(discovered)
-        scanOutcomes = outcomes
-        hasScannedOnce = true
+        return sortedSessions(discovered)
     }
 
     private static func makeDiscoveredSession(
@@ -897,25 +907,7 @@ struct AgentsDashboardView: View {
                 on: target,
                 timeout: .seconds(8)
             )
-            if TMuxSessionHelper.isTmuxMissing(in: result.stdout) {
-                return HostScanOutcome(
-                    hostID: target.id,
-                    hostLabel: target.displayName,
-                    sessions: [],
-                    status: .tmuxMissing
-                )
-            }
-            let parsed = TMuxSessionHelper.parseSessions(
-                from: result.stdout,
-                onlyTermAppManaged: false,
-                knownCommands: knownCommands
-            )
-            return HostScanOutcome(
-                hostID: target.id,
-                hostLabel: target.displayName,
-                sessions: parsed,
-                status: .ok(sessionCount: parsed.count)
-            )
+            return evaluateScanResult(result, target: target, knownCommands: knownCommands)
         } catch let error as AgentRemoteError where error.isAuthOrTrustIssue {
             return HostScanOutcome(
                 hostID: target.id,
@@ -955,6 +947,65 @@ struct AgentsDashboardView: View {
                 status: .unreachable(reason: conciseUnreachableReason(for: error, hostLabel: target.displayName))
             )
         }
+    }
+
+    nonisolated static func evaluateScanResult(
+        _ result: SSHExecResult,
+        target: AgentHostTarget,
+        knownCommands: [String: String]
+    ) -> HostScanOutcome {
+        guard result.exitCode == 0 else {
+            return HostScanOutcome(
+                hostID: target.id,
+                hostLabel: target.displayName,
+                sessions: [],
+                status: .unreachable(reason: conciseScanFailureReason(for: result))
+            )
+        }
+        if TMuxSessionHelper.isTmuxMissing(in: result.stdout) {
+            return HostScanOutcome(
+                hostID: target.id,
+                hostLabel: target.displayName,
+                sessions: [],
+                status: .tmuxMissing
+            )
+        }
+        guard TMuxSessionHelper.hasPanesBeginMarker(in: result.stdout) else {
+            return HostScanOutcome(
+                hostID: target.id,
+                hostLabel: target.displayName,
+                sessions: [],
+                status: .unreachable(reason: conciseScanFailureReason(for: result))
+            )
+        }
+        let parsed = TMuxSessionHelper.parseSessions(
+            from: result.stdout,
+            onlyTermAppManaged: false,
+            knownCommands: knownCommands
+        )
+        return HostScanOutcome(
+            hostID: target.id,
+            hostLabel: target.displayName,
+            sessions: parsed,
+            status: .ok(sessionCount: parsed.count)
+        )
+    }
+
+    private nonisolated static func conciseScanFailureReason(for result: SSHExecResult) -> String {
+        let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stderr.isEmpty {
+            let firstLine = stderr
+                .split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first { !$0.isEmpty }
+            if let firstLine, !firstLine.isEmpty {
+                return firstLine
+            }
+        }
+        if result.exitCode != 0 {
+            return "Remote scan failed (exit \(result.exitCode))"
+        }
+        return "Incomplete tmux scan response"
     }
 
     private nonisolated static func conciseAuthReason(

@@ -654,24 +654,70 @@ final class AIAgentTests: XCTestCase {
                 in: "TERMAPP_TMUX_MISSING\t0\t1\t1700000000\t1700000000\t/tmp\tzsh\nTERMAPP_PANES_BEGIN\n"
             )
         )
+        XCTAssertTrue(TMuxSessionHelper.hasPanesBeginMarker(in: "TERMAPP_PANES_BEGIN\n"))
+        XCTAssertTrue(TMuxSessionHelper.hasPanesBeginMarker(in: "sess\t0\t1\r\nTERMAPP_PANES_BEGIN\r\n"))
+        XCTAssertFalse(TMuxSessionHelper.hasPanesBeginMarker(in: ""))
+        XCTAssertFalse(TMuxSessionHelper.hasPanesBeginMarker(in: "sh -c '... TERMAPP_PANES_BEGIN ...'"))
+        XCTAssertFalse(TMuxSessionHelper.hasPanesBeginMarker(in: "TERMAPP_TMUX_MISSING\n"))
         XCTAssertEqual(TMuxSessionHelper.parseSessions(from: "TERMAPP_TMUX_MISSING\n", onlyTermAppManaged: false), [])
 
         let cmd = TMuxSessionHelper.listSessionsCommand()
         XCTAssertFalse(cmd.contains("\n"))
         XCTAssertFalse(cmd.contains("\r"))
-        XCTAssertEqual(cmd.filter { $0 == "'" }.count % 2, 0)
+        XCTAssertTrue(cmd.hasPrefix("sh -c '"))
+        XCTAssertTrue(cmd.hasSuffix("'"))
+        XCTAssertEqual(cmd.filter { $0 == "'" }.count, 2)
         XCTAssertEqual(cmd.filter { $0 == "\"" }.count % 2, 0)
+        XCTAssertTrue(cmd.contains("/opt/local/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"))
+        XCTAssertTrue(cmd.contains("${TMPDIR:-/tmp}"))
+        XCTAssertTrue(cmd.contains("${TMUX_TMPDIR:-}"))
+        XCTAssertTrue(cmd.contains("tmux -S \"$sock\" list-sessions -F"))
+        XCTAssertTrue(cmd.contains("tmux -S \"$sock\" list-panes -a -F"))
         XCTAssertTrue(cmd.contains("if command -v tmux >/dev/null 2>&1; then "))
-        XCTAssertTrue(cmd.contains("; else printf 'TERMAPP_TMUX_MISSING\\n'; fi"))
+        XCTAssertTrue(cmd.contains("else printf \"TERMAPP_TMUX_MISSING\\n\"; fi"))
 
         #if os(macOS)
         for shellPath in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: shellPath)
-            process.arguments = ["-n", "-c", cmd]
-            try process.run()
-            process.waitUntilExit()
-            XCTAssertEqual(process.terminationStatus, 0, "\(shellPath) -n failed on listSessionsCommand()")
+            let syntaxProc = Process()
+            syntaxProc.executableURL = URL(fileURLWithPath: shellPath)
+            syntaxProc.arguments = ["-n", "-c", cmd]
+            try syntaxProc.run()
+            syntaxProc.waitUntilExit()
+            XCTAssertEqual(syntaxProc.terminationStatus, 0, "\(shellPath) -n failed on listSessionsCommand()")
+        }
+
+        let missingTmuxCmd = TMuxSessionHelper.listSessionsCommand(searchPath: "/usr/bin:/bin")
+        for shellPath in ["/bin/sh", "/bin/bash", "/bin/zsh", "/bin/csh", "/bin/tcsh"] {
+            let execProc = Process()
+            let stdoutPipe = Pipe()
+            let stderrPipe = Pipe()
+            execProc.executableURL = URL(fileURLWithPath: shellPath)
+            execProc.arguments = ["-c", cmd]
+            execProc.standardOutput = stdoutPipe
+            execProc.standardError = stderrPipe
+            try execProc.run()
+            execProc.waitUntilExit()
+            let stdout = String(data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let stderr = String(data: stderrPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            XCTAssertEqual(execProc.terminationStatus, 0, "\(shellPath) -c failed: \(stderr)")
+            XCTAssertTrue(
+                TMuxSessionHelper.hasPanesBeginMarker(in: stdout) || TMuxSessionHelper.isTmuxMissing(in: stdout),
+                "Expected completion sentinel or missing marker from \(shellPath), got: \(stdout)"
+            )
+
+            let missingProc = Process()
+            let missingOut = Pipe()
+            let missingErr = Pipe()
+            missingProc.executableURL = URL(fileURLWithPath: shellPath)
+            missingProc.arguments = ["-c", missingTmuxCmd]
+            missingProc.standardOutput = missingOut
+            missingProc.standardError = missingErr
+            try missingProc.run()
+            missingProc.waitUntilExit()
+            let mOut = String(data: missingOut.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let mErr = String(data: missingErr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            XCTAssertEqual(missingProc.terminationStatus, 0, "\(shellPath) -c missing-tmux failed: \(mErr)")
+            XCTAssertTrue(TMuxSessionHelper.isTmuxMissing(in: mOut), "Expected TERMAPP_TMUX_MISSING from \(shellPath), got: \(mOut)")
         }
         #endif
     }

@@ -157,6 +157,85 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertTrue(resumed)
         XCTAssertTrue(dismissed)
     }
+
+    func testScanResultRequiresExitZeroAndCompletionSentinelPreservingCache() {
+        let (defaults, cleanup) = makeIsolatedDefaults()
+        defer { cleanup() }
+
+        let hostID = UUID()
+        let target = AgentHostTarget(
+            id: hostID,
+            label: "Mac Studio",
+            hostname: "studio.local",
+            authMethod: "key"
+        )
+        let cached = CachedAISession(
+            hostID: hostID,
+            hostLabel: "Mac Studio",
+            sessionName: "termapp-ai-claude-repo",
+            agentSlug: "claude",
+            projectSlug: "repo",
+            currentPath: "~/repo",
+            isTermAppManaged: true,
+            detectedCommand: "claude",
+            lastSeenAt: Date(timeIntervalSince1970: 1_700_000_500),
+            wasOpenInApp: true
+        )
+        AISessionCacheStore.upsert(cached, defaults: defaults)
+
+        // 1. Empty stdout with exitCode 0 (truncated/incomplete) must NOT become .ok(0) and must preserve cache.
+        let emptyOutcome = AgentsDashboardView.evaluateScanResult(
+            SSHExecResult(stdout: "", stderr: "", exitCode: 0),
+            target: target,
+            knownCommands: [:]
+        )
+        if case .unreachable = emptyOutcome.status {
+            // expected
+        } else {
+            XCTFail("Expected .unreachable for output missing TERMAPP_PANES_BEGIN, got \(emptyOutcome.status)")
+        }
+
+        let afterEmpty = AgentsDashboardView.applyScanOutcomes([emptyOutcome], cacheDefaults: defaults)
+        XCTAssertEqual(afterEmpty.count, 1)
+        XCTAssertEqual(afterEmpty.first?.isCached, true)
+        XCTAssertEqual(afterEmpty.first?.session.sessionName, "termapp-ai-claude-repo")
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults), [cached])
+
+        // 2. Non-zero exitCode (e.g. non-POSIX shell syntax error) even with sentinel/missing marker must NOT wipe cache.
+        let nonZeroOutcome = AgentsDashboardView.evaluateScanResult(
+            SSHExecResult(stdout: "TERMAPP_TMUX_MISSING\n", stderr: "fish: Unknown command", exitCode: 127),
+            target: target,
+            knownCommands: [:]
+        )
+        XCTAssertEqual(nonZeroOutcome.status, .unreachable(reason: "fish: Unknown command"))
+        let afterNonZero = AgentsDashboardView.applyScanOutcomes([nonZeroOutcome], cacheDefaults: defaults)
+        XCTAssertEqual(afterNonZero.count, 1)
+        XCTAssertEqual(afterNonZero.first?.isCached, true)
+        XCTAssertEqual(AISessionCacheStore.load(defaults: defaults), [cached])
+
+        // 3. Clean exitCode 0 + TERMAPP_PANES_BEGIN with 0 sessions IS a valid .ok(sessionCount: 0) and prunes cache.
+        let cleanEmptyOutcome = AgentsDashboardView.evaluateScanResult(
+            SSHExecResult(stdout: "\(TMuxSessionHelper.panesBeginMarker)\n", stderr: "", exitCode: 0),
+            target: target,
+            knownCommands: [:]
+        )
+        XCTAssertEqual(cleanEmptyOutcome.status, .ok(sessionCount: 0))
+        let afterCleanEmpty = AgentsDashboardView.applyScanOutcomes([cleanEmptyOutcome], cacheDefaults: defaults)
+        XCTAssertTrue(afterCleanEmpty.isEmpty)
+        XCTAssertTrue(AISessionCacheStore.load(defaults: defaults).isEmpty)
+
+        // 4. Clean exitCode 0 + TERMAPP_TMUX_MISSING returns .tmuxMissing and clears cache.
+        AISessionCacheStore.upsert(cached, defaults: defaults)
+        let missingOutcome = AgentsDashboardView.evaluateScanResult(
+            SSHExecResult(stdout: "\(TMuxSessionHelper.tmuxMissingMarker)\n", stderr: "", exitCode: 0),
+            target: target,
+            knownCommands: [:]
+        )
+        XCTAssertEqual(missingOutcome.status, .tmuxMissing)
+        let afterMissing = AgentsDashboardView.applyScanOutcomes([missingOutcome], cacheDefaults: defaults)
+        XCTAssertTrue(afterMissing.isEmpty)
+        XCTAssertTrue(AISessionCacheStore.load(defaults: defaults).isEmpty)
+    }
 }
 
 private final class StubSession: Session, @unchecked Sendable {

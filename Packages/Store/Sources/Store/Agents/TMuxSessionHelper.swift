@@ -7,6 +7,7 @@ public enum TMuxSessionHelper {
     public static let panesBeginMarker = "TERMAPP_PANES_BEGIN"
 
     private static let standardPATH = "$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin"
+    private static let scanPATH = "$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/opt/local/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
     private static let bracketedPasteBegin = "\u{1B}[200~"
     private static let bracketedPasteEnd = "\u{1B}[201~"
 
@@ -377,13 +378,46 @@ public enum TMuxSessionHelper {
         return "export PATH=\"\(standardPATH):$PATH\"; tmux kill-session -t \(quoted)"
     }
 
-    /// Builds a POSIX command to list `tmux` sessions and pane commands in tab-delimited format.
+    /// Builds a shell-agnostic command (`sh -c '...'`) to list `tmux` sessions and pane commands in tab-delimited format.
     ///
-    /// Prints `TERMAPP_TMUX_MISSING` when `tmux` is not installed on the remote host.
+    /// Queries the default `tmux` socket first and, if no sessions are returned, probes sockets under `/tmp/tmux-$(id -u)/*`,
+    /// `${TMPDIR:-/tmp}/tmux-$(id -u)/*`, `$TMUX_TMPDIR`, and macOS `/var/folders/*/*/T/tmux-$(id -u)/*`.
+    /// Prints `TERMAPP_TMUX_MISSING` when `tmux` is not installed on the remote host, and always prints `TERMAPP_PANES_BEGIN`
+    /// as a completion sentinel when `tmux` is present.
     public static func listSessionsCommand() -> String {
+        listSessionsCommand(searchPath: scanPATH)
+    }
+
+    static func listSessionsCommand(searchPath: String) -> String {
         let sessionFormat = "#{session_name}\\t#{session_attached}\\t#{session_windows}\\t#{session_created}\\t#{session_activity}\\t#{pane_current_path}\\t#{pane_current_command}"
         let paneFormat = "#{session_name}\\t#{pane_current_command}\\t#{pane_current_path}"
-        return "export PATH=\"\(standardPATH):$PATH\"; if command -v tmux >/dev/null 2>&1; then tmux list-sessions -F \"$(printf '\(sessionFormat)')\" 2>/dev/null || true; printf '\(panesBeginMarker)\\n'; tmux list-panes -a -F \"$(printf '\(paneFormat)')\" 2>/dev/null || true; else printf '\(tmuxMissingMarker)\\n'; fi"
+        let inner = [
+            "export PATH=\"\(searchPath)\"",
+            "if command -v tmux >/dev/null 2>&1; then sf=$(printf \"\(sessionFormat)\")",
+            "pf=$(printf \"\(paneFormat)\")",
+            "out=$(tmux list-sessions -F \"$sf\" 2>/dev/null || true)",
+            "if [ -n \"$out\" ]; then printf \"%s\\n%s\\n\" \"$out\" \"\(panesBeginMarker)\"",
+            "tmux list-panes -a -F \"$pf\" 2>/dev/null || true",
+            "else uid=$(id -u 2>/dev/null || echo 0)",
+            "utmp=$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)",
+            "pout=\"\"",
+            "seen=\"|\"",
+            "for dir in /tmp \"${TMPDIR:-/tmp}\" \"${TMUX_TMPDIR:-}\" \"$utmp\" /var/folders/*/*/T; do [ -n \"$dir\" ] || continue",
+            "sockdir=\"${dir%/}/tmux-$uid\"",
+            "[ -d \"$sockdir\" ] || continue",
+            "rdir=$(CDPATH=\"\" cd -- \"$sockdir\" 2>/dev/null && pwd -P || printf \"%s\" \"$sockdir\")",
+            "case \"$seen\" in *\"|$rdir|\"*) continue;; esac",
+            "seen=\"$seen$rdir|\"",
+            "for sock in \"$rdir\"/*; do [ -S \"$sock\" ] || continue",
+            "s=$(tmux -S \"$sock\" list-sessions -F \"$sf\" 2>/dev/null || true)",
+            "if [ -n \"$s\" ]; then printf \"%s\\n\" \"$s\"",
+            "p=$(tmux -S \"$sock\" list-panes -a -F \"$pf\" 2>/dev/null || true)",
+            "if [ -n \"$p\" ]; then if [ -n \"$pout\" ]; then pout=$(printf \"%s\\n%s\" \"$pout\" \"$p\"); else pout=\"$p\"; fi; fi; fi; done; done",
+            "printf \"\(panesBeginMarker)\\n\"",
+            "if [ -n \"$pout\" ]; then printf \"%s\\n\" \"$pout\"; fi; fi",
+            "else printf \"\(tmuxMissingMarker)\\n\"; fi",
+        ].joined(separator: "; ")
+        return "sh -c \(shellQuote(inner))"
     }
 
     /// Builds a POSIX command that expands `path`, prints `PWD:<resolved>` on line 1, and lists sorted non-hidden subdirectories.
@@ -400,6 +434,13 @@ public enum TMuxSessionHelper {
         output
             .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
             .contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == tmuxMissingMarker }
+    }
+
+    /// Returns `true` when `listSessionsCommand()` output contains the `TERMAPP_PANES_BEGIN` completion sentinel line.
+    public static func hasPanesBeginMarker(in output: String) -> Bool {
+        output
+            .split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+            .contains { $0.trimmingCharacters(in: .whitespacesAndNewlines) == panesBeginMarker }
     }
 
     /// Parses output from `listSessionsCommand()` into structured session records.
