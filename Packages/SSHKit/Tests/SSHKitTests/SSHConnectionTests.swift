@@ -219,4 +219,67 @@ final class SSHConnectionTests: XCTestCase {
         let peerFd = await accepted.value
         if peerFd >= 0 { Darwin.close(peerFd) }
     }
+
+    func testSecureZeroClearsSensitiveBuffer() {
+        let count = 64
+        let ptr = UnsafeMutableRawBufferPointer.allocate(byteCount: count, alignment: 1)
+        defer { ptr.deallocate() }
+        for i in 0..<count {
+            ptr[i] = UInt8((i &+ 1) & 0xFF)
+        }
+        SSHConnection.secureZero(ptr)
+        for i in 0..<count {
+            XCTAssertEqual(ptr[i], 0)
+        }
+    }
+
+    func testComputeEffectiveDeadlineKeyboardInteractiveGrace() {
+        let now = ContinuousClock.now
+        let base = now + .seconds(30)
+        let answeredLater = now + .seconds(45)
+
+        let extended = SSHConnection.computeEffectiveDeadline(
+            base,
+            isConnecting: true,
+            lastAnswered: answeredLater,
+            allowKeyboardInteractiveGrace: true
+        )
+        XCTAssertEqual(extended, answeredLater + .seconds(30))
+
+        let noGrace = SSHConnection.computeEffectiveDeadline(
+            base,
+            isConnecting: true,
+            lastAnswered: answeredLater,
+            allowKeyboardInteractiveGrace: false
+        )
+        XCTAssertEqual(noGrace, base)
+
+        let postConnect = SSHConnection.computeEffectiveDeadline(
+            base,
+            isConnecting: false,
+            lastAnswered: answeredLater,
+            allowKeyboardInteractiveGrace: true
+        )
+        XCTAssertEqual(postConnect, base)
+    }
+
+    func testDeinitWithoutCloseFinishesStateStream() async {
+        let stateStream: AsyncStream<SessionState>
+        do {
+            let conn = SSHConnection(host: "127.0.0.1", username: "u", auth: .password("p"))
+            stateStream = conn.state
+        }
+
+        let finished = Task {
+            for await _ in stateStream {}
+            return true
+        }
+        let watchdog = Task {
+            try? await Task.sleep(for: .seconds(2))
+            finished.cancel()
+        }
+        let didFinish = await finished.value
+        watchdog.cancel()
+        XCTAssertTrue(didFinish)
+    }
 }

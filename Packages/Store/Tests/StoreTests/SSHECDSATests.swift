@@ -177,6 +177,52 @@ final class SSHECDSATests: XCTestCase {
         XCTAssertEqual(mock.syncFlag(service: KeyStore.metaService, account: acct), true)
         XCTAssertEqual(try store.list().first?.syncsViaICloud, true)
     }
+
+    func testKeysWithSavedPassphraseDoesNotReadSecretBytes() throws {
+        let mock = MockKeychainStorage()
+        let store = KeyStore(storage: mock)
+        let keyWithPass = StoredKey(name: "k1", type: .ed25519, publicKey: "ssh-ed25519 AAAA", isEncrypted: true)
+        let keyWithoutPass = StoredKey(name: "k2", type: .ed25519, publicKey: "ssh-ed25519 BBBB", isEncrypted: true)
+        try store.add(keyWithPass, privateKey: Data("p1".utf8), passphrase: "secret")
+        try store.add(keyWithoutPass, privateKey: Data("p2".utf8), passphrase: nil)
+
+        mock.readCallCount = 0
+        mock.readAllCallCount = 0
+        let ids = try store.keysWithSavedPassphrase()
+        XCTAssertEqual(ids, [keyWithPass.id])
+        XCTAssertEqual(mock.readCallCount, 0)
+        XCTAssertEqual(mock.readAllCallCount, 0)
+    }
+
+    func testPassphraseInvalidUTF8ThrowsAndSavePassphraseFailsClosedOnMissingOrCorruptMeta() throws {
+        let mock = MockKeychainStorage()
+        let store = KeyStore(storage: mock)
+        let key = StoredKey(name: "k", type: .ed25519, publicKey: "ssh-ed25519 AAAA", isEncrypted: true, syncsViaICloud: false)
+
+        // Missing metadata fails closed.
+        XCTAssertThrowsError(try store.savePassphrase("secret", for: key)) { error in
+            XCTAssertEqual(error as? KeyStoreError, .keyMissing)
+        }
+
+        // Corrupt metadata fails closed instead of falling back.
+        try mock.save(Data("not-json".utf8), service: KeyStore.metaService, account: key.id.uuidString, synchronizable: false)
+        XCTAssertThrowsError(try store.savePassphrase("secret", for: key))
+        XCTAssertNil(try mock.read(service: KeyStore.passphraseService, account: key.id.uuidString))
+
+        // Valid metadata uses stored sync flag (even if caller passes a stale `key`).
+        var syncedKey = key
+        syncedKey.syncsViaICloud = true
+        try store.add(syncedKey, privateKey: Data("priv".utf8), passphrase: nil)
+        try store.savePassphrase("typed", for: key)
+        XCTAssertEqual(mock.syncFlag(service: KeyStore.passphraseService, account: key.id.uuidString), true)
+        XCTAssertEqual(try store.passphrase(for: key), "typed")
+
+        // Corrupt UTF-8 passphrase throws errSecDecode instead of returning replacement characters.
+        try mock.save(Data([0xFF, 0xFE, 0xFD]), service: KeyStore.passphraseService, account: key.id.uuidString, synchronizable: true)
+        XCTAssertThrowsError(try store.passphrase(for: key)) { error in
+            XCTAssertEqual(error as? KeychainError, KeychainError(status: errSecDecode))
+        }
+    }
 }
 
 private final class MockKeychainStorage: KeychainStoring, @unchecked Sendable {
@@ -188,6 +234,8 @@ private final class MockKeychainStorage: KeychainStoring, @unchecked Sendable {
     private var items: [ItemKey: Data] = [:]
     var failSetSyncService: String?
     var failSaveService: String?
+    var readCallCount = 0
+    var readAllCallCount = 0
 
     func syncFlag(service: String, account: String) -> Bool? {
         if items[ItemKey(service: service, account: account, synchronizable: true)] != nil { return true }
@@ -202,6 +250,7 @@ private final class MockKeychainStorage: KeychainStoring, @unchecked Sendable {
     }
 
     func read(service: String, account: String) throws -> Data? {
+        readCallCount += 1
         if let synced = try read(service: service, account: account, synchronizable: true) { return synced }
         return try read(service: service, account: account, synchronizable: false)
     }
@@ -211,9 +260,22 @@ private final class MockKeychainStorage: KeychainStoring, @unchecked Sendable {
     }
 
     func readAll(service: String) throws -> [(account: String, data: Data, synchronizable: Bool)] {
-        items.compactMap { key, data in
+        readAllCallCount += 1
+        return items.compactMap { key, data in
             key.service == service ? (key.account, data, key.synchronizable) : nil
         }
+    }
+
+    func accountExists(service: String, account: String, synchronizable: Bool?) throws -> Bool {
+        if let synchronizable {
+            return items[ItemKey(service: service, account: account, synchronizable: synchronizable)] != nil
+        }
+        return items[ItemKey(service: service, account: account, synchronizable: true)] != nil
+            || items[ItemKey(service: service, account: account, synchronizable: false)] != nil
+    }
+
+    func listAccounts(service: String) throws -> Set<String> {
+        Set(items.keys.compactMap { $0.service == service ? $0.account : nil })
     }
 
     func delete(service: String, account: String) throws {

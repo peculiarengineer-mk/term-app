@@ -1,4 +1,5 @@
 import SwiftUI
+import SwiftData
 import SSHKit
 import Store
 
@@ -44,6 +45,7 @@ final class HostConnectionModel {
     private var hostUpdatedAt: Date
     private var lastFailedWithAuth = false
     private var bypassSavedSecrets = false
+    private var pendingTrustTarget: (hostname: String, port: Int)?
 
     // One per line: @Observable's tracking accessor cannot attach to a multi-variable declaration.
     private(set) var hostname: String
@@ -53,19 +55,28 @@ final class HostConnectionModel {
     private(set) var keyID: UUID?
     private(set) var tmux: String?
     private(set) var title: String
+    private(set) var proxyJumpHostID: UUID?
+    private(set) var forwardAgent: Bool
+    var hostKeyPromptHostname: String { pendingTrustTarget?.hostname ?? hostname }
+    var hostKeyPromptPort: Int { pendingTrustTarget?.port ?? port }
     let hostID: UUID
     private let known = KnownHostsStore()
     private var typedPassword: String?
+    private var modelContext: ModelContext?
+    private var explicitAllHosts: [Host]?
 
-    init(host: Host) {
+    init(host: Host, allHosts: [Host]? = nil) {
         hostname = host.hostname; port = host.port; username = host.username
         authMethod = host.authMethod; keyID = host.keyID; tmux = host.tmuxCommand; hostID = host.id
+        proxyJumpHostID = host.proxyJumpHostID; forwardAgent = host.forwardAgent
         title = host.label.isEmpty ? host.hostname : host.label
         hostUpdatedAt = host.updatedAt
+        modelContext = host.modelContext
+        explicitAllHosts = allHosts
     }
 
     /// Re-reads the host's fields, e.g. after the user edited it from the key-missing screen.
-    func refresh(from host: Host) {
+    func refresh(from host: Host, allHosts: [Host]? = nil) {
         if host.updatedAt != hostUpdatedAt {
             hostUpdatedAt = host.updatedAt
             lastFailedWithAuth = false
@@ -73,7 +84,14 @@ final class HostConnectionModel {
         }
         hostname = host.hostname; port = host.port; username = host.username
         authMethod = host.authMethod; keyID = host.keyID; tmux = host.tmuxCommand
+        proxyJumpHostID = host.proxyJumpHostID; forwardAgent = host.forwardAgent
         title = host.label.isEmpty ? host.hostname : host.label
+        if let ctx = host.modelContext {
+            modelContext = ctx
+        }
+        if let allHosts {
+            explicitAllHosts = allHosts
+        }
     }
 
     func start() {
@@ -82,12 +100,30 @@ final class HostConnectionModel {
             let key = keyID.flatMap { id in (try? store.list())?.first(where: { $0.id == id }) }
             guard let key, ((try? store.privateKey(for: key)) ?? nil) != nil else {
                 phase = .keyMissing(keyName: key?.name)
+                onFailed?(false)
                 return
+            }
+            if proxyJumpHostID != nil {
+                do {
+                    _ = try buildJumpHops(attempt: attempt)
+                } catch {
+                    phase = .failed(error.localizedDescription)
+                    onFailed?(false)
+                    return
+                }
             }
             if key.isEncrypted, typedPassphrase == nil,
                bypassSavedSecrets || ((try? store.passphrase(for: key)) ?? nil) == nil {
                 phase = .input(InputRequest(purpose: .passphrase, title: "Passphrase for \(key.name)",
                                             instruction: "", items: [.init(text: "Passphrase", echo: false)], prefill: [""]))
+                return
+            }
+        } else if proxyJumpHostID != nil {
+            do {
+                _ = try buildJumpHops(attempt: attempt)
+            } catch {
+                phase = .failed(error.localizedDescription)
+                onFailed?(false)
                 return
             }
         }
@@ -129,7 +165,10 @@ final class HostConnectionModel {
             phase = .failed("Cancelled")  // kept by connect()'s catch
             resolveInput([])
             task?.cancel()  // stop any further server rounds from re-opening the form
-        default: phase = .failed("Cancelled")
+            onFailed?(false)
+        default:
+            phase = .failed("Cancelled")
+            onFailed?(false)
         }
     }
 
@@ -157,6 +196,10 @@ final class HostConnectionModel {
         // closes; resume with no answers then and take the stale form down.
         return await withTaskCancellationHandler {
             await withCheckedContinuation { c in
+                if Task.isCancelled || promptAttempt != attempt {
+                    c.resume(returning: [])
+                    return
+                }
                 pendingAnswers = c
                 phase = .input(InputRequest(purpose: .keyboardInteractive,
                                             title: prompt.name.isEmpty ? "Authentication" : prompt.name,
@@ -219,9 +262,60 @@ final class HostConnectionModel {
         }
     }
 
+    private func currentHostSnapshot() -> Host {
+        Host(
+            id: hostID,
+            label: title,
+            hostname: hostname,
+            port: port,
+            username: username,
+            authMethod: authMethod,
+            keyID: keyID,
+            tmuxCommand: tmux,
+            proxyJumpHostID: proxyJumpHostID,
+            forwardAgent: forwardAgent
+        )
+    }
+
+    private func resolveAllHosts() -> [Host] {
+        if let explicitAllHosts {
+            return explicitAllHosts
+        }
+        if let modelContext {
+            return (try? modelContext.fetch(FetchDescriptor<Host>())) ?? []
+        }
+        return []
+    }
+
+    private func buildJumpHops(attempt currentAttempt: Int) throws -> [SSHJumpHop] {
+        let snapshot = currentHostSnapshot()
+        let allHosts = resolveAllHosts()
+        let known = self.known
+        return try SSHOptionsBuilder.buildJumpHops(for: snapshot, allHosts: allHosts) { [weak self] hopHost, hopPort, _ in
+            { [weak self] key in
+                let stored: String?
+                do { stored = try known.fingerprint(host: hopHost, port: hopPort) } catch { return .reject }
+                if let stored {
+                    if stored == key.fingerprint { return .trust }
+                    await self?.showMismatch(
+                        stored: stored,
+                        presented: key,
+                        host: hopHost,
+                        port: hopPort,
+                        attempt: currentAttempt
+                    )
+                    return .reject
+                }
+                guard let self else { return .reject }
+                return await self.askTrust(key, host: hopHost, port: hopPort, attempt: currentAttempt)
+            }
+        }
+    }
+
     func connect() {
         attempt += 1
         lastFailedWithAuth = false
+        pendingTrustTarget = nil
         resolve(.reject)
         resolveInput([])
         task?.cancel()
@@ -230,19 +324,39 @@ final class HostConnectionModel {
         handedOff = false
         Task { await old?.close() }
         phase = .connecting
+        let currentAttempt = attempt
         let auth: SSHAuth
-        do { auth = try buildAuth() }
+        let jumpHops: [SSHJumpHop]
+        do {
+            auth = try buildAuth()
+            jumpHops = try buildJumpHops(attempt: currentAttempt)
+        }
         catch KeyStoreError.keyMissing {
             let name = (try? KeyStore().list())?.first(where: { $0.id == keyID })?.name
-            phase = .keyMissing(keyName: name); return
+            phase = .keyMissing(keyName: name); onFailed?(false); return
         }
         catch KeyStoreError.secureEnclaveUnavailable {
-            phase = .failed("This device has no Secure Enclave, so it can't use this key."); return
+            phase = .failed("This device has no Secure Enclave, so it can't use this key."); onFailed?(false); return
         }
-        catch { phase = .failed("\(error.localizedDescription)"); return }
-        let conn = SSHConnection(host: hostname, port: UInt16(clamping: port), username: username, auth: auth)
+        catch { phase = .failed("\(error.localizedDescription)"); onFailed?(false); return }
+        var overridePassphrases: [UUID: String] = [:]
+        if let keyID, let typedPassphrase {
+            overridePassphrases[keyID] = typedPassphrase
+        }
+        let agentForwarding = SSHOptionsBuilder.buildAgentForwardingConfig(
+            for: currentHostSnapshot(),
+            overridePassphrases: overridePassphrases
+        )
+        let conn = SSHConnection(
+            host: hostname,
+            port: UInt16(clamping: port),
+            username: username,
+            auth: auth,
+            jumpHops: jumpHops,
+            agentForwarding: agentForwarding
+        )
         connection = conn
-        let known = self.known, host = hostname, port = self.port, currentAttempt = attempt
+        let known = self.known, host = hostname, port = self.port
         task = Task {
             do {
                 try await conn.connect { [weak self] key in
@@ -250,24 +364,33 @@ final class HostConnectionModel {
                     do { stored = try known.fingerprint(host: host, port: port) } catch { return .reject }
                     if let stored {
                         if stored == key.fingerprint { return .trust }
-                        await self?.showMismatch(stored: stored, presented: key, attempt: currentAttempt)
+                        await self?.showMismatch(stored: stored, presented: key, host: host, port: port, attempt: currentAttempt)
                         return .reject  // blocked: never continue on a changed key
                     }
                     guard let self else { return .reject }
-                    return await self.askTrust(key, attempt: currentAttempt)
+                    return await self.askTrust(key, host: host, port: port, attempt: currentAttempt)
                 }
-                if Task.isCancelled { await conn.close(); return }
+                if Task.isCancelled {
+                    if connection === conn { connection = nil }
+                    await conn.close()
+                    return
+                }
                 let bridge = SessionBridge(session: conn)
                 phase = .connected(bridge)
                 handedOff = true  // the connection now belongs to the receiver; teardown must not close it
                 persistTypedPassphrase()
+                connection = nil
+                typedPassword = nil
+                typedPassphrase = nil
+                savePassphraseOnSuccess = false
+                pendingTrustTarget = nil
                 onConnected?(conn, bridge)
             } catch {
                 if Task.isCancelled { return }  // superseded: the new connection owns any pending prompt
                 resolveInput([])
-                if case .mismatch = phase { return }  // the mismatch screen is already showing
-                if case .failed = phase { return }  // keep the original message
-                if case .prompt = phase { phase = .failed("Cancelled") ; return }
+                if case .mismatch = phase { onFailed?(false); return }  // the mismatch screen is already showing
+                if case .failed = phase { onFailed?(false); return }  // keep the original message
+                if case .prompt = phase { phase = .failed("Cancelled"); onFailed?(false); return }
                 if let e = error as? SSHError, case .authenticationFailed = e { lastFailedWithAuth = true }
                 phase = .failed(Self.describe(error))
                 var network = false
@@ -294,12 +417,13 @@ final class HostConnectionModel {
         try? store.savePassphrase(phrase, for: key)
     }
 
-    private func showMismatch(stored: String, presented: HostKey, attempt mismatchAttempt: Int) {
+    private func showMismatch(stored: String, presented: HostKey, host: String, port: Int, attempt mismatchAttempt: Int) {
         guard !Task.isCancelled, mismatchAttempt == attempt else { return }
+        pendingTrustTarget = (host, port)
         phase = .mismatch(stored: stored, presented: presented)
     }
 
-    private func askTrust(_ key: HostKey, attempt trustAttempt: Int) async -> HostKeyDecision {
+    private func askTrust(_ key: HostKey, host: String, port: Int, attempt trustAttempt: Int) async -> HostKeyDecision {
         if Task.isCancelled || trustAttempt != attempt { return .reject }
         resolve(.reject)  // never leave an earlier continuation pending
         trustGeneration += 1
@@ -311,6 +435,7 @@ final class HostConnectionModel {
                     return
                 }
                 decision = c
+                pendingTrustTarget = (host, port)
                 phase = .prompt(key)
             }
         } onCancel: {
@@ -323,19 +448,30 @@ final class HostConnectionModel {
     }
 
     func trust(_ key: HostKey) {
-        do { try known.trust(host: hostname, port: port, fingerprint: key.fingerprint, synchronizable: try syncForFingerprint()) }
-        catch { phase = .failed("Could not store the host key: \(error.localizedDescription)"); resolve(.reject); return }
+        let target = pendingTrustTarget ?? (hostname, port)
+        do {
+            let sync = try syncForFingerprint(host: target.hostname, port: target.port)
+            try known.trust(host: target.hostname, port: target.port, fingerprint: key.fingerprint, synchronizable: sync)
+        } catch {
+            phase = .failed("Could not store the host key: \(error.localizedDescription)")
+            resolve(.reject)
+            return
+        }
+        pendingTrustTarget = nil
         phase = .connecting
         resolve(.trust)
     }
 
     /// A save never turns an already-synced fingerprint local. A failed lookup throws rather than
     /// guessing "local", because saving local would delete the synced copy everywhere.
-    private func syncForFingerprint() throws -> Bool {
+    private func syncForFingerprint(host: String, port: Int) throws -> Bool {
         if AppContainer.syncEnabledAtLaunch { return true }
-        let account = "\(hostname.lowercased()):\(port)"
-        return try KeychainStore().readAll(service: KeychainService.knownHosts)
-            .contains { $0.account == account && $0.synchronizable }
+        let account = "\(host.lowercased()):\(port)"
+        return try KeychainStore().accountExists(
+            service: KeychainService.knownHosts,
+            account: account,
+            synchronizable: true
+        )
     }
 
     func cancelPrompt() { resolve(.reject) }
@@ -346,8 +482,11 @@ final class HostConnectionModel {
     }
 
     func replaceStoredKey(with key: HostKey) {
+        let target = pendingTrustTarget ?? (hostname, port)
         do {
-            try known.trust(host: hostname, port: port, fingerprint: key.fingerprint, synchronizable: try syncForFingerprint())
+            let sync = try syncForFingerprint(host: target.hostname, port: target.port)
+            try known.trust(host: target.hostname, port: target.port, fingerprint: key.fingerprint, synchronizable: sync)
+            pendingTrustTarget = nil
             connect()
         } catch { phase = .failed("Could not replace the host key: \(error.localizedDescription)") }
     }
@@ -359,6 +498,12 @@ final class HostConnectionModel {
         task = nil
         let c = handedOff ? nil : connection
         connection = nil
+        typedPassword = nil
+        typedPassphrase = nil
+        savePassphraseOnSuccess = false
+        pendingTrustTarget = nil
+        onConnected = nil
+        onFailed = nil
         Task { await c?.close() }
     }
 }

@@ -37,21 +37,38 @@ struct LicencesView: View {
 private struct LicenceTextView: View {
     let title: String
     let file: String
-
-    private var text: String? {
-        guard let url = Bundle.main.url(forResource: file, withExtension: "txt") else { return nil }
-        return try? String(contentsOf: url, encoding: .utf8)
-    }
+    @State private var text: String?
+    @State private var isLoaded = false
 
     var body: some View {
         ScrollView {
-            Text(text ?? "Licence text missing")
-                .font(.system(.footnote, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding()
+            if let text {
+                Text(text)
+                    .font(.system(.footnote, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            } else if isLoaded {
+                Text("Licence text missing")
+                    .font(.system(.footnote, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            } else {
+                ProgressView()
+                    .frame(maxWidth: .infinity)
+                    .padding()
+            }
         }
         .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: file) {
+            guard !isLoaded else { return }
+            let loaded = await Task.detached(priority: .userInitiated) { [file] () -> String? in
+                guard let url = Bundle.main.url(forResource: file, withExtension: "txt") else { return nil }
+                return try? String(contentsOf: url, encoding: .utf8)
+            }.value
+            text = loaded
+            isLoaded = true
+        }
     }
 }

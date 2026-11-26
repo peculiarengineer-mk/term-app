@@ -759,6 +759,22 @@ struct LaunchAIAgentSheet: View {
                     }
                     return
                 }
+
+                isInstallingTmux = false
+                let verifyDetail = conciseErrorLine(from: verifyResult.stderr)
+                    ?? conciseErrorLine(from: verifyResult.stdout)
+                if let verifyDetail {
+                    tmuxInstallError = "Verification failed after tmux install: \(verifyDetail)"
+                } else {
+                    tmuxInstallError = "Verification failed after tmux install (exit code \(verifyResult.exitCode))."
+                }
+                tmuxRequiresInteractiveInstall = TMuxSessionHelper.installTmuxCommand(
+                    packageManager: availability.packageManager,
+                    isRoot: availability.isRoot,
+                    interactive: true
+                ) != nil
+                AppHaptics.notify(.error)
+                return
             }
 
             isInstallingTmux = false

@@ -108,6 +108,9 @@ final class ReconnectCoordinator {
                     self.reconnect(current, auto: true)
                 }
                 self.autoPending.remove(id)
+                if alive, case .disconnected(let err) = self.latest[id], self.watched[id] == bridgeID {
+                    self.markDead(id, bridge: bridgeID, error: err)
+                }
             }
         }
     }
@@ -201,8 +204,13 @@ final class ReconnectCoordinator {
         return (try? context.fetch(d))?.first
     }
 
-    private func snapshot(_ id: UUID) -> HostSnapshot? {
-        guard let host = fetchHost(id) else { return nil }
+    private func fetchAllHosts() -> [Host] {
+        (try? container.mainContext.fetch(FetchDescriptor<Host>())) ?? []
+    }
+
+    private func snapshot(for live: LiveSession) -> HostSnapshot? {
+        guard let host = fetchHost(live.hostID) ?? live.ephemeralHost else { return nil }
+        let allHosts = fetchAllHosts()
         var needsUser = host.authMethod == "keyboardInteractive"
             || (host.authMethod == "password" && HostSecrets.password(for: host.id) == nil)
         if host.authMethod == "key" {
@@ -213,13 +221,17 @@ final class ReconnectCoordinator {
                 needsUser = true  // key missing (nil keyID or not in the key store)
             }
         }
-        return HostSnapshot(model: HostConnectionModel(host: host), tmuxCommand: host.tmuxCommand, needsUser: needsUser)
+        return HostSnapshot(
+            model: HostConnectionModel(host: host, allHosts: allHosts),
+            tmuxCommand: host.tmuxCommand,
+            needsUser: needsUser
+        )
     }
 
     private func reconnect(_ live: LiveSession, auto: Bool) {
         let id = live.id
         if entries[id] != nil { return }  // already reconnecting or waiting on the user
-        guard let snap = snapshot(live.hostID) else {
+        guard let snap = snapshot(for: live) else {
             live.overlay = AnyView(HostGoneView(onClose: { [weak self] in self?.close(id) }))
             return
         }
@@ -297,14 +309,14 @@ final class ReconnectCoordinator {
         entry.retryTask?.cancel()
         entry.retryTask = nil
         entry.retries = 0
-        guard let host = fetchHost(live.hostID) else {
+        guard let host = fetchHost(live.hostID) ?? live.ephemeralHost else {
             dropEntry(id)
             live.overlay = AnyView(HostGoneView(onClose: { [weak self] in self?.close(id) }))
             return
         }
         let previousTitle = entry.model.title
         entry.tmuxCommand = host.tmuxCommand
-        entry.model.refresh(from: host)
+        entry.model.refresh(from: host, allHosts: fetchAllHosts())
         let wasStarted = entry.started
         entry.started = true
         if !wasStarted || entry.model.title != previousTitle { showOverlay(live) }

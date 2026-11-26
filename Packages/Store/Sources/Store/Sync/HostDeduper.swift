@@ -38,6 +38,8 @@ public enum HostDeduper {
                 survivor.tags = newest.tags
                 survivor.createdAt = newest.createdAt
                 survivor.updatedAt = newest.updatedAt
+                survivor.proxyJumpHostID = newest.proxyJumpHostID
+                survivor.forwardAgent = newest.forwardAgent
             }
             for dup in byCopy.dropFirst() {
                 context.delete(dup)

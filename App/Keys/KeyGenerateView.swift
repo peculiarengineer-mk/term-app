@@ -16,6 +16,7 @@ struct KeyGenerateView: View {
     private enum Kind: Hashable { case enclave, ed25519 }
     @State private var kind: Kind = SecureEnclaveKey.isAvailable ? .enclave : .ed25519
     @State private var generatedKey: StoredKey?
+    @State private var isGenerating = false
     @State private var copied = false
     @State private var copyResetTask: Task<Void, Never>?
     @State private var error: String?
@@ -51,7 +52,7 @@ struct KeyGenerateView: View {
                     }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Generate") { generateKey() }
-                            .disabled(trimmedName.isEmpty)
+                            .disabled(trimmedName.isEmpty || isGenerating)
                     }
                 } else {
                     ToolbarItem(placement: .confirmationAction) {
@@ -170,6 +171,9 @@ struct KeyGenerateView: View {
     }
 
     private func generateKey() {
+        guard !isGenerating else { return }
+        isGenerating = true
+        error = nil
         do {
             let created: StoredKey
             if kind == .enclave {
@@ -184,8 +188,10 @@ struct KeyGenerateView: View {
                 dismiss()
             } else {
                 generatedKey = created
+                isGenerating = false
             }
         } catch {
+            isGenerating = false
             self.error = error.localizedDescription
         }
     }

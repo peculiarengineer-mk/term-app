@@ -76,6 +76,23 @@ final class HostDeduperTests: XCTestCase {
         XCTAssertEqual(Set(hosts.map(\.copyID)), [c1, c2])
     }
 
+    func testDedupeCopiesProxyJumpHostIDAndForwardAgentFromNewest() throws {
+        let context = try makeContext()
+        let id = UUID()
+        let jumpID = UUID()
+        let t = Date(timeIntervalSinceReferenceDate: 1_000_000)
+        context.insert(Host(id: id, label: "old", updatedAt: t, copyID: c1, proxyJumpHostID: nil, forwardAgent: false))
+        context.insert(Host(id: id, label: "new", updatedAt: t.addingTimeInterval(5), copyID: c2, proxyJumpHostID: jumpID, forwardAgent: true))
+        try context.save()
+
+        XCTAssertEqual(try HostDeduper.dedupe(in: context), 1)
+        let hosts = try context.fetch(FetchDescriptor<Host>())
+        XCTAssertEqual(hosts.count, 1)
+        XCTAssertEqual(hosts[0].copyID, c1)
+        XCTAssertEqual(hosts[0].proxyJumpHostID, jumpID)
+        XCTAssertTrue(hosts[0].forwardAgent)
+    }
+
     func testSecondRunDeletesNothingAndChangesNothing() throws {
         let context = try makeContext()
         let id = UUID()

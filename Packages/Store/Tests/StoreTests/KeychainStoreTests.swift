@@ -77,6 +77,25 @@ final class KeychainStoreTests: XCTestCase {
         }
     }
 
+    func testAccountExistsAndListAccounts() throws {
+        try skippingMissingEntitlement {
+            let existsBefore = try store.accountExists(service: service, account: account)
+            let accountsBefore = try store.listAccounts(service: service)
+            XCTAssertFalse(existsBefore)
+            XCTAssertEqual(accountsBefore, [])
+
+            try store.save(Data("secret".utf8), service: service, account: account, synchronizable: false)
+            let existsAny = try store.accountExists(service: service, account: account)
+            let existsLocal = try store.accountExists(service: service, account: account, synchronizable: false)
+            let existsSynced = try store.accountExists(service: service, account: account, synchronizable: true)
+            let accountsAfter = try store.listAccounts(service: service)
+            XCTAssertTrue(existsAny)
+            XCTAssertTrue(existsLocal)
+            XCTAssertFalse(existsSynced)
+            XCTAssertEqual(accountsAfter, [account])
+        }
+    }
+
     private func accessibleAttribute(synchronizable: Bool) throws -> String? {
         let q: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

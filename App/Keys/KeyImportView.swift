@@ -4,16 +4,20 @@ import UniformTypeIdentifiers
 import Store
 
 struct KeyImportView: View {
+    private static let maxKeyFileBytes = 1024 * 1024
+
     let onCreated: (() -> Void)?
     let onCreatedKey: ((StoredKey) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var text = ""
+    @State private var inspection: Result<ParsedKey, Error>?
     @State private var passphrase = ""
     @State private var savePassphrase = false
     @State private var sync = false
     @State private var showPicker = false
+    @State private var fileImportTask: Task<Void, Never>?
     @State private var error: String?
 
     init(
@@ -26,11 +30,6 @@ struct KeyImportView: View {
 
     private var trimmedName: String {
         name.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var inspection: Result<ParsedKey, Error>? {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return Result { try KeyImporter.inspect(text) }
     }
 
     private var parsed: ParsedKey? {
@@ -117,7 +116,17 @@ struct KeyImportView: View {
                 }
             }
             .onChange(of: savePassphrase) { _, on in if !on { passphrase = "" } }
-            .onChange(of: text) { _, _ in error = nil }
+            .onChange(of: text) { _, newValue in
+                error = nil
+                passphrase = ""
+                savePassphrase = false
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                inspection = trimmed.isEmpty ? nil : Result { try KeyImporter.inspect(newValue) }
+            }
+            .onDisappear {
+                fileImportTask?.cancel()
+                fileImportTask = nil
+            }
             .navigationTitle("Import Key")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -142,19 +151,38 @@ struct KeyImportView: View {
                             self.error = Self.describe(error)
                         }
                     }
-                    .disabled(trimmedName.isEmpty || parsed == nil)
+                    .disabled(trimmedName.isEmpty || parsed == nil || (savePassphrase && passphrase.isEmpty))
                 }
             }
             .fileImporter(isPresented: $showPicker, allowedContentTypes: [.data, .text]) { result in
-                switch result {
-                case .success(let url):
-                    let scoped = url.startAccessingSecurityScopedResource()
-                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                    do { text = try String(contentsOf: url, encoding: .utf8) } catch { self.error = "\(error)" }
-                case .failure(let e):
-                    error = "\(e)"
+                loadImportedKeyFile(result)
+            }
+        }
+    }
+
+    private func loadImportedKeyFile(_ result: Result<URL, any Error>) {
+        fileImportTask?.cancel()
+        switch result {
+        case .success(let url):
+            fileImportTask = Task { @MainActor in
+                defer { fileImportTask = nil }
+                do {
+                    let decoded = try await SecurityScopedFileReader.readText(
+                        from: url,
+                        maxBytes: Self.maxKeyFileBytes
+                    )
+                    guard !Task.isCancelled else { return }
+                    text = decoded
+                    error = nil
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    self.error = error.localizedDescription
                 }
             }
+        case .failure(let e):
+            error = e.localizedDescription
         }
     }
 

@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import SwiftTerm
+import UniformTypeIdentifiers
 
 /// Handle a parent keeps to drive the terminal from outside (toolbar buttons, shortcuts).
 @MainActor
@@ -309,17 +310,25 @@ public struct TerminalHostView: UIViewRepresentable {
         if let host = view as? HostTerminalView {
             host.onFirstSizedLayout = nil  // a late layout must not attach after detach
             host.onPinchFontSize = nil
+            host.keyCommandHandler = nil
         }
+        view.terminalDelegate = nil
+        view.inputAccessoryView = nil
         coordinator.detach()
     }
 
     @MainActor
     public final class Coordinator: NSObject, TerminalViewDelegate {
+        static let maxClipboardBytes = 64 * 1024
+
         var io: any TerminalIO
         var appliedFontSize: CGFloat = 0
         var appliedFontFamily: TerminalFontFamily?
         var appliedTheme: TerminalTheme?
         var appliedCursorStyle: TerminalCursorStyle?
+        var writePasteboard: @MainActor (_ items: [[String: Any]], _ options: [UIPasteboard.OptionsKey: Any]) -> Void = { items, options in
+            UIPasteboard.general.setItems(items, options: options)
+        }
         private var pump: Task<Void, Never>?
         /// True while replayed output is being fed: the terminal's answers to queries in it
         /// (DA, DSR, OSC colour) were already sent by an earlier view and must not reach the remote again.
@@ -366,8 +375,12 @@ public struct TerminalHostView: UIViewRepresentable {
         }
         public nonisolated func clipboardCopy(source: TerminalView, content: Data) {
             MainActor.assumeIsolated {
-                guard !replaying else { return }
-                UIPasteboard.general.string = String(decoding: content, as: UTF8.self)
+                guard !replaying, content.count <= Self.maxClipboardBytes else { return }
+                let text = String(decoding: content, as: UTF8.self)
+                writePasteboard(
+                    [[UTType.utf8PlainText.identifier: text]],
+                    [.localOnly: true]
+                )
             }
         }
         public nonisolated func rangeChanged(source: TerminalView, startY: Int, endY: Int) {}

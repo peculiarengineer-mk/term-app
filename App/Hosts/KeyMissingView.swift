@@ -16,6 +16,7 @@ struct KeyMissingView: View {
     @State private var showGenerate = false
     @State private var showEditor = false
     @State private var pendingRetry = false
+    @State private var saveError: String?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
 
@@ -112,19 +113,40 @@ struct KeyMissingView: View {
                 assignKey(newKey)
             })
         }
-        .sheet(isPresented: $showEditor, onDismiss: onRetry) {
+        .sheet(isPresented: $showEditor, onDismiss: retryIfCreated) {
             NavigationStack {
-                HostEditorView(host: host)
+                HostEditorView(host: host, onSaved: {
+                    pendingRetry = true
+                })
             }
+        }
+        .alert(
+            "Error",
+            isPresented: Binding(get: { saveError != nil }, set: { if !$0 { saveError = nil } })
+        ) {
+            Button("OK") {}
+        } message: {
+            Text(saveError ?? "")
         }
     }
 
     private func assignKey(_ newKey: StoredKey) {
+        let previousKeyID = host.keyID
+        let previousAuthMethod = host.authMethod
+        let previousUpdatedAt = host.updatedAt
         host.keyID = newKey.id
         host.authMethod = "key"
         host.touch()
-        try? context.save()
-        pendingRetry = true
+        do {
+            try context.save()
+            pendingRetry = true
+        } catch {
+            context.rollback()
+            host.keyID = previousKeyID
+            host.authMethod = previousAuthMethod
+            host.updatedAt = previousUpdatedAt
+            saveError = "Could not assign key to host: \(error.localizedDescription)"
+        }
     }
 
     private func retryIfCreated() {

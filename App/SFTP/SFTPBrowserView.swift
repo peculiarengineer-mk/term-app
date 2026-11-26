@@ -6,6 +6,14 @@ import TermUI
 
 /// Sheet for browsing and managing remote files over SFTP on an active `SSHConnection`.
 struct SFTPBrowserView: View {
+    private static let maxUploadBytes = 50 * 1024 * 1024
+
+    struct PendingUpload {
+        let data: Data
+        let fileName: String
+        let targetDirectory: String
+    }
+
     let connection: SSHConnection
     let hostTitle: String
 
@@ -15,8 +23,10 @@ struct SFTPBrowserView: View {
     @State private var rootPath = ""
     @State private var navigationPath: [String] = []
     @State private var directoryRefreshTokens: [String: Int] = [:]
+    @State private var loadedEntriesByDirectory: [String: [SFTPEntry]] = [:]
     @State private var workingStatus: String?
     @State private var activeTransferTask: Task<Void, Never>?
+    @State private var fileImportTask: Task<Void, Never>?
     @State private var mutationGeneration = 0
     @State private var previewEntry: SFTPEntry?
     @State private var showingImporter = false
@@ -30,6 +40,7 @@ struct SFTPBrowserView: View {
     @State private var showingRenameAlert = false
     @State private var deletingEntry: SFTPEntry?
     @State private var deleteSourceDirectory = ""
+    @State private var pendingOverwriteUpload: PendingUpload?
     @State private var actionError: String?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
@@ -81,15 +92,22 @@ struct SFTPBrowserView: View {
                 renamingEntry: $renamingEntry,
                 renameText: $renameText,
                 deletingEntry: $deletingEntry,
+                pendingOverwriteUpload: $pendingOverwriteUpload,
                 actionError: $actionError,
                 onCreateFolder: { name in createFolder(named: name, in: newFolderTargetDirectory) },
                 onRename: { entry, name in renameEntry(entry, to: name, in: renameSourceDirectory) },
-                onDelete: { entry in deleteEntry(entry, in: deleteSourceDirectory) }
+                onDelete: { entry in deleteEntry(entry, in: deleteSourceDirectory) },
+                onConfirmOverwrite: { pending in
+                    performUpload(data: pending.data, fileName: pending.fileName, in: pending.targetDirectory)
+                }
             )
         )
         .onDisappear {
+            fileImportTask?.cancel()
+            fileImportTask = nil
             activeTransferTask?.cancel()
             activeTransferTask = nil
+            pendingOverwriteUpload = nil
         }
     }
 
@@ -104,6 +122,9 @@ struct SFTPBrowserView: View {
             refreshToken: directoryRefreshTokens[path] ?? 0,
             onResolvedRootPath: { resolved in
                 rootPath = resolved
+            },
+            onLoadedEntries: { dirPath, entries in
+                loadedEntriesByDirectory[dirPath] = entries
             },
             onNavigateToDirectory: { targetPath in
                 navigateToDirectory(targetPath)
@@ -188,6 +209,8 @@ struct SFTPBrowserView: View {
     private func cancelActiveTransfer() {
         AppHaptics.impact(.light)
         mutationGeneration += 1
+        fileImportTask?.cancel()
+        fileImportTask = nil
         activeTransferTask?.cancel()
         activeTransferTask = nil
         workingStatus = nil
@@ -223,24 +246,40 @@ struct SFTPBrowserView: View {
     }
 
     private func handleFileImport(_ result: Result<URL, any Error>, targetDirectory: String) {
+        fileImportTask?.cancel()
         switch result {
         case .success(let url):
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer {
-                if scoped {
-                    url.stopAccessingSecurityScopedResource()
-                }
+            let fileName = url.lastPathComponent
+            guard Self.isValidEntryName(fileName) else {
+                actionError = "Selected file has an invalid filename."
+                return
             }
-            do {
-                let data = try Data(contentsOf: url)
-                let fileName = url.lastPathComponent
-                guard !fileName.isEmpty else {
-                    actionError = "Selected file has an invalid filename."
-                    return
+            let statusText = "Preparing \(fileName)…"
+            workingStatus = statusText
+            fileImportTask = Task { @MainActor in
+                defer {
+                    fileImportTask = nil
+                    if workingStatus == statusText {
+                        workingStatus = nil
+                    }
                 }
-                uploadFile(data: data, fileName: fileName, in: targetDirectory)
-            } catch {
-                actionError = "Could not read selected file: \(error.localizedDescription)"
+                do {
+                    let data = try await SecurityScopedFileReader.readData(
+                        from: url,
+                        maxBytes: Self.maxUploadBytes
+                    )
+                    guard !Task.isCancelled else { return }
+                    if workingStatus == statusText {
+                        workingStatus = nil
+                    }
+                    uploadFile(data: data, fileName: fileName, in: targetDirectory)
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    AppHaptics.notify(.error)
+                    actionError = "Could not read selected file: \(error.localizedDescription)"
+                }
             }
         case .failure(let error):
             actionError = "Could not import file: \(error.localizedDescription)"
@@ -249,6 +288,23 @@ struct SFTPBrowserView: View {
 
     private func uploadFile(data: Data, fileName: String, in targetDir: String) {
         guard !targetDir.isEmpty else { return }
+        guard Self.isValidEntryName(fileName) else {
+            actionError = "Selected file has an invalid filename."
+            return
+        }
+        if let existing = loadedEntriesByDirectory[targetDir]?.first(where: { $0.name == fileName }) {
+            if existing.isDirectory {
+                AppHaptics.notify(.error)
+                actionError = "A folder named \"\(fileName)\" already exists in \(targetDir)."
+                return
+            }
+            pendingOverwriteUpload = PendingUpload(data: data, fileName: fileName, targetDirectory: targetDir)
+            return
+        }
+        performUpload(data: data, fileName: fileName, in: targetDir)
+    }
+
+    private func performUpload(data: Data, fileName: String, in targetDir: String) {
         let remotePath = SFTPPath.join(targetDir, fileName)
         startMutation(status: "Uploading \(fileName)…", failurePrefix: "Upload failed") {
             try await connection.sftpUploadFile(data: data, remotePath: remotePath)
@@ -260,7 +316,7 @@ struct SFTPBrowserView: View {
 
     private func createFolder(named rawName: String, in targetDir: String) {
         let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isValidEntryName(trimmed) else {
+        guard Self.isValidEntryName(trimmed) else {
             actionError = "Please enter a valid folder name without '/'."
             return
         }
@@ -277,7 +333,7 @@ struct SFTPBrowserView: View {
     private func renameEntry(_ entry: SFTPEntry, to rawName: String, in targetDir: String) {
         renamingEntry = nil
         let trimmed = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isValidEntryName(trimmed) else {
+        guard Self.isValidEntryName(trimmed) else {
             actionError = "Please enter a valid name without '/'."
             return
         }
@@ -300,8 +356,13 @@ struct SFTPBrowserView: View {
         }
     }
 
-    private func isValidEntryName(_ name: String) -> Bool {
-        !name.isEmpty && !name.contains("/") && name != "." && name != ".."
+    static func isValidEntryName(_ name: String) -> Bool {
+        guard !name.isEmpty, !name.contains("/"), name != ".", name != ".." else {
+            return false
+        }
+        return !name.unicodeScalars.contains { scalar in
+            scalar == "\0" || CharacterSet.controlCharacters.contains(scalar)
+        }
     }
 
     static func iconName(for entry: SFTPEntry) -> String {
@@ -350,6 +411,7 @@ private struct SFTPDirectoryView: View {
     let isMutating: Bool
     let refreshToken: Int
     let onResolvedRootPath: (String) -> Void
+    let onLoadedEntries: (String, [SFTPEntry]) -> Void
     let onNavigateToDirectory: (String) -> Void
     let onPreviewFile: (SFTPEntry) -> Void
     let onNewFolder: (String) -> Void
@@ -699,6 +761,7 @@ private struct SFTPDirectoryView: View {
             loadedPath = resolved
             entries = listing
             isLoading = false
+            onLoadedEntries(resolved, listing)
             onResolvedRootPath(resolved)
         } catch is CancellationError {
             if generation == loadGeneration {
@@ -729,6 +792,7 @@ private struct SFTPDirectoryView: View {
             loadedPath = targetPath
             entries = listing
             isLoading = false
+            onLoadedEntries(targetPath, listing)
         } catch is CancellationError {
             if generation == loadGeneration {
                 isLoading = false
@@ -776,6 +840,7 @@ private struct SFTPFileDetailSheet: View {
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
 
     @State private var downloadedData: Data?
+    @State private var fetchedOnlyForExport = false
     @State private var previewImage: UIImage?
     @State private var previewText: String?
     @State private var isLoadingPreview = false
@@ -783,6 +848,8 @@ private struct SFTPFileDetailSheet: View {
     @State private var errorMessage: String?
     @State private var copied = false
     @State private var copyResetTask: Task<Void, Never>?
+    @State private var previewTask: Task<Void, Never>?
+    @State private var exportTask: Task<Void, Never>?
     @State private var exportDocument: SFTPExportDocument?
     @State private var isExporting = false
     @State private var didStartInitialLoad = false
@@ -828,7 +895,7 @@ private struct SFTPFileDetailSheet: View {
                     }
 
                     Button {
-                        Task { await exportFile() }
+                        startExport()
                     } label: {
                         if isDownloadingForExport {
                             ProgressView()
@@ -849,6 +916,11 @@ private struct SFTPFileDetailSheet: View {
             .onDisappear {
                 copyResetTask?.cancel()
                 copyResetTask = nil
+                previewTask?.cancel()
+                previewTask = nil
+                exportTask?.cancel()
+                exportTask = nil
+                clearExportOnlyData()
             }
             .fileExporter(
                 isPresented: $isExporting,
@@ -861,6 +933,12 @@ private struct SFTPFileDetailSheet: View {
                     AppHaptics.notify(.success)
                 case .failure(let error):
                     errorMessage = "Export failed: \(error.localizedDescription)"
+                }
+                clearExportOnlyData()
+            }
+            .onChange(of: isExporting) { _, exporting in
+                if !exporting {
+                    clearExportOnlyData()
                 }
             }
         }
@@ -929,7 +1007,7 @@ private struct SFTPFileDetailSheet: View {
             Spacer()
 
             Button {
-                Task { await exportFile() }
+                startExport()
             } label: {
                 Label("Export…", systemImage: "square.and.arrow.up")
             }
@@ -977,7 +1055,11 @@ private struct SFTPFileDetailSheet: View {
                             .foregroundStyle(palette.critical)
                         if canPreviewInline {
                             Button("Retry") {
-                                Task { await loadInlinePreview() }
+                                previewTask?.cancel()
+                                previewTask = Task { @MainActor in
+                                    defer { previewTask = nil }
+                                    await loadInlinePreview()
+                                }
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -996,7 +1078,7 @@ private struct SFTPFileDetailSheet: View {
 
             Section {
                 Button {
-                    Task { await exportFile() }
+                    startExport()
                 } label: {
                     HStack {
                         Spacer()
@@ -1035,7 +1117,9 @@ private struct SFTPFileDetailSheet: View {
                 remotePath: entry.path,
                 maxBytes: Int(previewByteLimit)
             )
+            guard !Task.isCancelled else { return }
             downloadedData = data
+            fetchedOnlyForExport = false
             if isImageFile, let image = UIImage(data: data) {
                 previewImage = image
                 previewText = nil
@@ -1049,7 +1133,16 @@ private struct SFTPFileDetailSheet: View {
         } catch is CancellationError {
             return
         } catch {
+            guard !Task.isCancelled else { return }
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func startExport() {
+        guard exportTask == nil else { return }
+        exportTask = Task { @MainActor in
+            defer { exportTask = nil }
+            await exportFile()
         }
     }
 
@@ -1066,17 +1159,36 @@ private struct SFTPFileDetailSheet: View {
 
         do {
             let data = try await connection.sftpDownloadFile(remotePath: entry.path)
+            guard !Task.isCancelled else { return }
             downloadedData = data
+            fetchedOnlyForExport = true
             exportDocument = SFTPExportDocument(data: data)
             isExporting = true
+        } catch is CancellationError {
+            return
         } catch {
+            guard !Task.isCancelled else { return }
             AppHaptics.notify(.error)
             errorMessage = "Download failed: \(error.localizedDescription)"
         }
     }
 
+    private func clearExportOnlyData() {
+        exportDocument = nil
+        if fetchedOnlyForExport {
+            downloadedData = nil
+            fetchedOnlyForExport = false
+        }
+    }
+
     private func copyText(_ text: String) {
-        UIPasteboard.general.string = text
+        UIPasteboard.general.setItems(
+            [[UTType.utf8PlainText.identifier: text]],
+            options: [
+                .localOnly: true,
+                .expirationDate: Date().addingTimeInterval(120)
+            ]
+        )
         AppHaptics.notify(.success)
         copied = true
         copyResetTask?.cancel()
@@ -1089,6 +1201,34 @@ private struct SFTPFileDetailSheet: View {
 }
 
 private struct SFTPAlertsModifier: ViewModifier {
+    private enum ActiveAlert {
+        case newFolder
+        case rename(SFTPEntry)
+        case error(String)
+
+        var title: String {
+            switch self {
+            case .newFolder: "New Folder"
+            case .rename: "Rename"
+            case .error: "SFTP Error"
+            }
+        }
+    }
+
+    private enum ActiveConfirmation {
+        case delete(SFTPEntry)
+        case overwrite(SFTPBrowserView.PendingUpload)
+
+        var title: String {
+            switch self {
+            case .delete(let entry):
+                "Delete \"\(entry.name)\"?"
+            case .overwrite(let upload):
+                "Replace \"\(upload.fileName)\"?"
+            }
+        }
+    }
+
     let currentPath: String
     @Binding var showingNewFolderAlert: Bool
     @Binding var newFolderName: String
@@ -1096,68 +1236,182 @@ private struct SFTPAlertsModifier: ViewModifier {
     @Binding var renamingEntry: SFTPEntry?
     @Binding var renameText: String
     @Binding var deletingEntry: SFTPEntry?
+    @Binding var pendingOverwriteUpload: SFTPBrowserView.PendingUpload?
     @Binding var actionError: String?
     let onCreateFolder: (String) -> Void
     let onRename: (SFTPEntry, String) -> Void
     let onDelete: (SFTPEntry) -> Void
+    let onConfirmOverwrite: (SFTPBrowserView.PendingUpload) -> Void
 
-    private var deleteConfirmationTitle: String {
-        guard let entry = deletingEntry else { return "Delete item?" }
-        return "Delete \"\(entry.name)\"?"
+    @State private var presentedAlert: ActiveAlert?
+    @State private var syncAlertTask: Task<Void, Never>?
+
+    private var activeConfirmation: ActiveConfirmation? {
+        if let deletingEntry {
+            return .delete(deletingEntry)
+        }
+        if let pendingOverwriteUpload {
+            return .overwrite(pendingOverwriteUpload)
+        }
+        return nil
+    }
+
+    private var isNewFolderNameValid: Bool {
+        SFTPBrowserView.isValidEntryName(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    private var isRenameTextValid: Bool {
+        SFTPBrowserView.isValidEntryName(renameText.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
     func body(content: Content) -> some View {
         content
-            .alert("New Folder", isPresented: $showingNewFolderAlert) {
-                TextField("Folder name", text: $newFolderName)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Button("Create") { onCreateFolder(newFolderName) }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Create a new directory inside \(currentPath).")
-            }
             .alert(
-                "Rename",
-                isPresented: $showingRenameAlert,
-                presenting: renamingEntry
-            ) { entry in
-                TextField("New name", text: $renameText)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                Button("Rename") { onRename(entry, renameText) }
-                Button("Cancel", role: .cancel) { renamingEntry = nil }
-            } message: { entry in
-                Text("Enter a new name for \"\(entry.name)\".")
-            }
-            .confirmationDialog(
-                deleteConfirmationTitle,
+                presentedAlert?.title ?? "",
                 isPresented: Binding(
-                    get: { deletingEntry != nil },
-                    set: { if !$0 { deletingEntry = nil } }
+                    get: { presentedAlert != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            dismissCurrentAlert()
+                        }
+                    }
                 ),
-                titleVisibility: .visible,
-                presenting: deletingEntry
-            ) { entry in
-                Button("Delete", role: .destructive) { onDelete(entry) }
-                Button("Cancel", role: .cancel) {}
-            } message: { entry in
-                if entry.isDirectory {
-                    Text("This removes the empty directory \"\(entry.name)\" from the remote server.")
-                } else {
-                    Text("This permanently deletes \"\(entry.name)\" from the remote server.")
+                presenting: presentedAlert
+            ) { alert in
+                switch alert {
+                case .newFolder:
+                    TextField("Folder name", text: $newFolderName)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("Create") {
+                        onCreateFolder(newFolderName)
+                    }
+                    .disabled(!isNewFolderNameValid)
+                    Button("Cancel", role: .cancel) {}
+
+                case .rename(let entry):
+                    TextField("New name", text: $renameText)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Button("Rename") {
+                        onRename(entry, renameText)
+                    }
+                    .disabled(!isRenameTextValid)
+                    Button("Cancel", role: .cancel) {
+                        renamingEntry = nil
+                    }
+
+                case .error:
+                    Button("OK") {}
+                }
+            } message: { alert in
+                switch alert {
+                case .newFolder:
+                    Text("Create a new directory inside \(currentPath).")
+                case .rename(let entry):
+                    Text("Enter a new name for \"\(entry.name)\".")
+                case .error(let message):
+                    Text(message)
                 }
             }
-            .alert(
-                "SFTP Error",
+            .confirmationDialog(
+                activeConfirmation?.title ?? "",
                 isPresented: Binding(
-                    get: { actionError != nil },
-                    set: { if !$0 { actionError = nil } }
-                )
-            ) {
-                Button("OK") {}
-            } message: {
-                Text(actionError ?? "")
+                    get: { activeConfirmation != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            deletingEntry = nil
+                            pendingOverwriteUpload = nil
+                        }
+                    }
+                ),
+                titleVisibility: .visible,
+                presenting: activeConfirmation
+            ) { confirmation in
+                switch confirmation {
+                case .delete(let entry):
+                    Button("Delete", role: .destructive) { onDelete(entry) }
+                    Button("Cancel", role: .cancel) {}
+                case .overwrite(let upload):
+                    Button("Replace", role: .destructive) {
+                        pendingOverwriteUpload = nil
+                        onConfirmOverwrite(upload)
+                    }
+                    Button("Cancel", role: .cancel) {
+                        pendingOverwriteUpload = nil
+                    }
+                }
+            } message: { confirmation in
+                switch confirmation {
+                case .delete(let entry):
+                    if entry.isDirectory {
+                        Text("This removes the empty directory \"\(entry.name)\" from the remote server.")
+                    } else {
+                        Text("This permanently deletes \"\(entry.name)\" from the remote server.")
+                    }
+                case .overwrite(let upload):
+                    Text("A file named \"\(upload.fileName)\" already exists in \(upload.targetDirectory). Replacing it will overwrite its contents.")
+                }
             }
+            .onAppear {
+                syncAlertPresentation()
+            }
+            .onChange(of: showingNewFolderAlert) { _, _ in
+                syncAlertPresentation()
+            }
+            .onChange(of: showingRenameAlert) { _, _ in
+                syncAlertPresentation()
+            }
+            .onChange(of: actionError) { _, _ in
+                syncAlertPresentation()
+            }
+            .onDisappear {
+                syncAlertTask?.cancel()
+                syncAlertTask = nil
+            }
+    }
+
+    private func desiredAlert() -> ActiveAlert? {
+        if showingNewFolderAlert {
+            return .newFolder
+        }
+        if showingRenameAlert, let renamingEntry {
+            return .rename(renamingEntry)
+        }
+        if let actionError {
+            return .error(actionError)
+        }
+        return nil
+    }
+
+    private func syncAlertPresentation() {
+        let next = desiredAlert()
+        if presentedAlert == nil {
+            presentedAlert = next
+        } else if next == nil {
+            presentedAlert = nil
+        }
+    }
+
+    private func dismissCurrentAlert() {
+        switch presentedAlert {
+        case .newFolder:
+            showingNewFolderAlert = false
+        case .rename:
+            showingRenameAlert = false
+            renamingEntry = nil
+        case .error:
+            actionError = nil
+        case nil:
+            break
+        }
+        presentedAlert = nil
+        guard desiredAlert() != nil else { return }
+        syncAlertTask?.cancel()
+        syncAlertTask = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            syncAlertPresentation()
+        }
     }
 }

@@ -121,6 +121,26 @@ public enum GitDiffHelper {
     private static let diffBeginMarker = "TERMAPP_GIT_DIFF_BEGIN"
     private static let diffEndMarker = "TERMAPP_GIT_DIFF_END"
 
+    // MARK: - Path Validation
+
+    /// Validates that `path` is a non-empty relative path without NUL, newlines, leading `/`, or `..` traversal components.
+    public static func isSafeRelativePath(_ path: String) -> Bool {
+        guard !path.isEmpty,
+              !path.contains("\0"),
+              !path.contains("\r"),
+              !path.contains("\n"),
+              !path.hasPrefix("/")
+        else {
+            return false
+        }
+        let components = path.split(separator: "/", omittingEmptySubsequences: false)
+        if components.contains("..") {
+            return false
+        }
+        let meaningful = components.filter { !$0.isEmpty && $0 != "." }
+        return !meaningful.isEmpty
+    }
+
     // MARK: - Command Builders
 
     /// Builds a POSIX-compatible command that prints structured git status and unified diff markers in `directory`.
@@ -132,8 +152,8 @@ public enum GitDiffHelper {
         let printRoot = "printf '\(rootPrefix)%s\\n' \"$_root\""
         let branchCheck = "_branch=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo detached)"
         let printBranch = "printf '\(branchPrefix)%s\\n' \"$_branch\""
-        let statusSection = "printf '\(statusBeginMarker)\\n'; git status --porcelain=v1 2>/dev/null || true; printf '\(statusEndMarker)\\n'"
-        let diffBody = "if git rev-parse --verify HEAD >/dev/null 2>&1; then git diff HEAD --no-color 2>/dev/null || true; else git diff --no-color 2>/dev/null || true; fi"
+        let statusSection = "printf '\(statusBeginMarker)\\n'; git -c core.quotepath=false status --porcelain=v1 2>/dev/null || true; printf '\(statusEndMarker)\\n'"
+        let diffBody = "if git rev-parse --verify HEAD >/dev/null 2>&1; then git -c core.quotepath=false diff HEAD --no-color 2>/dev/null || true; else git -c core.quotepath=false diff --no-color 2>/dev/null || true; fi"
         let diffSection = "printf '\(diffBeginMarker)\\n'; \(diffBody); printf '\(diffEndMarker)\\n'"
 
         return "\(pathPrefix); \(cdCheck); \(rootCheck); \(printRoot); \(branchCheck); \(printBranch); \(statusSection); \(diffSection)"
@@ -148,10 +168,21 @@ public enum GitDiffHelper {
 
     /// Builds a POSIX-compatible command that discards local modifications to `path` (or removes it when untracked).
     public static func discardFileCommand(in directory: String, path: String, isUntracked: Bool) -> String {
+        guard isSafeRelativePath(path) else {
+            return "printf '%s\\n' 'Invalid path' >&2; false"
+        }
         let dirExpr = TMuxSessionHelper.shellPathExpression(for: directory)
         let quotedPath = TMuxSessionHelper.shellQuote(path)
-        let action = isUntracked ? "rm -f -- \(quotedPath)" : "git checkout -- \(quotedPath)"
-        return "export PATH=\"\(standardPATH):$PATH\"; cd -- \(dirExpr) && \(action)"
+        let rootCd = "cd -- \(dirExpr) && _root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n \"$_root\" ] && cd -- \"$_root\""
+
+        let action: String
+        if isUntracked {
+            action = "git clean -fd -- \(quotedPath)"
+        } else {
+            action = "if git rev-parse --verify HEAD >/dev/null 2>&1; then git reset -q HEAD -- \(quotedPath) && { if git ls-files --error-unmatch -- \(quotedPath) >/dev/null 2>&1; then git checkout -- \(quotedPath); else rm -rf -- \(quotedPath); fi; }; else git rm --cached -q -f -- \(quotedPath) && rm -rf -- \(quotedPath); fi"
+        }
+
+        return "export PATH=\"\(standardPATH):$PATH\"; \(rootCd) && \(action)"
     }
 
     // MARK: - Parsers
@@ -172,22 +203,21 @@ public enum GitDiffHelper {
         var activeSection: Section = .none
 
         for rawLine in splitLinesPreservingSpaces(output) {
-            let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
-
             switch activeSection {
             case .status:
-                if trimmed == statusEndMarker {
+                if rawLine == statusEndMarker {
                     activeSection = .none
                 } else {
                     statusLines.append(rawLine)
                 }
             case .diff:
-                if trimmed == diffEndMarker {
+                if rawLine == diffEndMarker {
                     activeSection = .none
                 } else {
                     diffLines.append(rawLine)
                 }
             case .none:
+                let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
                 if trimmed == notAGitRepoMarker {
                     return GitRepoSnapshot(isGitRepo: false)
                 } else if trimmed.hasPrefix(rootPrefix) {
@@ -436,7 +466,7 @@ public enum GitDiffHelper {
             return unquoteCStringIfNeeded(String(rest[bRange.upperBound...]))
         }
         if let quotedBRange = rest.range(of: " \"b/", options: .backwards) {
-            let raw = "\"" + String(rest[rest.index(quotedBRange.upperBound, offsetBy: 0)...])
+            let raw = "\"b/" + String(rest[quotedBRange.upperBound...])
             return stripDiffPathPrefix(raw, prefix: "b/")
         }
         return ""
@@ -454,31 +484,64 @@ public enum GitDiffHelper {
         guard raw.count >= 2, raw.first == "\"", raw.last == "\"" else {
             return raw
         }
-        let inner = raw.dropFirst().dropLast()
-        var result = ""
-        result.reserveCapacity(inner.count)
+        let chars = Array(raw.dropFirst().dropLast())
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(chars.count)
 
-        var iterator = inner.makeIterator()
-        while let ch = iterator.next() {
+        var i = 0
+        while i < chars.count {
+            let ch = chars[i]
             if ch != "\\" {
-                result.append(ch)
+                bytes.append(contentsOf: String(ch).utf8)
+                i += 1
                 continue
             }
-            guard let escaped = iterator.next() else {
-                result.append("\\")
+            i += 1
+            guard i < chars.count else {
+                bytes.append(UInt8(ascii: "\\"))
                 break
             }
+            let escaped = chars[i]
             switch escaped {
-            case "n": result.append("\n")
-            case "r": result.append("\r")
-            case "t": result.append("\t")
-            case "\\": result.append("\\")
-            case "\"": result.append("\"")
+            case "a": bytes.append(0x07); i += 1
+            case "b": bytes.append(0x08); i += 1
+            case "f": bytes.append(0x0C); i += 1
+            case "n": bytes.append(UInt8(ascii: "\n")); i += 1
+            case "r": bytes.append(UInt8(ascii: "\r")); i += 1
+            case "t": bytes.append(UInt8(ascii: "\t")); i += 1
+            case "v": bytes.append(0x0B); i += 1
+            case "\\": bytes.append(UInt8(ascii: "\\")); i += 1
+            case "\"": bytes.append(UInt8(ascii: "\"")); i += 1
+            case "0"..."7":
+                if i + 2 < chars.count,
+                   let d1 = octalDigitValue(chars[i]),
+                   let d2 = octalDigitValue(chars[i + 1]),
+                   let d3 = octalDigitValue(chars[i + 2]),
+                   case let value = (d1 << 6) | (d2 << 3) | d3,
+                   value <= 0xFF
+                {
+                    bytes.append(UInt8(value))
+                    i += 3
+                } else {
+                    bytes.append(contentsOf: String(escaped).utf8)
+                    i += 1
+                }
             default:
-                result.append(escaped)
+                bytes.append(contentsOf: String(escaped).utf8)
+                i += 1
             }
         }
 
-        return result
+        return String(bytes: bytes, encoding: .utf8) ?? String(decoding: bytes, as: UTF8.self)
+    }
+
+    private static func octalDigitValue(_ ch: Character) -> Int? {
+        guard let ascii = ch.asciiValue,
+              ascii >= UInt8(ascii: "0"),
+              ascii <= UInt8(ascii: "7")
+        else {
+            return nil
+        }
+        return Int(ascii - UInt8(ascii: "0"))
     }
 }

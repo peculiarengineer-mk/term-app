@@ -31,6 +31,7 @@ public enum SSHExec {
         auth: SSHAuth,
         command: String,
         timeout: Duration = defaultTimeout,
+        jumpHops: [SSHJumpHop] = [],
         verifyHostKey: @escaping @Sendable (HostKey) async -> HostKeyDecision
     ) async throws -> SSHExecResult {
         try Task.checkCancellation()
@@ -39,7 +40,7 @@ public enum SSHExec {
         }
 
         let deadline = ContinuousClock.now + timeout
-        let conn = SSHConnection(host: host, port: port, username: username, auth: auth)
+        let conn = SSHConnection(host: host, port: port, username: username, auth: auth, jumpHops: jumpHops)
 
         do {
             let result = try await withThrowingTaskGroup(of: SSHExecResult.self) { group in

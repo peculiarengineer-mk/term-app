@@ -106,8 +106,8 @@ struct ReconnectPromptView: View {
 
         case .prompt(let key):
             HostKeyPromptView(
-                hostname: model.hostname,
-                port: model.port,
+                hostname: model.hostKeyPromptHostname,
+                port: model.hostKeyPromptPort,
                 key: key,
                 onTrust: { model.trust(key) },
                 onCancel: { model.cancelPrompt() }
@@ -115,8 +115,8 @@ struct ReconnectPromptView: View {
 
         case .mismatch(let stored, let presented):
             HostKeyMismatchView(
-                hostname: model.hostname,
-                port: model.port,
+                hostname: model.hostKeyPromptHostname,
+                port: model.hostKeyPromptPort,
                 stored: stored,
                 presented: presented,
                 onReplace: { model.replaceStoredKey(with: presented) },

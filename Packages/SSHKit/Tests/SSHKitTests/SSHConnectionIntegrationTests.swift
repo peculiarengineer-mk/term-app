@@ -187,4 +187,73 @@ final class SSHConnectionIntegrationTests: XCTestCase {
         _ = await collect(admin, until: "removed2\r\n")
         await admin.close()
     }
+
+    func testProxyJumpMultiHopSessionExecAndSFTP() async throws {
+        let e = try env(needPassword: true)
+        let hop1 = SSHJumpHop(host: e.host, port: e.port, username: e.user, auth: .password(e.password!)) { _ in .trust }
+        let hop2 = SSHJumpHop(host: e.host, port: e.port, username: e.user, auth: .password(e.password!)) { _ in .trust }
+
+        let conn = SSHConnection(
+            host: e.host,
+            port: e.port,
+            username: e.user,
+            auth: .password(e.password!),
+            jumpHops: [hop1, hop2]
+        )
+        try await connect(conn)
+        let activeJumps = await conn.activeJumpConnectionCountForTesting
+        XCTAssertEqual(activeJumps, 2)
+
+        try await conn.write(Data("echo jump_pty_ok\n".utf8))
+        let ptyText = await collect(conn, until: "jump_pty_ok\r\n")
+        XCTAssertTrue(ptyText.contains("jump_pty_ok"), "output: \(ptyText)")
+
+        let execRes = try await conn.exec("echo jump_exec_ok", timeout: .seconds(10))
+        XCTAssertEqual(execRes.exitCode, 0)
+        XCTAssertTrue(execRes.stdout.contains("jump_exec_ok"))
+
+        let entries = try await conn.sftpListDirectory(path: ".")
+        XCTAssertNotNil(entries)
+        await conn.close()
+
+        let jumpCountAfterClose = await conn.activeJumpConnectionCountForTesting
+        XCTAssertEqual(jumpCountAfterClose, 0)
+
+        let oneShot = try await SSHExec.runCommand(
+            host: e.host,
+            port: e.port,
+            username: e.user,
+            auth: .password(e.password!),
+            command: "echo oneshot_jump_ok",
+            timeout: .seconds(15),
+            jumpHops: [hop1]
+        ) { _ in .trust }
+        XCTAssertEqual(oneShot.exitCode, 0)
+        XCTAssertTrue(oneShot.stdout.contains("oneshot_jump_ok"))
+    }
+
+    func testAgentForwardingListsForwardedIdentity() async throws {
+        let e = try env(needPassword: true)
+        let key = Curve25519.Signing.PrivateKey()
+        let blob = Self.sshString(Data("ssh-ed25519".utf8)) + Self.sshString(key.publicKey.rawRepresentation)
+        let comment = "termapp-agent-fwd-test"
+        let identity = SSHAgentIdentity(publicKeyBlob: blob, comment: comment) { data in
+            try? key.signature(for: data)
+        }
+        let conn = SSHConnection(
+            host: e.host,
+            port: e.port,
+            username: e.user,
+            auth: .password(e.password!),
+            agentForwarding: SSHAgentForwardingConfig(identities: [identity])
+        )
+        try await connect(conn)
+        try await conn.write(Data("ssh-add -L; echo agent_done\n".utf8))
+        let text = await collect(conn, until: "agent_done\r\n")
+        XCTAssertTrue(text.contains("agent_done"), "output: \(text)")
+        if text.contains("SSH_AUTH_SOCK") || !text.contains("Could not open a connection") {
+            XCTAssertTrue(text.contains(comment), "expected forwarded key comment in: \(text)")
+        }
+        await conn.close()
+    }
 }

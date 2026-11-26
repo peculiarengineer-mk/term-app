@@ -130,6 +130,19 @@ enum SocketPoller {
         }
     }
 
+    static func errorString(for code: Int32) -> String {
+        var buffer = [CChar](repeating: 0, count: 256)
+        let rc = strerror_r(code, &buffer, buffer.count)
+        if rc == 0 || (rc == EINVAL && buffer[0] != 0) {
+            let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+            let message = String(decoding: bytes, as: UTF8.self)
+            if !message.isEmpty {
+                return message
+            }
+        }
+        return "errno \(code)"
+    }
+
     static func remainingMilliseconds(until deadline: ContinuousClock.Instant) -> Int64 {
         let rem = deadline - ContinuousClock.now
         guard rem > .zero else { return 0 }
@@ -169,7 +182,7 @@ enum SocketPoller {
                 break
             }
             let fd = socket(ai.pointee.ai_family, ai.pointee.ai_socktype, ai.pointee.ai_protocol)
-            if fd < 0 { lastError = String(cString: strerror(errno)); continue }
+            if fd < 0 { lastError = errorString(for: errno); continue }
             var one: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
             let flags = fcntl(fd, F_GETFL)
@@ -184,16 +197,16 @@ enum SocketPoller {
                 let pr = pollUntilReady(fd: fd, events: Int16(POLLOUT), deadline: deadline, cancelFlag: cancelFlag)
                 if pr == -2 { Darwin.close(fd); throw CancellationError() }
                 if pr == 0 { lastError = "timed out"; Darwin.close(fd); break }
-                if pr < 0 { lastError = String(cString: strerror(errno)); Darwin.close(fd); continue }
+                if pr < 0 { lastError = errorString(for: errno); Darwin.close(fd); continue }
                 var err: Int32 = 0
                 var len = socklen_t(MemoryLayout<Int32>.size)
                 if getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0 {
                     if cancelFlag.isCancelled { Darwin.close(fd); throw CancellationError() }
                     return fd
                 }
-                lastError = String(cString: strerror(err != 0 ? err : errno))
+                lastError = errorString(for: err != 0 ? err : errno)
             } else {
-                lastError = String(cString: strerror(errno))
+                lastError = errorString(for: errno)
             }
             Darwin.close(fd)
         }

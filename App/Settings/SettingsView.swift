@@ -189,8 +189,11 @@ struct SettingsView: View {
                                 }
                             }
                         } else {
-                            appLock.setEnabled(false)
-                            securityError = nil
+                            Task {
+                                if await appLock.disableWithAuthentication() {
+                                    securityError = nil
+                                }
+                            }
                         }
                     }
                 ))

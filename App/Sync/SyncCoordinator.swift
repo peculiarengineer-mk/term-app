@@ -12,11 +12,62 @@ actor SyncCoordinator {
     static let resaveKey = "sync.initialResaveDone"
     /// Set by `syncTurnedOff()`; hosts edited after it are re-saved on the next sync launch.
     static let disabledAtKey = "sync.disabledAt"
-    private var observer: NSObjectProtocol?
-    private var pending: Task<Void, Never>?
+    private static let maxDedupeRetries = 3
+
+    // @unchecked Sendable: guarded by NSLock; observer/task are updated by the actor and cleared in deinit.
+    private final class LifecycleBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var observer: NSObjectProtocol?
+        private var pending: Task<Void, Never>?
+
+        var hasObserver: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return observer != nil
+        }
+
+        func setObserver(_ token: NSObjectProtocol) {
+            lock.lock()
+            let old = observer
+            observer = token
+            lock.unlock()
+            if let old {
+                NotificationCenter.default.removeObserver(old)
+            }
+        }
+
+        func replacePending(_ task: Task<Void, Never>) {
+            lock.lock()
+            let old = pending
+            pending = task
+            lock.unlock()
+            old?.cancel()
+        }
+
+        func invalidate() {
+            lock.lock()
+            let currentObserver = observer
+            let currentPending = pending
+            observer = nil
+            pending = nil
+            lock.unlock()
+            currentPending?.cancel()
+            if let currentObserver {
+                NotificationCenter.default.removeObserver(currentObserver)
+            }
+        }
+    }
+
+    private let lifecycle = LifecycleBox()
+    private var started = false
+    private var dedupeRetryCount = 0
     private let logger = Logger(subsystem: "com.peculiarengineer.termapp", category: "sync")
 
-    func start() {
+    deinit {
+        lifecycle.invalidate()
+    }
+
+    func start() async {
         // `sync.enabled` is re-checked because AppContainer.make() turns it off (for the next launch)
         // when the CloudKit container fails and it falls back to the local store.
         guard AppContainer.syncEnabledAtLaunch else { return }
@@ -24,16 +75,19 @@ actor SyncCoordinator {
             Self.syncTurnedOff()  // the CloudKit fallback turned sync off without going through Settings
             return
         }
-        guard observer == nil else { return }
+        guard !started, !lifecycle.hasObserver else { return }
+        started = true
         resaveOnce()
         dedupe()
-        promoteKeychainItems()
-        observer = NotificationCenter.default.addObserver(
+        await Self.promoteKeychainItems(logger: logger)
+        guard !lifecycle.hasObserver else { return }
+        let token = NotificationCenter.default.addObserver(
             forName: .NSPersistentStoreRemoteChange, object: nil, queue: nil
         ) { [weak self] _ in
             guard let self else { return }
             Task { await self.scheduleDedupe() }
         }
+        lifecycle.setObserver(token)
     }
 
     /// Called whenever sync goes from on to off (Settings, or the CloudKit fallback at launch): the
@@ -68,25 +122,38 @@ actor SyncCoordinator {
 
     /// Restarts the 1 s wait on every notification, so a burst yields one pass after it ends.
     private func scheduleDedupe() {
-        pending?.cancel()
-        pending = Task { [weak self] in
-            guard (try? await Task.sleep(for: .seconds(1))) != nil else { return }
+        dedupeRetryCount = 0
+        scheduleDedupeTask(delay: .seconds(1))
+    }
+
+    private func scheduleDedupeTask(delay: Duration) {
+        let task = Task { [weak self] in
+            guard (try? await Task.sleep(for: delay)) != nil else { return }
             await self?.dedupe()
         }
+        lifecycle.replacePending(task)
     }
 
     private func dedupe() {
         do {
             try HostDeduper.dedupe(in: modelContext)
+            dedupeRetryCount = 0
         } catch {
             modelContext.rollback()
             logger.error("Host dedupe failed: \(error.localizedDescription, privacy: .public)")
+            if dedupeRetryCount < Self.maxDedupeRetries {
+                dedupeRetryCount += 1
+                let backoffSeconds = 1 << dedupeRetryCount
+                scheduleDedupeTask(delay: .seconds(backoffSeconds))
+            }
         }
     }
 
-    /// Makes local host passwords and known-host entries synchronizable. Never the reverse; key
-    /// and passphrase services are not touched.
-    private func promoteKeychainItems() {
+    /// Makes local host passwords and known-host entries synchronizable on `@MainActor` so Keychain
+    /// promotions serialize cleanly with UI-driven Keychain writes. Never the reverse; key and
+    /// passphrase services are not touched.
+    @MainActor
+    private static func promoteKeychainItems(logger: Logger) {
         let store = KeychainStore()
         for service in [KeychainService.knownHosts, KeychainService.hostPassword] {
             let items: [(account: String, data: Data, synchronizable: Bool)]

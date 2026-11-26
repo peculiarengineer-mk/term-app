@@ -19,15 +19,15 @@ final class VibeCoderTests: XCTestCase {
         XCTAssertTrue(cmd.contains("TERMAPP_GIT_DIFF_END"))
         XCTAssertTrue(cmd.contains("git rev-parse --show-toplevel"))
         XCTAssertTrue(cmd.contains("git symbolic-ref --short HEAD"))
-        XCTAssertTrue(cmd.contains("git status --porcelain=v1"))
-        XCTAssertTrue(cmd.contains("git diff HEAD --no-color"))
-        XCTAssertTrue(cmd.contains("git diff --no-color"))
+        XCTAssertTrue(cmd.contains("git -c core.quotepath=false status --porcelain=v1"))
+        XCTAssertTrue(cmd.contains("git -c core.quotepath=false diff HEAD --no-color"))
+        XCTAssertTrue(cmd.contains("git -c core.quotepath=false diff --no-color"))
 
         let evilCmd = GitDiffHelper.statusAndDiffCommand(in: "/srv/$(rm -rf /)/app")
         XCTAssertTrue(evilCmd.contains("'/srv/$(rm -rf /)/app'"))
     }
 
-    func testStageCommitAndDiscardCommandsQuoting() {
+    func testStageCommitAndDiscardCommandsQuoting() throws {
         let commitCmd = GitDiffHelper.stageAndCommitCommand(
             in: "~/code/app",
             message: "fix: handle 'single' \"double\" `tick` $(sub)\nline2"
@@ -40,14 +40,67 @@ final class VibeCoderTests: XCTestCase {
             path: "Sources/It's Bad.swift",
             isUntracked: false
         )
-        XCTAssertTrue(trackedDiscard.contains("cd -- '/srv/repo' && git checkout -- 'Sources/It'\\''s Bad.swift'"))
+        XCTAssertTrue(trackedDiscard.contains("cd -- '/srv/repo' && _root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n \"$_root\" ] && cd -- \"$_root\""))
+        XCTAssertTrue(trackedDiscard.contains("git reset -q HEAD -- 'Sources/It'\\''s Bad.swift'"))
+        XCTAssertTrue(trackedDiscard.contains("git checkout -- 'Sources/It'\\''s Bad.swift'"))
 
         let untrackedDiscard = GitDiffHelper.discardFileCommand(
             in: "~/repo",
             path: "notes $(id).txt",
             isUntracked: true
         )
-        XCTAssertTrue(untrackedDiscard.contains("cd -- \"$HOME\"/'repo' && rm -f -- 'notes $(id).txt'"))
+        XCTAssertTrue(untrackedDiscard.contains("cd -- \"$HOME\"/'repo' && _root=$(git rev-parse --show-toplevel 2>/dev/null) && [ -n \"$_root\" ] && cd -- \"$_root\""))
+        XCTAssertTrue(untrackedDiscard.contains("git clean -fd -- 'notes $(id).txt'"))
+
+        // Path validation rejects traversal, absolute paths, NUL, newlines, and "."
+        for badPath in ["", "/", "/etc/passwd", "..", "../secret", "a/../../b", "a/..", ".", "./", "a\0b", "a\nb", "a\rb"] {
+            XCTAssertFalse(GitDiffHelper.isSafeRelativePath(badPath), "Expected invalid path: \(badPath.debugDescription)")
+            let cmd = GitDiffHelper.discardFileCommand(in: "/srv/repo", path: badPath, isUntracked: true)
+            XCTAssertFalse(cmd.contains("git clean"))
+            XCTAssertFalse(cmd.contains("rm "))
+            XCTAssertFalse(cmd.contains("git checkout"))
+            XCTAssertTrue(cmd.contains("Invalid path"))
+        }
+
+        for goodPath in ["Scratch/", "Sources/It's Bad.swift", "..hidden", "a/..b/c"] {
+            XCTAssertTrue(GitDiffHelper.isSafeRelativePath(goodPath), "Expected valid path: \(goodPath)")
+        }
+
+        #if os(macOS)
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gitdiff-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        func runSh(_ cmd: String, cwd: URL = tempDir) throws -> Int32 {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.arguments = ["-c", cmd]
+            p.currentDirectoryURL = cwd
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus
+        }
+
+        XCTAssertEqual(try runSh("git init && git config user.email t@t.com && git config user.name t && mkdir -p sub && printf 'orig\\n' > sub/tracked.txt && git add . && git commit -m init"), 0)
+        try "changed\n".write(to: tempDir.appendingPathComponent("sub/tracked.txt"), atomically: true, encoding: .utf8)
+        try "staged\n".write(to: tempDir.appendingPathComponent("new_staged.txt"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(try runSh("git add new_staged.txt"), 0)
+        let dirToClean = tempDir.appendingPathComponent("untracked_dir/nested")
+        try FileManager.default.createDirectory(at: dirToClean, withIntermediateDirectories: true)
+        try "u\n".write(to: dirToClean.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+
+        let subdirPath = tempDir.appendingPathComponent("sub").path
+        XCTAssertEqual(try runSh(GitDiffHelper.discardFileCommand(in: subdirPath, path: "sub/tracked.txt", isUntracked: false)), 0)
+        XCTAssertEqual(try String(contentsOf: tempDir.appendingPathComponent("sub/tracked.txt"), encoding: .utf8), "orig\n")
+
+        XCTAssertEqual(try runSh(GitDiffHelper.discardFileCommand(in: subdirPath, path: "new_staged.txt", isUntracked: false)), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("new_staged.txt").path))
+
+        XCTAssertEqual(try runSh(GitDiffHelper.discardFileCommand(in: subdirPath, path: "untracked_dir/", isUntracked: true)), 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir.appendingPathComponent("untracked_dir").path))
+
+        XCTAssertNotEqual(try runSh(GitDiffHelper.discardFileCommand(in: subdirPath, path: "../outside", isUntracked: true)), 0)
+        #endif
     }
 
     func testParseSnapshotFullAndEdgeCases() {
@@ -236,6 +289,40 @@ final class VibeCoderTests: XCTestCase {
         XCTAssertTrue(parsed[2].lines.allSatisfy { $0.kind == .header })
     }
 
+    func testParseSnapshotMarkerSpoofingAndOctalUTF8Unquoting() {
+        let spoofedOutput = [
+            "TERMAPP_GIT_ROOT:/srv/term-app",
+            "TERMAPP_GIT_BRANCH:main",
+            "TERMAPP_GIT_STATUS_BEGIN",
+            " M \"caf\\303\\251.txt\"",
+            "R  \"old/\\303\\251.txt\" -> \"dir/\\346\\227\\245\\346\\234\\254\\350\\252\\236.md\"",
+            "?? \"emoji/\\360\\237\\232\\200.swift\"",
+            "TERMAPP_GIT_STATUS_END",
+            "TERMAPP_GIT_DIFF_BEGIN",
+            "diff --git \"a/caf\\303\\251.txt\" \"b/caf\\303\\251.txt\"",
+            "index 1111111..2222222 100644",
+            "--- \"a/caf\\303\\251.txt\"",
+            "+++ \"b/caf\\303\\251.txt\"",
+            "@@ -1,3 +1,4 @@",
+            " TERMAPP_GIT_DIFF_END",
+            " NOT_A_GIT_REPO",
+            "+added after spoofed end",
+            "TERMAPP_GIT_DIFF_END",
+        ].joined(separator: "\n")
+
+        let snapshot = GitDiffHelper.parseSnapshot(from: spoofedOutput)
+        XCTAssertTrue(snapshot.isGitRepo)
+        XCTAssertEqual(snapshot.files.map(\.path), [
+            "café.txt",
+            "dir/日本語.md",
+            "emoji/🚀.swift",
+        ])
+        XCTAssertEqual(snapshot.diffs.count, 1)
+        XCTAssertEqual(snapshot.diffs[0].path, "café.txt")
+        XCTAssertEqual(snapshot.diffs[0].additions, 1)
+        XCTAssertEqual(snapshot.diffs[0].lines.last?.text, "+added after spoofed end")
+    }
+
     // MARK: - ListeningPortsHelper
 
     func testListListeningPortsCommand() {
@@ -406,23 +493,23 @@ final class VibeCoderTests: XCTestCase {
 
         XCTAssertEqual(
             RemoteAttachmentHelper.remotePath(filename: "Screen Shot 1.PNG", id: fixedID),
-            "/tmp/termapp-attach-a1b2c3d4.png"
+            "/tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
         XCTAssertEqual(
             RemoteAttachmentHelper.remotePath(filename: "photo.JPEG", id: fixedID, directory: "/var/tmp/"),
-            "/var/tmp/termapp-attach-a1b2c3d4.jpeg"
+            "/var/tmp/termapp-attach-a1b2c3d4e5f64789.jpeg"
         )
         XCTAssertEqual(
             RemoteAttachmentHelper.remotePath(filename: "noext", id: fixedID),
-            "/tmp/termapp-attach-a1b2c3d4.png"
+            "/tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
         XCTAssertEqual(
             RemoteAttachmentHelper.remotePath(filename: ".hidden", id: fixedID),
-            "/tmp/termapp-attach-a1b2c3d4.png"
+            "/tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
         XCTAssertEqual(
             RemoteAttachmentHelper.remotePath(filename: "../../etc/evil.veryLongExt123", id: fixedID, directory: "/tmp/../etc"),
-            "/tmp/termapp-attach-a1b2c3d4.verylong"
+            "/tmp/termapp-attach-a1b2c3d4e5f64789.verylong"
         )
 
         let metacharPath = RemoteAttachmentHelper.remotePath(
@@ -434,29 +521,35 @@ final class VibeCoderTests: XCTestCase {
         XCTAssertFalse(metacharPath.contains(";"))
         XCTAssertFalse(metacharPath.contains("$"))
         XCTAssertFalse(metacharPath.contains(".."))
-        XCTAssertTrue(metacharPath.contains("termapp-attach-a1b2c3d4."))
+        XCTAssertTrue(metacharPath.contains("termapp-attach-a1b2c3d4e5f64789."))
+
+        let randomPath = RemoteAttachmentHelper.remotePath(filename: "shot.png")
+        let leaf = URL(fileURLWithPath: randomPath).lastPathComponent
+        let stem = leaf.replacingOccurrences(of: ".png", with: "")
+        let suffix = stem.replacingOccurrences(of: "termapp-attach-", with: "")
+        XCTAssertEqual(suffix.count, 16)
     }
 
     func testPromptInsertion() {
         XCTAssertEqual(
-            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4.png", existingPrompt: ""),
-            "/tmp/termapp-attach-a1b2c3d4.png"
+            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4e5f64789.png", existingPrompt: ""),
+            "/tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
         XCTAssertEqual(
-            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4.png", existingPrompt: "   "),
-            "/tmp/termapp-attach-a1b2c3d4.png"
+            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4e5f64789.png", existingPrompt: "   "),
+            "/tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
         XCTAssertEqual(
-            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4.png", existingPrompt: "Inspect this"),
-            "Inspect this /tmp/termapp-attach-a1b2c3d4.png"
+            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4e5f64789.png", existingPrompt: "Inspect this"),
+            "Inspect this /tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
         XCTAssertEqual(
-            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4.png", existingPrompt: "Inspect this "),
-            "Inspect this /tmp/termapp-attach-a1b2c3d4.png"
+            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4e5f64789.png", existingPrompt: "Inspect this "),
+            "Inspect this /tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
         XCTAssertEqual(
-            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4.png", existingPrompt: "Inspect:\n"),
-            "Inspect:\n/tmp/termapp-attach-a1b2c3d4.png"
+            RemoteAttachmentHelper.promptInsertion(forRemotePath: "/tmp/termapp-attach-a1b2c3d4e5f64789.png", existingPrompt: "Inspect:\n"),
+            "Inspect:\n/tmp/termapp-attach-a1b2c3d4e5f64789.png"
         )
     }
 }

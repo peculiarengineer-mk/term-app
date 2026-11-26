@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import Security
 
 // MARK: - Local-Only Token Store
@@ -8,9 +9,16 @@ public enum CloudflareTokenStore {
     public static let service = "termapp.cloudflare.token"
     public static let account = "api-token"
 
+    private static let logger = Logger(subsystem: "com.peculiarengineer.termapp", category: "cloudflare")
+
     /// Reads the locally stored Cloudflare API token, or `nil` if missing or unreadable.
     public static func read(keychain: KeychainStore = KeychainStore()) -> String? {
         read(storage: keychain)
+    }
+
+    /// Reads the locally stored Cloudflare API token, throwing on Keychain or UTF-8 decoding failures.
+    public static func readToken(keychain: KeychainStore = KeychainStore()) throws -> String? {
+        try readToken(storage: keychain)
     }
 
     /// Trims whitespace and saves the Cloudflare API token locally (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`).
@@ -29,20 +37,27 @@ public enum CloudflareTokenStore {
     }
 
     internal static func read(storage: any KeychainStoring) -> String? {
-        guard let data = try? storage.read(service: service, account: account, synchronizable: false),
-              let raw = String(data: data, encoding: .utf8)
-        else {
+        do {
+            return try readToken(storage: storage)
+        } catch {
+            logger.error("Failed to read Cloudflare token from Keychain: \(String(describing: error), privacy: .public)")
             return nil
+        }
+    }
+
+    internal static func readToken(storage: any KeychainStoring) throws -> String? {
+        guard let data = try storage.read(service: service, account: account, synchronizable: false) else {
+            return nil
+        }
+        guard let raw = String(data: data, encoding: .utf8) else {
+            throw KeychainError(status: errSecDecode)
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
     internal static func save(_ token: String, storage: any KeychainStoring) throws {
-        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw CloudflareError.missingToken
-        }
+        let trimmed = try CloudflareClient.validatedToken(token)
         try storage.save(Data(trimmed.utf8), service: service, account: account, synchronizable: false)
     }
 
@@ -310,6 +325,7 @@ public struct CFTunnelIngressRule: Codable, Equatable, Hashable, Identifiable, S
 /// Errors produced by `CloudflareTokenStore` and `CloudflareClient`.
 public enum CloudflareError: Error, Equatable, Sendable, LocalizedError {
     case missingToken
+    case invalidToken
     case unauthorized
     case apiError(String)
     case httpError(Int, String)
@@ -320,6 +336,8 @@ public enum CloudflareError: Error, Equatable, Sendable, LocalizedError {
         switch self {
         case .missingToken:
             return "Cloudflare API token is missing."
+        case .invalidToken:
+            return "Cloudflare API token contains invalid whitespace or control characters."
         case .unauthorized:
             return "Cloudflare API token is invalid or lacks permission."
         case .apiError(let message):
@@ -341,6 +359,8 @@ public enum CloudflareError: Error, Equatable, Sendable, LocalizedError {
 /// Async client for Cloudflare REST API v4 (token verification, accounts, DNS zones/records, and Tunnels).
 public struct CloudflareClient: Sendable {
     public static let defaultBaseURL = URL(string: "https://api.cloudflare.com/client/v4")!
+    private static let maxPaginationPages = 20
+    private static let requestTimeoutSeconds: TimeInterval = 30
 
     private let session: URLSession
     private let token: String
@@ -365,28 +385,25 @@ public struct CloudflareClient: Sendable {
         return result.status.lowercased() == "active"
     }
 
-    /// Lists Cloudflare accounts accessible to the token (`GET /accounts?per_page=50`).
+    /// Lists Cloudflare accounts accessible to the token (`GET /accounts?per_page=50`), following pagination up to 20 pages.
     public func listAccounts() async throws -> [CFAccount] {
-        try await request(
-            method: "GET",
+        try await requestPaginated(
             pathSegments: ["accounts"],
             queryItems: [URLQueryItem(name: "per_page", value: "50")]
         )
     }
 
-    /// Lists DNS zones accessible to the token (`GET /zones?per_page=50`).
+    /// Lists DNS zones accessible to the token (`GET /zones?per_page=50`), following pagination up to 20 pages.
     public func listZones() async throws -> [CFZone] {
-        try await request(
-            method: "GET",
+        try await requestPaginated(
             pathSegments: ["zones"],
             queryItems: [URLQueryItem(name: "per_page", value: "50")]
         )
     }
 
-    /// Lists DNS records for a zone (`GET /zones/{zoneID}/dns_records?per_page=100`).
+    /// Lists DNS records for a zone (`GET /zones/{zoneID}/dns_records?per_page=100`), following pagination up to 20 pages.
     public func listDNSRecords(zoneID: String) async throws -> [CFDNSRecord] {
-        let records: [CFDNSRecord] = try await request(
-            method: "GET",
+        let records: [CFDNSRecord] = try await requestPaginated(
             pathSegments: ["zones", zoneID, "dns_records"],
             queryItems: [URLQueryItem(name: "per_page", value: "100")]
         )
@@ -421,10 +438,9 @@ public struct CloudflareClient: Sendable {
         )
     }
 
-    /// Lists active Cloudflare Tunnels in an account (`GET /accounts/{accountID}/cfd_tunnel?is_deleted=false&per_page=100`).
+    /// Lists active Cloudflare Tunnels in an account (`GET /accounts/{accountID}/cfd_tunnel?is_deleted=false&per_page=100`), following pagination up to 20 pages.
     public func listTunnels(accountID: String) async throws -> [CFTunnel] {
-        try await request(
-            method: "GET",
+        try await requestPaginated(
             pathSegments: ["accounts", accountID, "cfd_tunnel"],
             queryItems: [
                 URLQueryItem(name: "is_deleted", value: "false"),
@@ -450,11 +466,62 @@ public struct CloudflareClient: Sendable {
 
     // MARK: - Request & Envelope Helpers
 
+    internal static func validatedToken(_ rawToken: String) throws -> String {
+        let trimmed = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw CloudflareError.missingToken
+        }
+        let hasInvalidScalar = trimmed.unicodeScalars.contains {
+            CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0)
+        }
+        guard !hasInvalidScalar else {
+            throw CloudflareError.invalidToken
+        }
+        return trimmed
+    }
+
     private func withZoneID(_ record: CFDNSRecord, fallback zoneID: String) -> CFDNSRecord {
         guard record.zoneID.isEmpty else { return record }
         var copy = record
         copy.zoneID = zoneID
         return copy
+    }
+
+    private func requestPaginated<Item: Decodable>(
+        pathSegments: [String],
+        queryItems: [URLQueryItem]
+    ) async throws -> [Item] {
+        var collected: [Item] = []
+        var page = 1
+
+        while page <= Self.maxPaginationPages {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            let pageQuery = page == 1
+                ? queryItems
+                : queryItems + [URLQueryItem(name: "page", value: String(page))]
+            let envelope: CFEnvelope<[Item]> = try await requestEnvelope(
+                method: "GET",
+                pathSegments: pathSegments,
+                queryItems: pageQuery,
+                bodyData: nil
+            )
+            guard let items = envelope.result else {
+                throw CloudflareError.invalidResponse
+            }
+            collected.append(contentsOf: items)
+
+            guard let totalPages = envelope.resultInfo?.totalPages,
+                  page < totalPages,
+                  !items.isEmpty
+            else {
+                break
+            }
+            page += 1
+        }
+
+        return collected
     }
 
     private func request<Response: Decodable>(
@@ -502,15 +569,34 @@ public struct CloudflareClient: Sendable {
         queryItems: [URLQueryItem] = [],
         bodyData: Data? = nil
     ) async throws -> Response? {
-        guard !token.isEmpty else {
-            throw CloudflareError.missingToken
+        let envelope: CFEnvelope<Response> = try await requestEnvelope(
+            method: method,
+            pathSegments: pathSegments,
+            queryItems: queryItems,
+            bodyData: bodyData
+        )
+        return envelope.result
+    }
+
+    private func requestEnvelope<Response: Decodable>(
+        method: String,
+        pathSegments: [String],
+        queryItems: [URLQueryItem] = [],
+        bodyData: Data? = nil
+    ) async throws -> CFEnvelope<Response> {
+        if Task.isCancelled {
+            throw CancellationError()
         }
+        let validatedToken = try Self.validatedToken(token)
 
         let url = try makeURL(pathSegments: pathSegments, queryItems: queryItems)
         var urlRequest = URLRequest(url: url)
         urlRequest.httpMethod = method
-        urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.timeoutInterval = Self.requestTimeoutSeconds
+        urlRequest.setValue("Bearer \(validatedToken)", forHTTPHeaderField: "Authorization")
+        if bodyData != nil {
+            urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
         urlRequest.httpBody = bodyData
 
@@ -520,7 +606,12 @@ public struct CloudflareClient: Sendable {
             (data, response) = try await session.data(for: urlRequest)
         } catch is CancellationError {
             throw CancellationError()
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            throw CancellationError()
         } catch {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
             throw CloudflareError.networkError(error.localizedDescription)
         }
 
@@ -528,13 +619,13 @@ public struct CloudflareClient: Sendable {
             throw CloudflareError.invalidResponse
         }
 
-        if http.statusCode == 401 || http.statusCode == 403 {
+        if http.statusCode == 401 {
             throw CloudflareError.unauthorized
         }
 
         let decoder = JSONDecoder()
 
-        // Inspect envelope success/errors first so 4xx/5xx Cloudflare JSON errors surface as `.apiError`.
+        // Inspect envelope success/errors first so 4xx/5xx Cloudflare JSON errors (including 403 details) surface as `.apiError`.
         if let statusEnvelope = try? decoder.decode(CFStatusEnvelope.self, from: data) {
             if !statusEnvelope.success {
                 let messages = (statusEnvelope.errors ?? [])
@@ -547,6 +638,9 @@ public struct CloudflareClient: Sendable {
                 if !codes.isEmpty {
                     throw CloudflareError.apiError("Cloudflare error code(s): \(codes.joined(separator: ", "))")
                 }
+                if http.statusCode == 403 {
+                    throw CloudflareError.unauthorized
+                }
                 if !(200..<300).contains(http.statusCode) {
                     throw CloudflareError.httpError(http.statusCode, "")
                 }
@@ -554,15 +648,21 @@ public struct CloudflareClient: Sendable {
             }
 
             guard (200..<300).contains(http.statusCode) else {
+                if http.statusCode == 403 {
+                    throw CloudflareError.unauthorized
+                }
                 throw CloudflareError.httpError(http.statusCode, String(data: data, encoding: .utf8) ?? "")
             }
 
             do {
-                let envelope = try decoder.decode(CFEnvelope<Response>.self, from: data)
-                return envelope.result
+                return try decoder.decode(CFEnvelope<Response>.self, from: data)
             } catch {
                 throw CloudflareError.invalidResponse
             }
+        }
+
+        if http.statusCode == 403 {
+            throw CloudflareError.unauthorized
         }
 
         guard (200..<300).contains(http.statusCode) else {
@@ -575,7 +675,7 @@ public struct CloudflareClient: Sendable {
     }
 
     private func makeURL(pathSegments: [String], queryItems: [URLQueryItem]) throws -> URL {
-        guard pathSegments.allSatisfy({ !$0.isEmpty }),
+        guard pathSegments.allSatisfy(Self.isValidPathSegment),
               var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
         else {
             throw CloudflareError.invalidResponse
@@ -598,6 +698,20 @@ public struct CloudflareClient: Sendable {
         }
         return url
     }
+
+    private static func isValidPathSegment(_ segment: String) -> Bool {
+        guard !segment.isEmpty,
+              segment != ".",
+              segment != "..",
+              !segment.contains("/"),
+              !segment.contains("\\")
+        else {
+            return false
+        }
+        return !segment.unicodeScalars.contains {
+            CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0)
+        }
+    }
 }
 
 // MARK: - Internal Response Envelopes
@@ -612,10 +726,28 @@ private struct CFStatusEnvelope: Decodable {
     let errors: [CFAPIErrorDetail]?
 }
 
+private struct CFResultInfo: Decodable {
+    let page: Int?
+    let totalPages: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case page
+        case totalPages = "total_pages"
+    }
+}
+
 private struct CFEnvelope<Result: Decodable>: Decodable {
     let success: Bool
     let errors: [CFAPIErrorDetail]?
     let result: Result?
+    let resultInfo: CFResultInfo?
+
+    enum CodingKeys: String, CodingKey {
+        case success
+        case errors
+        case result
+        case resultInfo = "result_info"
+    }
 }
 
 private struct VerifyTokenResult: Decodable {

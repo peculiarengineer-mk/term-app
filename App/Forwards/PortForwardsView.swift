@@ -26,7 +26,11 @@ struct PortForwardsView: View {
 
     let connection: SSHConnection
     let hostID: UUID
-    let hostTitle: String
+
+    init(connection: SSHConnection, hostID: UUID, hostTitle _: String = "") {
+        self.connection = connection
+        self.hostID = hostID
+    }
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openURL) private var openURL
@@ -43,7 +47,7 @@ struct PortForwardsView: View {
     private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     private var activeByID: [UUID: ActivePortForward] {
-        Dictionary(uniqueKeysWithValues: activeForwards.map { ($0.id, $0) })
+        Dictionary(activeForwards.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     }
 
     private var savedRuleIDs: Set<UUID> {

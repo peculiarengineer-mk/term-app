@@ -191,4 +191,151 @@ final class SnippetAndSSHConfigTests: XCTestCase {
         XCTAssertEqual(entries[1].port, 22)
         XCTAssertEqual(entries[1].username, "fallback")
     }
+
+    func testSSHConfigParserSingleQuotesIPv6ValidationAndHostnameTokens() {
+        let config = """
+        Host box's # inline comment after apostrophe
+            HostName %h.internal.example.com
+            IdentityFile '~/.ssh/id_literal'
+
+        Host web1 web2
+            HostName %n.prod.corp
+
+        Host escaped
+            HostName %%h.literal.org
+
+        Host ::1
+            User v6loop
+
+        Host 2001:db8::1
+            User v6doc
+
+        Host dev:web
+            User notanip
+        """
+
+        let entries = SSHConfigParser.parse(config)
+        XCTAssertEqual(entries.map(\.alias), ["box's", "web1", "web2", "escaped", "::1", "2001:db8::1"])
+
+        XCTAssertEqual(entries[0].hostname, "box's.internal.example.com")
+        XCTAssertEqual(entries[0].identityFile, "'~/.ssh/id_literal'")
+
+        XCTAssertEqual(entries[1].hostname, "web1.prod.corp")
+        XCTAssertEqual(entries[2].hostname, "web2.prod.corp")
+        XCTAssertEqual(entries[3].hostname, "%h.literal.org")
+
+        XCTAssertEqual(entries[4].hostname, "::1")
+        XCTAssertEqual(entries[5].hostname, "2001:db8::1")
+    }
+
+    func testSSHConfigParserProxyJumpAndForwardAgent() {
+        let entryDefaultInit = SSHConfigEntry(alias: "compat", hostname: "compat.internal")
+        XCTAssertNil(entryDefaultInit.proxyJump)
+        XCTAssertFalse(entryDefaultInit.forwardAgent)
+
+        let config = """
+        Host bastion
+            HostName bastion.example.com
+            User ops
+            ForwardAgent yes
+
+        Host app-via-bastion
+            HostName 10.0.1.20
+            ProxyJump bastion
+            ForwardAgent True
+
+        Host app-equals
+            HostName 10.0.1.21
+            ProxyJump=user@bastion.example.com:2222
+            ForwardAgent=1
+
+        Host app-none
+            HostName 10.0.1.22
+            ProxyJump NoNe
+            ForwardAgent No
+
+        Host app-false-zero
+            HostName 10.0.1.23
+            ProxyJump none
+            ForwardAgent false
+
+        Host app-zero
+            HostName 10.0.1.24
+            ForwardAgent 0
+
+        Host app-invalid-fa
+            HostName 10.0.1.25
+            ForwardAgent maybe
+
+        Host app-first-wins
+            HostName 10.0.1.26
+            ProxyJump first-jump
+            ProxyJump second-jump
+            ForwardAgent YES
+            ForwardAgent no
+        """
+
+        let entries = SSHConfigParser.parse(config)
+        XCTAssertEqual(entries.count, 8)
+
+        XCTAssertNil(entries[0].proxyJump)
+        XCTAssertTrue(entries[0].forwardAgent)
+
+        XCTAssertEqual(entries[1].proxyJump, "bastion")
+        XCTAssertTrue(entries[1].forwardAgent)
+
+        XCTAssertEqual(entries[2].proxyJump, "user@bastion.example.com:2222")
+        XCTAssertTrue(entries[2].forwardAgent)
+
+        XCTAssertNil(entries[3].proxyJump)
+        XCTAssertFalse(entries[3].forwardAgent)
+
+        XCTAssertNil(entries[4].proxyJump)
+        XCTAssertFalse(entries[4].forwardAgent)
+
+        XCTAssertNil(entries[5].proxyJump)
+        XCTAssertFalse(entries[5].forwardAgent)
+
+        XCTAssertNil(entries[6].proxyJump)
+        XCTAssertFalse(entries[6].forwardAgent)
+
+        XCTAssertEqual(entries[7].proxyJump, "first-jump")
+        XCTAssertTrue(entries[7].forwardAgent)
+    }
+
+    func testSSHConfigParserProxyJumpAndForwardAgentWithHostStarDefaults() {
+        let config = """
+        Host *
+            ProxyJump global-bastion
+            ForwardAgent yes
+
+        Host inherited
+            HostName 10.2.0.10
+
+        Host opted-out
+            HostName 10.2.0.11
+            ProxyJump none
+            ForwardAgent no
+
+        Host overridden
+            HostName 10.2.0.12
+            ProxyJump edge-bastion
+            ForwardAgent 0
+        """
+
+        let entries = SSHConfigParser.parse(config)
+        XCTAssertEqual(entries.count, 3)
+
+        XCTAssertEqual(entries[0].alias, "inherited")
+        XCTAssertEqual(entries[0].proxyJump, "global-bastion")
+        XCTAssertTrue(entries[0].forwardAgent)
+
+        XCTAssertEqual(entries[1].alias, "opted-out")
+        XCTAssertNil(entries[1].proxyJump)
+        XCTAssertFalse(entries[1].forwardAgent)
+
+        XCTAssertEqual(entries[2].alias, "overridden")
+        XCTAssertEqual(entries[2].proxyJump, "edge-bastion")
+        XCTAssertFalse(entries[2].forwardAgent)
+    }
 }

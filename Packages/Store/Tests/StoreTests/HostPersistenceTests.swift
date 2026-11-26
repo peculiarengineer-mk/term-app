@@ -35,6 +35,45 @@ final class HostPersistenceTests: XCTestCase {
         XCTAssertEqual(h.tmuxCommand, "tmux a")
         XCTAssertEqual(h.tags, ["a", "b"])
         XCTAssertEqual(h.source, "manual")
+        XCTAssertNil(h.proxyJumpHostID)
+        XCTAssertFalse(h.forwardAgent)
+    }
+
+    func testHostDefaultsAndProxyJumpForwardAgentRoundTrip() throws {
+        let defaults = Host()
+        XCTAssertNil(defaults.proxyJumpHostID)
+        XCTAssertFalse(defaults.forwardAgent)
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("hosts-proxy.store")
+        let bastionID = UUID()
+        let targetID: UUID
+
+        do {
+            let container = try ModelContainer(
+                for: Host.self, configurations: ModelConfiguration(url: url, cloudKitDatabase: .none))
+            let context = ModelContext(container)
+            let target = Host(
+                label: "app",
+                hostname: "10.0.2.20",
+                proxyJumpHostID: bastionID,
+                forwardAgent: true
+            )
+            targetID = target.id
+            context.insert(target)
+            try context.save()
+        }
+
+        let container = try ModelContainer(
+            for: Host.self, configurations: ModelConfiguration(url: url, cloudKitDatabase: .none))
+        let hosts = try ModelContext(container).fetch(FetchDescriptor<Host>())
+        XCTAssertEqual(hosts.count, 1)
+        let persisted = try XCTUnwrap(hosts.first)
+        XCTAssertEqual(persisted.id, targetID)
+        XCTAssertEqual(persisted.proxyJumpHostID, bastionID)
+        XCTAssertTrue(persisted.forwardAgent)
     }
 
     func testTouchMovesUpdatedAtKeepsCopyID() {

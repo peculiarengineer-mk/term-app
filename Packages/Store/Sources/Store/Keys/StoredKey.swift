@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 public enum KeyType: String, Codable, Sendable, CaseIterable {
     case ed25519, ecdsa, rsa
@@ -78,15 +79,29 @@ public struct KeyStore: Sendable {
     }
 
     public func passphrase(for key: StoredKey) throws -> String? {
-        try keychain.read(service: Self.passphraseService, account: key.id.uuidString)
-            .map { String(decoding: $0, as: UTF8.self) }
+        guard let data = try keychain.read(service: Self.passphraseService, account: key.id.uuidString) else {
+            return nil
+        }
+        guard let passphrase = String(data: data, encoding: .utf8) else {
+            throw KeychainError(status: errSecDecode)
+        }
+        return passphrase
+    }
+
+    /// Returns the IDs of keys that have a saved passphrase without loading passphrase bytes into memory.
+    public func keysWithSavedPassphrase() throws -> Set<UUID> {
+        let accounts = try keychain.listAccounts(service: Self.passphraseService)
+        return Set(accounts.compactMap(UUID.init(uuidString:)))
     }
 
     /// Saves a typed passphrase carrying the key's own sync flag (read from stored metadata).
     public func savePassphrase(_ passphrase: String, for key: StoredKey) throws {
         let acct = key.id.uuidString
-        let stored = (try keychain.read(service: Self.metaService, account: acct))
-            .flatMap { try? JSONDecoder().decode(StoredKey.self, from: $0) } ?? key
+        // Fail closed when metadata is missing or corrupt rather than falling back to a stale sync flag.
+        guard let meta = try keychain.read(service: Self.metaService, account: acct) else {
+            throw KeyStoreError.keyMissing
+        }
+        let stored = try JSONDecoder().decode(StoredKey.self, from: meta)
         try keychain.save(Data(passphrase.utf8), service: Self.passphraseService, account: acct,
                           synchronizable: stored.syncsViaICloud)
     }

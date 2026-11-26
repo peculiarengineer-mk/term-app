@@ -8,6 +8,7 @@ public enum AlgorithmPolicy {
     public static let ciphers = "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr"
     public static let macs = "hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com,hmac-sha2-256,hmac-sha2-512"
     public static let hostKeys = "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,rsa-sha2-512,rsa-sha2-256"
+    public static let compression = "none"
 
     public static let postQuantumKex: Set<String> = [
         "mlkem768x25519-sha256", "mlkem768nistp256-sha256", "mlkem1024nistp384-sha384",
@@ -40,6 +41,8 @@ extension AlgorithmPolicy {
         (LIBSSH2_METHOD_CRYPT_SC, "cipher server-to-client", ciphers),
         (LIBSSH2_METHOD_MAC_CS, "mac client-to-server", macs),
         (LIBSSH2_METHOD_MAC_SC, "mac server-to-client", macs),
+        (LIBSSH2_METHOD_COMP_CS, "compression client-to-server", compression),
+        (LIBSSH2_METHOD_COMP_SC, "compression server-to-client", compression),
     ]
 
     /// Policy names the linked libssh2 does not implement. `libssh2_session_method_pref` silently drops

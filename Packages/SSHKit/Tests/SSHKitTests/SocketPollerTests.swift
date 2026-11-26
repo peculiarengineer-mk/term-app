@@ -147,4 +147,19 @@ final class SocketPollerTests: XCTestCase {
         XCTAssertEqual(cancelResult, -2)
         XCTAssertLessThan(ContinuousClock.now - start, .seconds(1))
     }
+
+    func testErrorStringThreadSafeAndNonEmpty() {
+        XCTAssertFalse(SocketPoller.errorString(for: EACCES).isEmpty)
+        XCTAssertFalse(SocketPoller.errorString(for: ECONNREFUSED).isEmpty)
+        XCTAssertFalse(SocketPoller.errorString(for: ENOENT).isEmpty)
+        XCTAssertFalse(SocketPoller.errorString(for: -1).isEmpty)
+        XCTAssertFalse(SocketPoller.errorString(for: 999_999).isEmpty)
+
+        let codes: [Int32] = [EACCES, ECONNREFUSED, ETIMEDOUT, EPIPE, EBADF, -42]
+        DispatchQueue.concurrentPerform(iterations: 200) { idx in
+            let code = codes[idx % codes.count]
+            let text = SocketPoller.errorString(for: code)
+            XCTAssertFalse(text.isEmpty)
+        }
+    }
 }

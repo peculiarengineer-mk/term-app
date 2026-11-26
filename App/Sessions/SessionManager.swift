@@ -1,8 +1,101 @@
 import SwiftUI
 import SwiftData
+import os
 import SSHKit
 import Store
 import TermUI
+
+/// Coalesces bursts of terminal output chunks off `@MainActor` before running activity heuristics.
+private final class OutputChunkCoalescer: Sendable {
+    private struct State: Sendable {
+        var pending = Data()
+        var flushTask: Task<Void, Never>?
+        var flushScheduled = false
+        var stopped = false
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private let interval: Duration
+    private let maxBufferedBytes: Int
+    private let onFlush: @Sendable (Data) -> Void
+
+    init(
+        interval: Duration = .milliseconds(150),
+        maxBufferedBytes: Int = 64 * 1024,
+        onFlush: @escaping @Sendable (Data) -> Void
+    ) {
+        self.interval = interval
+        self.maxBufferedBytes = maxBufferedBytes
+        self.onFlush = onFlush
+    }
+
+    func enqueue(_ chunk: [UInt8]) {
+        guard !chunk.isEmpty else { return }
+        let shouldSpawn = state.withLock { s -> Bool in
+            guard !s.stopped else { return false }
+            s.pending.append(contentsOf: chunk)
+            if s.pending.count > maxBufferedBytes {
+                var trimmed = s.pending.suffix(maxBufferedBytes)
+                while let first = trimmed.first, (first & 0xC0) == 0x80 {
+                    trimmed = trimmed.dropFirst()
+                }
+                s.pending = Data(trimmed)
+            }
+            guard !s.flushScheduled else { return false }
+            s.flushScheduled = true
+            return true
+        }
+        guard shouldSpawn else { return }
+        let task = Task.detached(priority: .utility) { [weak self, interval] in
+            try? await Task.sleep(for: interval)
+            guard !Task.isCancelled, let self else { return }
+            self.flush()
+        }
+        let cancelNewTask = state.withLock { s -> Bool in
+            if s.stopped { return true }
+            s.flushTask = task
+            return false
+        }
+        if cancelNewTask { task.cancel() }
+    }
+
+    func discardPending() {
+        let task = state.withLock { s -> Task<Void, Never>? in
+            s.pending.removeAll(keepingCapacity: true)
+            s.flushScheduled = false
+            let t = s.flushTask
+            s.flushTask = nil
+            return t
+        }
+        task?.cancel()
+    }
+
+    func stop() {
+        let task = state.withLock { s -> Task<Void, Never>? in
+            s.stopped = true
+            s.flushScheduled = false
+            s.pending.removeAll(keepingCapacity: false)
+            let t = s.flushTask
+            s.flushTask = nil
+            return t
+        }
+        task?.cancel()
+    }
+
+    private func flush() {
+        let data = state.withLock { s -> Data? in
+            s.flushTask = nil
+            s.flushScheduled = false
+            guard !s.stopped, !s.pending.isEmpty else { return nil }
+            let out = s.pending
+            s.pending = Data()
+            return out
+        }
+        if let data {
+            onFlush(data)
+        }
+    }
+}
 
 /// One live SSH session: the connection, its terminal bridge and the host it belongs to.
 @MainActor @Observable
@@ -57,7 +150,9 @@ final class LiveSession: Identifiable {
         didSet {
             if showAIAgentControls {
                 AgentNotificationManager.shared.requestAuthorizationIfNeeded()
+                syncOutputTracking()
             } else if !isAgentActivityTracked {
+                syncOutputTracking()
                 outputTailData.removeAll(keepingCapacity: false)
                 agentActivityState = .idle
             }
@@ -76,6 +171,9 @@ final class LiveSession: Identifiable {
 
     @ObservationIgnored private var outputTailData = Data()
     @ObservationIgnored nonisolated(unsafe) private var completionDebounceTask: Task<Void, Never>?
+    @ObservationIgnored nonisolated(unsafe) fileprivate var autoPortForwardsTask: Task<Void, Never>?
+    @ObservationIgnored nonisolated(unsafe) private var launchCommandTask: Task<Void, Never>?
+    @ObservationIgnored nonisolated(unsafe) private var outputCoalescer: OutputChunkCoalescer?
     @ObservationIgnored private var visibleTerminalCount = 0
     @ObservationIgnored private var suppressedDirectInputCount = 0
 
@@ -135,6 +233,13 @@ final class LiveSession: Identifiable {
         attachActivityObservers(to: bridge)
     }
 
+    deinit {
+        completionDebounceTask?.cancel()
+        autoPortForwardsTask?.cancel()
+        launchCommandTask?.cancel()
+        outputCoalescer?.stop()
+    }
+
     func terminalAppeared() {
         visibleTerminalCount += 1
     }
@@ -160,6 +265,10 @@ final class LiveSession: Identifiable {
     func cleanupActivityTracking() {
         completionDebounceTask?.cancel()
         completionDebounceTask = nil
+        launchCommandTask?.cancel()
+        launchCommandTask = nil
+        outputCoalescer?.stop()
+        outputCoalescer = nil
         suppressedDirectInputCount = 0
         outputTailData.removeAll(keepingCapacity: false)
         bridge.onOutputChunk = nil
@@ -177,7 +286,8 @@ final class LiveSession: Identifiable {
         guard !command.isEmpty else { return }
 
         let targetBridge = bridge
-        Task { @MainActor [weak self] in
+        launchCommandTask?.cancel()
+        launchCommandTask = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
             guard !Task.isCancelled,
                   let self,
@@ -193,6 +303,8 @@ final class LiveSession: Identifiable {
     }
 
     fileprivate func replace(session: any Session, bridge: SessionBridge, algorithms: NegotiatedAlgorithms?) {
+        autoPortForwardsTask?.cancel()
+        autoPortForwardsTask = nil
         cleanupActivityTracking()
         self.session = session; self.bridge = bridge
         self.algorithms = algorithms
@@ -205,12 +317,7 @@ final class LiveSession: Identifiable {
     }
 
     private func attachActivityObservers(to targetBridge: SessionBridge) {
-        targetBridge.onOutputChunk = { [weak self, weak targetBridge] chunk in
-            Task { @MainActor [weak self] in
-                guard let self, let targetBridge, self.bridge === targetBridge else { return }
-                self.handleOutputChunk(chunk)
-            }
-        }
+        syncOutputTracking(on: targetBridge)
         targetBridge.onUserInput = { [weak self, weak targetBridge] bytes in
             Task { @MainActor [weak self] in
                 guard let self, let targetBridge, self.bridge === targetBridge else { return }
@@ -219,10 +326,31 @@ final class LiveSession: Identifiable {
         }
     }
 
-    private func handleOutputChunk(_ chunk: [UInt8]) {
+    private func syncOutputTracking(on targetBridge: SessionBridge? = nil) {
+        let activeBridge = targetBridge ?? bridge
+        guard isAgentActivityTracked else {
+            outputCoalescer?.stop()
+            outputCoalescer = nil
+            activeBridge.onOutputChunk = nil
+            return
+        }
+        let coalescer = OutputChunkCoalescer { [weak self, weak activeBridge] data in
+            Task { @MainActor [weak self] in
+                guard let self, let activeBridge, self.bridge === activeBridge else { return }
+                self.handleOutputChunk(data)
+            }
+        }
+        outputCoalescer?.stop()
+        outputCoalescer = coalescer
+        activeBridge.onOutputChunk = { [weak coalescer] chunk in
+            coalescer?.enqueue(chunk)
+        }
+    }
+
+    private func handleOutputChunk(_ chunk: Data) {
         guard isAgentActivityTracked, !chunk.isEmpty else { return }
 
-        outputTailData.append(contentsOf: chunk)
+        outputTailData.append(chunk)
         if outputTailData.count > Self.maxOutputTailBytes {
             var trimmed = outputTailData.suffix(Self.maxOutputTailBytes)
             while let first = trimmed.first, (first & 0xC0) == 0x80 {
@@ -267,6 +395,7 @@ final class LiveSession: Identifiable {
             directInputSequence &+= 1
         }
 
+        outputCoalescer?.discardPending()
         outputTailData.removeAll(keepingCapacity: true)
         completionDebounceTask?.cancel()
         completionDebounceTask = nil
@@ -362,17 +491,20 @@ final class SessionManager {
             AgentNotificationManager.shared.requestAuthorizationIfNeeded()
         }
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
-        startAutoPortForwards(for: hostID, on: session)
+        startAutoPortForwards(for: live, on: session)
         onSessionsChanged?()
         return live
     }
 
-    private func startAutoPortForwards(for hostID: UUID, on session: any Session) {
+    private func startAutoPortForwards(for live: LiveSession, on session: any Session) {
+        live.autoPortForwardsTask?.cancel()
+        live.autoPortForwardsTask = nil
         guard let conn = session as? SSHConnection else { return }
-        let rules = PortForwardStore.list(for: hostID).filter(\.autoStart)
+        let rules = PortForwardStore.list(for: live.hostID).filter(\.autoStart)
         guard !rules.isEmpty else { return }
-        Task.detached {
+        live.autoPortForwardsTask = Task.detached {
             for rule in rules {
+                guard !Task.isCancelled else { return }
                 _ = try? await conn.startLocalForward(
                     PortForwardRule(
                         id: rule.id,
@@ -393,7 +525,12 @@ final class SessionManager {
         if host.modelContext == nil {
             modelContext.insert(host)
         }
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            modelContext.rollback()
+            return false
+        }
         live.ephemeralHost = nil
         AppHaptics.notify(.success)
         return true
@@ -447,7 +584,7 @@ final class SessionManager {
         let old = live.session
         live.replace(session: session, bridge: bridge, algorithms: algorithms)
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
-        startAutoPortForwards(for: live.hostID, on: session)
+        startAutoPortForwards(for: live, on: session)
         onSessionsChanged?()
         Task { await old.close() }
     }
@@ -455,6 +592,8 @@ final class SessionManager {
     func close(_ id: UUID) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         let live = sessions.remove(at: i)
+        live.autoPortForwardsTask?.cancel()
+        live.autoPortForwardsTask = nil
         live.cleanupActivityTracking()
         onSessionsChanged?()
         let session = live.session

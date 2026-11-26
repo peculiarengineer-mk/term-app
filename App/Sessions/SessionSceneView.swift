@@ -9,8 +9,11 @@ import TermUI
 /// bridge rebuilds the terminal view.
 struct TerminalPane: View {
     let live: LiveSession
+    var isFocusedPane: Bool = true
+    var onFocusPane: (() -> Void)? = nil
     var onOpenGitDiff: (() -> Void)? = nil
     var onOpenDevPreview: (() -> Void)? = nil
+    @Environment(AppLockManager.self) private var appLock
     @Environment(ProStore.self) private var proStore
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
@@ -20,8 +23,11 @@ struct TerminalPane: View {
     @AppStorage(AppearanceSettings.hapticsKey) private var hapticsEnabled = AppearanceSettings.defaultHapticsEnabled
     @State private var isVisible = false
     @State private var inspectingSecurity = false
+    @State private var hostWindow: UIWindow?
     @State private var zoomHUDText: String?
     @State private var zoomHUDTask: Task<Void, Never>?
+    @State private var scene: UIWindowScene?
+    @State private var ownsKeyboard = false
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
     private var fontFamily: TerminalFontFamily { TerminalFontFamily(rawValue: fontFamilyRaw) ?? .sfMono }
@@ -58,10 +64,13 @@ struct TerminalPane: View {
                     cursorStyle: cursorStyle,
                     controller: controller,
                     accessoryView: live.bar,
-                    keyCommands: HardwareKeyCommands.commands(action: TerminalHostView.keyCommandAction),
-                    autoFocus: live.shouldAutoFocus && live.overlay == nil,
+                    keyCommands: appLock.isLocked ? [] : HardwareKeyCommands.commands(action: TerminalHostView.keyCommandAction),
+                    autoFocus: isFocusedPane && live.shouldAutoFocus && live.overlay == nil && !appLock.isLocked,
                     hapticsEnabled: hapticsEnabled,
-                    onKeyCommand: { [controller] in HardwareKeyCommands.handle($0, controller: controller) },
+                    onKeyCommand: appLock.isLocked ? nil : { [controller, appLock] command in
+                        guard !appLock.isLocked else { return }
+                        HardwareKeyCommands.handle(command, controller: controller)
+                    },
                     onFontSizeChange: { newSize in
                         let updated = Double(newSize)
                         fontSize = updated
@@ -71,6 +80,7 @@ struct TerminalPane: View {
                 .simultaneousGesture(
                     TapGesture().onEnded {
                         live.recordTerminalFocusInteraction()
+                        onFocusPane?()
                     }
                 )
 
@@ -106,6 +116,8 @@ struct TerminalPane: View {
             if let overlay = live.overlay { overlay }
         }
         .background(theme.backgroundColor.ignoresSafeArea(.container, edges: .bottom))
+        .background(WindowReader(window: $hostWindow))
+        .background(SceneReader(scene: $scene))
         .id(ObjectIdentifier(live.bridge))
         .onAppear {
             isVisible = true
@@ -115,6 +127,7 @@ struct TerminalPane: View {
         }
         .onDisappear {
             isVisible = false
+            ownsKeyboard = false
             live.terminalDisappeared()
             live.hasInlineModalPresented = false
             zoomHUDTask?.cancel()
@@ -122,6 +135,22 @@ struct TerminalPane: View {
         }
         .onChange(of: inspectingSecurity) { _, isPresented in
             live.hasInlineModalPresented = isPresented
+        }
+        .onChange(of: isFocusedPane) { _, focused in
+            if focused, live.shouldAutoFocus, !appLock.isLocked {
+                focusTerminalIfNeeded()
+            }
+        }
+        .onChange(of: live.shouldAutoFocus) { _, autoFocus in
+            if isFocusedPane, autoFocus, !appLock.isLocked {
+                focusTerminalIfNeeded()
+            }
+        }
+        .onChange(of: appLock.isLocked) { _, isLocked in
+            if isLocked {
+                ownsKeyboard = false
+                live.controller.dismissKeyboard()
+            }
         }
         .onChange(of: themeName) { _, _ in syncExtraKeysBar() }
         .onChange(of: hapticsEnabled) { _, _ in syncExtraKeysBar() }
@@ -132,25 +161,74 @@ struct TerminalPane: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
             DispatchQueue.main.async {
-                if isVisible, live.overlay == nil, !inspectingSecurity, live.bar.window != nil {
+                if isVisible, live.overlay == nil, !inspectingSecurity, !appLock.isLocked, live.bar.window != nil {
+                    ownsKeyboard = true
                     live.recordTerminalFocusInteraction()
+                    onFocusPane?()
                 }
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
-            if isVisible, live.overlay == nil, !inspectingSecurity {
-                live.shouldAutoFocus = true
+            if isVisible, live.overlay == nil, !inspectingSecurity, !appLock.isLocked {
                 if live.bar.window != nil {
+                    ownsKeyboard = true
+                    live.shouldAutoFocus = true
                     live.recordTerminalFocusInteraction()
+                    onFocusPane?()
+                } else {
+                    ownsKeyboard = false
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            if isVisible, live.bar.window != nil {
+                ownsKeyboard = true
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
+            let owned = ownsKeyboard
+            ownsKeyboard = false
             DispatchQueue.main.async {
-                guard isVisible, live.overlay == nil, !inspectingSecurity, !hasPresentedModal else { return }
+                guard isVisible,
+                      owned,
+                      !appLock.isLocked,
+                      live.overlay == nil,
+                      !inspectingSecurity,
+                      !hasPresentedModal,
+                      scene == nil || scene?.activationState == .foregroundActive else {
+                    return
+                }
                 live.shouldAutoFocus = false
             }
         }
+    }
+
+    private func focusTerminalIfNeeded() {
+        guard isVisible,
+              isFocusedPane,
+              !appLock.isLocked,
+              live.overlay == nil,
+              !inspectingSecurity,
+              !hasPresentedModal,
+              let hostWindow,
+              let terminalView = Self.findTerminalView(in: hostWindow, matchingAccessory: live.bar),
+              !terminalView.isFirstResponder else {
+            return
+        }
+        _ = terminalView.becomeFirstResponder()
+        live.recordTerminalFocusInteraction()
+    }
+
+    private static func findTerminalView(in view: UIView, matchingAccessory bar: UIView) -> UIView? {
+        if view.inputAccessoryView === bar, view.canBecomeFirstResponder {
+            return view
+        }
+        for subview in view.subviews {
+            if let match = findTerminalView(in: subview, matchingAccessory: bar) {
+                return match
+            }
+        }
+        return nil
     }
 
     private func quantumNoticeBanner(algorithms: NegotiatedAlgorithms) -> some View {
@@ -210,10 +288,15 @@ struct TerminalPane: View {
     }
 
     private var hasPresentedModal: Bool {
-        UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-            .flatMap(\.windows)
-            .contains { $0.isKeyWindow && $0.rootViewController?.presentedViewController != nil }
+        let windows: [UIWindow]
+        if let scene {
+            windows = scene.windows
+        } else {
+            windows = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+        }
+        return windows.contains { $0.isKeyWindow && $0.rootViewController?.presentedViewController != nil }
     }
 
     private func syncExtraKeysBar() {
@@ -257,6 +340,7 @@ struct SessionSceneView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(SessionManager.self) private var manager
+    @Environment(AppLockManager.self) private var appLock
     @Environment(ProStore.self) private var proStore
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
@@ -364,7 +448,7 @@ struct SessionSceneView: View {
             if dismissing, let s { UIApplication.shared.requestSceneSessionDestruction(s.session, options: nil) }
         }
         .background {
-            if let scene {
+            if let scene, !appLock.isLocked {
                 SceneNotifications(
                     scene: scene,
                     onNewTab: { requestNewTabInMainWindow() },
@@ -512,7 +596,7 @@ struct SessionSceneView: View {
 
     @ViewBuilder
     private var keyboardShortcutsLayer: some View {
-        let modalFree = activeToolSheet == nil && !inspectingSecurity && !confirmingClose
+        let modalFree = activeToolSheet == nil && !inspectingSecurity && !confirmingClose && !appLock.isLocked
         ZStack {
             if let live = ownedLiveSession, modalFree {
                 SessionShortcutButton("Hosts Quick Connect", key: "t", modifiers: .command) {
@@ -586,4 +670,30 @@ private struct SceneNotifications: View {
             .onReceive(center.publisher(for: .termCloseTab, object: scene)) { _ in onCloseTab() }
             .allowsHitTesting(false)
     }
+}
+
+/// Finds the `UIWindow` hosting this view so split focus can target the pane's terminal view.
+private struct WindowReader: UIViewRepresentable {
+    @Binding var window: UIWindow?
+
+    final class Probe: UIView {
+        var onWindow: ((UIWindow?) -> Void)?
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            onWindow?(window)
+        }
+    }
+
+    func makeUIView(context: Context) -> Probe {
+        let view = Probe()
+        view.isUserInteractionEnabled = false
+        view.onWindow = { newWindow in
+            DispatchQueue.main.async {
+                window = newWindow
+            }
+        }
+        return view
+    }
+
+    func updateUIView(_ uiView: Probe, context: Context) {}
 }

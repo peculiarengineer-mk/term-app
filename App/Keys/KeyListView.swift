@@ -342,17 +342,16 @@ struct KeyListView: View {
             AppHaptics.notify(.warning)
             reload()
         } catch {
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
     }
 
     private func reload() {
         do {
-            let loaded = try store.list()
-            keys = loaded
-            keysWithSavedPassphrase = Set(loaded.filter { ((try? store.passphrase(for: $0)) ?? nil) != nil }.map(\.id))
+            keys = try store.list()
+            keysWithSavedPassphrase = try store.keysWithSavedPassphrase()
         } catch {
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
     }
 
@@ -362,7 +361,7 @@ struct KeyListView: View {
             AppHaptics.notify(.warning)
             reload()
         } catch {
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
     }
 
@@ -370,7 +369,7 @@ struct KeyListView: View {
         do {
             try store.setSynchronizable(on, for: key)
         } catch {
-            self.error = "\(error)"
+            self.error = error.localizedDescription
         }
         reload()
     }

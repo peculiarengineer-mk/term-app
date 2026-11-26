@@ -625,10 +625,20 @@ struct AgentsDashboardView: View {
         guard let host = hosts.first(where: { $0.id == item.hostID }) else { return }
         let target = AgentHostTarget(host: host, sessionManager: sessionManager)
         do {
-            _ = try await AgentAuthHelper.exec(
+            let result = try await AgentAuthHelper.exec(
                 TMuxSessionHelper.killSessionCommand(sessionName: item.session.sessionName),
                 on: target
             )
+            guard result.exitCode == 0 else {
+                let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let stdout = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                let detail = !stderr.isEmpty
+                    ? stderr
+                    : (!stdout.isEmpty ? stdout : "Failed to kill session (exit code \(result.exitCode)).")
+                AppHaptics.notify(.error)
+                killError = detail
+                return
+            }
             AppHaptics.notify(.success)
             remoteSessions.removeAll { $0.id == item.id }
         } catch {
@@ -652,17 +662,32 @@ struct AgentsDashboardView: View {
         }
 
         isScanning = true
+        defer {
+            if generation == scanGeneration {
+                isScanning = false
+            }
+        }
 
+        let maxConcurrentScans = 5
         let outcomes = await withTaskGroup(of: HostScanOutcome.self) { group in
-            for target in targets {
-                group.addTask {
-                    await Self.scanHost(target, knownCommands: knownCommands)
+            var iterator = targets.makeIterator()
+            for _ in 0..<min(maxConcurrentScans, targets.count) {
+                if let target = iterator.next() {
+                    group.addTask {
+                        await Self.scanHost(target, knownCommands: knownCommands)
+                    }
                 }
             }
 
             var collected: [HostScanOutcome] = []
+            collected.reserveCapacity(targets.count)
             for await outcome in group {
                 collected.append(outcome)
+                if !Task.isCancelled, let nextTarget = iterator.next() {
+                    group.addTask {
+                        await Self.scanHost(nextTarget, knownCommands: knownCommands)
+                    }
+                }
             }
             return collected
         }
@@ -690,7 +715,6 @@ struct AgentsDashboardView: View {
             return lhs.session.sessionName.localizedCaseInsensitiveCompare(rhs.session.sessionName) == .orderedAscending
         }
         scanOutcomes = outcomes
-        isScanning = false
         hasScannedOnce = true
     }
 

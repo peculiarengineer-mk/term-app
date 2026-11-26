@@ -589,7 +589,7 @@ struct GitDiffInspectorSheet: View {
     private var commitSheet: some View {
         let trimmedMessage = commitMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         let fileCount = snapshot?.files.count ?? 0
-        let branchLabel = snapshot?.branch.isEmpty == false ? snapshot!.branch : "HEAD"
+        let branchLabel = snapshot.flatMap { $0.branch.isEmpty ? nil : $0.branch } ?? "HEAD"
 
         return NavigationStack {
             Form {

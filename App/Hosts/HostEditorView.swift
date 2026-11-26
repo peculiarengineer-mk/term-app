@@ -22,8 +22,11 @@ enum HostSecrets {
         try keychain.save(Data(pw.utf8), service: passwordService, account: account,
                           synchronizable: AppContainer.syncEnabledAtLaunch || hasSynced)
     }
+    static func tryDeletePassword(for id: UUID) throws {
+        try KeychainStore().delete(service: passwordService, account: id.uuidString)
+    }
     static func deletePassword(for id: UUID) {
-        try? KeychainStore().delete(service: passwordService, account: id.uuidString)
+        try? tryDeletePassword(for: id)
     }
 }
 
@@ -33,6 +36,7 @@ struct HostEditorView: View {
     }
 
     let host: Host?
+    var onSaved: (() -> Void)? = nil
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
     @Query(sort: \Host.label) private var allHosts: [Host]
@@ -49,6 +53,8 @@ struct HostEditorView: View {
     @State private var tmuxOn = false
     @State private var tags: [String] = []
     @State private var tagInput = ""
+    @State private var proxyJumpHostID: UUID?
+    @State private var forwardAgent = false
     /// The host inserted by a first Save, so a retried Save after a Keychain failure updates it
     /// instead of inserting a duplicate.
     @State private var created: Host?
@@ -61,7 +67,14 @@ struct HostEditorView: View {
     @FocusState private var focusedField: Field?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
-    private var portValue: Int? { Int(port).flatMap { (1...65535).contains($0) ? $0 : nil } }
+    private var portValue: Int? {
+        let trimmed = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        return Int(trimmed).flatMap { (1...65535).contains($0) ? $0 : nil }
+    }
+    private var isSelectedKeyMissing: Bool {
+        guard let keyID else { return false }
+        return !keys.contains { $0.id == keyID }
+    }
     private var trimmedHost: String { hostname.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var trimmedUser: String { user.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var trimmedTagInput: String { tagInput.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -77,6 +90,16 @@ struct HostEditorView: View {
         return Set(allCleaned)
             .filter { !tags.contains($0) }
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private var editingHostID: UUID? {
+        host?.id ?? created?.id
+    }
+
+    private var eligibleJumpHosts: [Host] {
+        allHosts.filter { candidate in
+            SSHOptionsBuilder.canSelectJumpHost(candidate, forHostID: editingHostID, allHosts: allHosts)
+        }
     }
 
     var body: some View {
@@ -107,7 +130,18 @@ struct HostEditorView: View {
                 if auth == "key" {
                     Picker("Key", selection: $keyID) {
                         Text("Select…").tag(UUID?.none)
+                        if let keyID, !keys.contains(where: { $0.id == keyID }) {
+                            Text("Missing Key").tag(UUID?.some(keyID))
+                        }
                         ForEach(keys) { Text($0.name).tag(UUID?.some($0.id)) }
+                    }
+                    if isSelectedKeyMissing {
+                        Label(
+                            "The selected key is missing or deleted from this device. Choose, generate, or import a key.",
+                            systemImage: "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                     }
                     Button {
                         showGenerateKey = true
@@ -204,6 +238,25 @@ struct HostEditorView: View {
                 }
             }
 
+            Section {
+                Picker("Jump Host (ProxyJump)", selection: $proxyJumpHostID) {
+                    Text("None").tag(UUID?.none)
+                    if let currentJumpID = proxyJumpHostID,
+                       !eligibleJumpHosts.contains(where: { $0.id == currentJumpID }) {
+                        Text("Unavailable Host").tag(UUID?.some(currentJumpID))
+                    }
+                    ForEach(eligibleJumpHosts) { candidate in
+                        Text(jumpHostOptionLabel(for: candidate)).tag(UUID?.some(candidate.id))
+                    }
+                }
+
+                Toggle("Forward SSH Agent (-A)", isOn: $forwardAgent)
+            } header: {
+                Text("Jump Host & Agent")
+            } footer: {
+                Text("Allows this server to authenticate using your local SSH keys while connected. Only enable on hosts you trust.")
+            }
+
             if let error {
                 Text(error)
                     .foregroundStyle(.red)
@@ -263,6 +316,18 @@ struct HostEditorView: View {
         AppHaptics.impact(.light)
     }
 
+    private func jumpHostOptionLabel(for candidate: Host) -> String {
+        let trimmedLabel = candidate.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endpoint = candidate.port == 22 ? candidate.hostname : "\(candidate.hostname):\(candidate.port)"
+        if trimmedLabel.isEmpty {
+            return endpoint
+        }
+        if trimmedLabel.caseInsensitiveCompare(candidate.hostname) == .orderedSame {
+            return candidate.port == 22 ? trimmedLabel : "\(trimmedLabel):\(candidate.port)"
+        }
+        return "\(trimmedLabel) (\(endpoint))"
+    }
+
     private func reloadKeysAndSelect(_ newKeyID: UUID) {
         do {
             keys = try KeyStore().list()
@@ -294,6 +359,8 @@ struct HostEditorView: View {
         tmuxOn = host.tmuxCommand != nil
         tmux = host.tmuxCommand ?? ""
         tags = Self.normalizedTags(from: host.tags)
+        proxyJumpHostID = host.proxyJumpHostID
+        forwardAgent = host.forwardAgent
         do {
             password = try HostSecrets.readPassword(for: host.id) ?? ""
             passwordLoaded = true
@@ -319,6 +386,8 @@ struct HostEditorView: View {
         let t = tmux.trimmingCharacters(in: .whitespacesAndNewlines)
         // nil = off, empty = the default command
         target.tmuxCommand = tmuxOn ? t : nil
+        target.proxyJumpHostID = proxyJumpHostID
+        target.forwardAgent = forwardAgent
         target.touch()
         do {
             if isNew { context.insert(target) }
@@ -333,11 +402,13 @@ struct HostEditorView: View {
             if auth != "key", !password.isEmpty {
                 try HostSecrets.savePassword(password, for: target.id)
             } else if passwordLoaded {
-                HostSecrets.deletePassword(for: target.id)
+                try HostSecrets.tryDeletePassword(for: target.id)
             }
+            onSaved?()
             dismiss()
         } catch {
-            self.error = "Host saved, but the password could not be stored: \(error.localizedDescription)"
+            let action = (auth != "key" && !password.isEmpty) ? "stored" : "removed"
+            self.error = "Host saved, but the password could not be \(action): \(error.localizedDescription)"
         }
     }
 }

@@ -11,6 +11,10 @@ struct HostKeyMismatchView: View {
     let onClose: () -> Void
     @State private var confirming = false
 
+    private var hostDisplay: String {
+        port == 22 ? hostname : "\(hostname):\(port)"
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -73,7 +77,7 @@ struct HostKeyMismatchView: View {
             }
             .background(.bar)
         }
-        .confirmationDialog("Replace the stored key for \(hostname)?", isPresented: $confirming, titleVisibility: .visible) {
+        .confirmationDialog("Replace the stored key for \(hostDisplay)?", isPresented: $confirming, titleVisibility: .visible) {
             Button("Replace stored key", role: .destructive, action: onReplace)
             Button("Cancel", role: .cancel) {}
         } message: {

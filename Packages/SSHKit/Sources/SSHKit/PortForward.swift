@@ -49,7 +49,7 @@ enum LocalForwardSocket {
     static func bindAndListen(port: UInt16) throws -> (fd: Int32, boundPort: UInt16) {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else {
-            throw SSHError.channelFailed("forward socket failed: \(String(cString: strerror(errno)))")
+            throw SSHError.channelFailed("forward socket failed: \(SocketPoller.errorString(for: errno))")
         }
 
         var one: Int32 = 1
@@ -72,13 +72,13 @@ enum LocalForwardSocket {
             }
         }
         guard bindRc == 0 else {
-            let msg = String(cString: strerror(errno))
+            let msg = SocketPoller.errorString(for: errno)
             Darwin.close(fd)
             throw SSHError.channelFailed("bind 127.0.0.1:\(port) failed: \(msg)")
         }
 
         guard Darwin.listen(fd, 16) == 0 else {
-            let msg = String(cString: strerror(errno))
+            let msg = SocketPoller.errorString(for: errno)
             Darwin.close(fd)
             throw SSHError.channelFailed("listen failed: \(msg)")
         }
@@ -91,7 +91,7 @@ enum LocalForwardSocket {
             }
         }
         guard nameRc == 0 else {
-            let msg = String(cString: strerror(errno))
+            let msg = SocketPoller.errorString(for: errno)
             Darwin.close(fd)
             throw SSHError.channelFailed("getsockname failed: \(msg)")
         }

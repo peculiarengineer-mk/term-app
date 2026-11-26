@@ -176,7 +176,10 @@ struct AuthPromptView: View {
         self.subtitle = subtitle
         self.onSubmit = onSubmit
         self.onCancel = onCancel
-        _answers = State(initialValue: request.prefill)
+        let paddingCount = max(0, request.items.count - request.prefill.count)
+        let paddedAnswers = Array(request.prefill.prefix(request.items.count))
+            + Array(repeating: "", count: paddingCount)
+        _answers = State(initialValue: paddedAnswers)
     }
 
     var body: some View {
@@ -507,5 +510,64 @@ struct HostEnvironmentIcon: View {
             symbolName: environment.symbolName,
             gradientColors: environment.gradientColors
         )
+    }
+}
+
+/// Reads security-scoped `.fileImporter` URLs off `@MainActor` with a strict size limit.
+enum SecurityScopedFileReader {
+    enum ReadError: LocalizedError {
+        case tooLarge(maxBytes: Int)
+        case invalidUTF8
+
+        var errorDescription: String? {
+            switch self {
+            case .tooLarge(let maxBytes):
+                let formattedLimit = ByteCountFormatter.string(fromByteCount: Int64(maxBytes), countStyle: .binary)
+                return "Selected file exceeds the \(formattedLimit) limit."
+            case .invalidUTF8:
+                return "The selected file is not valid UTF-8 text."
+            }
+        }
+    }
+
+    static func readData(from url: URL, maxBytes: Int) async throws -> Data {
+        try await Task.detached(priority: .userInitiated) {
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer {
+                if scoped {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            let values = try url.resourceValues(forKeys: [.fileSizeKey])
+            if let fileSize = values.fileSize, fileSize > maxBytes {
+                throw ReadError.tooLarge(maxBytes: maxBytes)
+            }
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            var data = Data()
+            let chunkSize = 64 * 1024
+            while data.count <= maxBytes {
+                let remaining = (maxBytes + 1) - data.count
+                guard let chunk = try handle.read(upToCount: min(chunkSize, remaining)), !chunk.isEmpty else {
+                    break
+                }
+                data.append(chunk)
+            }
+            if data.count > maxBytes {
+                throw ReadError.tooLarge(maxBytes: maxBytes)
+            }
+            return data
+        }.value
+    }
+
+    static func readText(from url: URL, maxBytes: Int, allowASCIIFallback: Bool = false) async throws -> String {
+        let data = try await readData(from: url, maxBytes: maxBytes)
+        if let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        if allowASCIIFallback, let ascii = String(data: data, encoding: .ascii) {
+            return ascii
+        }
+        throw ReadError.invalidUTF8
     }
 }

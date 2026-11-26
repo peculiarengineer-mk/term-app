@@ -38,6 +38,7 @@ public final class ExtraKeysBar: UIView, UIScrollViewDelegate {
     public var onConfirmMultilinePaste: ((_ text: String, _ proceed: @escaping @MainActor () -> Void) -> Void)?
     public var hapticsEnabled: Bool = true
     var clock: () -> Date = Date.init
+    var readPasteboard: @MainActor () -> String? = { UIPasteboard.general.string }
 
     private weak var controller: TerminalController?
     private var theme: TerminalTheme = .appleProDark
@@ -144,15 +145,28 @@ public final class ExtraKeysBar: UIView, UIScrollViewDelegate {
     }
 
     /// Encodes pasted text for the terminal, wrapping in bracketed-paste markers (`ESC[200~` … `ESC[201~`) when
-    /// `bracketed` is true. Embedded `ESC[201~` markers are stripped first to prevent bracketed-paste escape injection.
+    /// `bracketed` is true. Embedded 7-bit (`ESC[200~`, `ESC[201~`) and 8-bit C1 (`0x9B 200~`, `0x9B 201~`)
+    /// bracketed-paste markers are stripped repeatedly to prevent bracketed-paste escape injection.
     public nonisolated static func encodedPaste(_ text: String, bracketed: Bool) -> [UInt8] {
         guard bracketed else { return Array(text.utf8) }
+        let startMarker = "\u{1b}[200~"
         let endMarker = "\u{1b}[201~"
+        let forbiddenMarkers = [
+            startMarker,
+            endMarker,
+            "\u{009b}200~",
+            "\u{009b}201~",
+        ]
         var sanitized = text
-        while sanitized.range(of: endMarker, options: .literal) != nil {
-            sanitized = sanitized.replacingOccurrences(of: endMarker, with: "", options: .literal)
+        var didStrip = true
+        while didStrip {
+            didStrip = false
+            for marker in forbiddenMarkers where sanitized.range(of: marker, options: .literal) != nil {
+                sanitized = sanitized.replacingOccurrences(of: marker, with: "", options: .literal)
+                didStrip = true
+            }
         }
-        return Array(("\u{1b}[200~" + sanitized + endMarker).utf8)
+        return Array((startMarker + sanitized + endMarker).utf8)
     }
 
     private var terminal: TerminalView? { controller?.view }
@@ -526,7 +540,7 @@ public final class ExtraKeysBar: UIView, UIScrollViewDelegate {
     }
 
     private func pasteTapped() {
-        guard let text = UIPasteboard.general.string, !text.isEmpty else {
+        guard let text = readPasteboard(), !text.isEmpty else {
             if hapticsEnabled {
                 notificationFeedback.notificationOccurred(.warning)
             }

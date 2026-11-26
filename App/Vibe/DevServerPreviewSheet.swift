@@ -25,6 +25,8 @@ struct DevServerPreviewSheet: View {
     @State private var previewTarget: PreviewTarget?
     @State private var loadGeneration = 0
     @State private var didInitialLoad = false
+    @State private var ownedForwardIDs: Set<UUID> = []
+    @State private var previewTask: Task<Void, Never>?
     @FocusState private var isCustomPortFocused: Bool
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
@@ -143,6 +145,19 @@ struct DevServerPreviewSheet: View {
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+        .onDisappear {
+            previewTask?.cancel()
+            previewTask = nil
+            let idsToStop = ownedForwardIDs
+            ownedForwardIDs.removeAll()
+            if !idsToStop.isEmpty, let connection = sshConnection {
+                Task {
+                    for id in idsToStop {
+                        await connection.stopLocalForward(id: id)
+                    }
+                }
+            }
+        }
     }
 
     private var customPortSection: some View {
@@ -155,7 +170,7 @@ struct DevServerPreviewSheet: View {
 
                 Button {
                     guard let port = parsedCustomPort else { return }
-                    Task { await preview(port: port, processName: nil) }
+                    startPreview(port: port, processName: nil, remoteHost: "127.0.0.1")
                 } label: {
                     if let customPort = parsedCustomPort, forwardingPort == customPort {
                         ProgressView()
@@ -184,7 +199,7 @@ struct DevServerPreviewSheet: View {
 
         return Button {
             AppHaptics.impact(.light)
-            Task { await preview(port: port.port, processName: port.processName) }
+            startPreview(port: port.port, processName: port.processName, remoteHost: remoteHost(for: port))
         } label: {
             HStack(spacing: 12) {
                 ProSquircleIcon(
@@ -253,13 +268,24 @@ struct DevServerPreviewSheet: View {
         }
         .contextMenu {
             Button("Open Preview", systemImage: "safari") {
-                Task { await preview(port: port.port, processName: port.processName) }
+                startPreview(port: port.port, processName: port.processName, remoteHost: remoteHost(for: port))
             }
             if let existingForward {
                 Button("Stop Tunnel", systemImage: "stop.circle", role: .destructive) {
                     Task { await stopForward(existingForward.id) }
                 }
             }
+        }
+    }
+
+    private func remoteHost(for port: ListeningPort) -> String {
+        port.address == "::1" ? "::1" : "127.0.0.1"
+    }
+
+    private func startPreview(port: UInt16, processName: String?, remoteHost: String) {
+        previewTask?.cancel()
+        previewTask = Task {
+            await preview(port: port, processName: processName, remoteHost: remoteHost)
         }
     }
 
@@ -308,7 +334,7 @@ struct DevServerPreviewSheet: View {
         }
     }
 
-    private func preview(port: UInt16, processName: String?) async {
+    private func preview(port: UInt16, processName: String?, remoteHost: String) async {
         isCustomPortFocused = false
         guard let connection = sshConnection else {
             actionError = "An active SSH connection is required for port forwarding."
@@ -319,7 +345,9 @@ struct DevServerPreviewSheet: View {
         defer { forwardingPort = nil }
 
         do {
+            try Task.checkCancellation()
             let currentForwards = await connection.activePortForwards()
+            try Task.checkCancellation()
             activeForwards = currentForwards
 
             let boundLocalPort: UInt16
@@ -334,14 +362,20 @@ struct DevServerPreviewSheet: View {
                     PortForwardRule(
                         name: ruleName,
                         localPort: 0,
-                        remoteHost: "127.0.0.1",
+                        remoteHost: remoteHost,
                         remotePort: port
                     )
                 )
+                if Task.isCancelled {
+                    await connection.stopLocalForward(id: started.id)
+                    return
+                }
+                ownedForwardIDs.insert(started.id)
                 boundLocalPort = started.boundLocalPort
                 activeForwards = await connection.activePortForwards()
             }
 
+            try Task.checkCancellation()
             guard let url = URL(string: "http://127.0.0.1:\(boundLocalPort)") else {
                 actionError = "Could not build local preview URL for port \(boundLocalPort)."
                 return
@@ -349,6 +383,8 @@ struct DevServerPreviewSheet: View {
 
             AppHaptics.notify(.success)
             previewTarget = PreviewTarget(url: url)
+        } catch is CancellationError {
+            return
         } catch {
             AppHaptics.notify(.error)
             actionError = "Could not forward port \(port): \(error.localizedDescription)"
@@ -357,6 +393,7 @@ struct DevServerPreviewSheet: View {
 
     private func stopForward(_ id: UUID) async {
         guard let connection = sshConnection else { return }
+        ownedForwardIDs.remove(id)
         await connection.stopLocalForward(id: id)
         activeForwards = await connection.activePortForwards()
         AppHaptics.notify(.warning)

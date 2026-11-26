@@ -1,10 +1,12 @@
 import XCTest
+import CLibSSH2
 @testable import SSHKit
 
 final class AlgorithmPolicyTests: XCTestCase {
     private var lists: [(String, [String])] {
         [("kex", AlgorithmPolicy.kex), ("ciphers", AlgorithmPolicy.ciphers),
-         ("macs", AlgorithmPolicy.macs), ("hostKeys", AlgorithmPolicy.hostKeys)]
+         ("macs", AlgorithmPolicy.macs), ("hostKeys", AlgorithmPolicy.hostKeys),
+         ("compression", AlgorithmPolicy.compression)]
             .map { ($0.0, $0.1.split(separator: ",").map(String.init)) }
     }
 
@@ -32,6 +34,17 @@ final class AlgorithmPolicyTests: XCTestCase {
         XCTAssertTrue(n("mlkem768x25519-sha256").isPostQuantum)
         XCTAssertTrue(n("sntrup761x25519-sha512").isPostQuantum)
         XCTAssertFalse(n("curve25519-sha256").isPostQuantum)
+    }
+
+    func testCompressionPolicyDisablesCompression() {
+        XCTAssertEqual(AlgorithmPolicy.compression, "none")
+        let compMethods = AlgorithmPolicy.methodLists.filter {
+            $0.method == LIBSSH2_METHOD_COMP_CS || $0.method == LIBSSH2_METHOD_COMP_SC
+        }
+        XCTAssertEqual(compMethods.count, 2)
+        for entry in compMethods {
+            XCTAssertEqual(entry.list, "none")
+        }
     }
 
     /// Offline: every policy name is implemented by the linked libssh2 (catches a rebuild that lost ML-KEM).

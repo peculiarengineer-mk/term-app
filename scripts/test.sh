@@ -1,14 +1,16 @@
 #!/bin/bash
-# Usage: scripts/test.sh <scheme>
+# Usage: scripts/test.sh <scheme> [xcodebuild-args...]
 # Runs xcodebuild test on an iPhone simulator with the newest iOS 18+ runtime. TERMAPP_TEST_* shell
 # variables are re-exported as TEST_RUNNER_TERMAPP_TEST_* so they reach the simulator.
 set -euo pipefail
-SCHEME="${1:?usage: scripts/test.sh <scheme>}"
+SCHEME="${1:?usage: scripts/test.sh <scheme> [xcodebuild-args...]}"
+shift
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-for v in $(compgen -e | grep '^TERMAPP_TEST_' || true); do
+while IFS= read -r v; do
+  [ -n "$v" ] || continue
   export "TEST_RUNNER_$v=${!v}"
-done
+done < <(compgen -e | grep '^TERMAPP_TEST_' || true)
 
 # Newest iOS runtime (18 or later) that has an available iPhone simulator.
 SIM_ID="$(xcrun simctl list devices available -j | /usr/bin/python3 -c '
@@ -28,7 +30,7 @@ print(best[1] if best else "")
 
 if [ -d "$ROOT/Packages/$SCHEME" ] && [ ! -f "$ROOT/TermApp.xcodeproj/xcshareddata/xcschemes/$SCHEME.xcscheme" ]; then
   cd "$ROOT/Packages/$SCHEME"
-  exec xcodebuild test -scheme "$SCHEME" -destination "platform=iOS Simulator,id=$SIM_ID"
+  exec xcodebuild test -scheme "$SCHEME" -destination "platform=iOS Simulator,id=$SIM_ID" "$@"
 fi
 cd "$ROOT"
-exec xcodebuild test -project TermApp.xcodeproj -scheme "$SCHEME" -destination "platform=iOS Simulator,id=$SIM_ID"
+exec xcodebuild test -project TermApp.xcodeproj -scheme "$SCHEME" -destination "platform=iOS Simulator,id=$SIM_ID" "$@"

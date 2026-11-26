@@ -18,20 +18,22 @@ struct HostConnectionView: View {
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
 
-    private var activeModel: HostConnectionModel {
-        externalModel ?? ownedModel!
+    private var activeModel: HostConnectionModel? {
+        externalModel ?? ownedModel
     }
 
     private var hostTitle: String {
-        let modelTitle = activeModel.title
-        if !modelTitle.isEmpty { return modelTitle }
+        if let modelTitle = activeModel?.title, !modelTitle.isEmpty { return modelTitle }
         return host.label.isEmpty ? host.hostname : host.label
     }
 
     private var addressSubtitle: String {
-        let userPart = activeModel.username.isEmpty ? "" : "\(activeModel.username)@"
-        let portPart = activeModel.port == 22 ? "" : ":\(activeModel.port)"
-        return "\(userPart)\(activeModel.hostname)\(portPart)"
+        let username = activeModel?.username ?? host.username
+        let port = activeModel?.port ?? host.port
+        let hostname = activeModel?.hostname ?? host.hostname
+        let userPart = username.isEmpty ? "" : "\(username)@"
+        let portPart = port == 22 ? "" : ":\(port)"
+        return "\(userPart)\(hostname)\(portPart)"
     }
 
     init(
@@ -49,130 +51,112 @@ struct HostConnectionView: View {
 
     var body: some View {
         Group {
-            switch activeModel.phase {
-            case .input(let request):
-                AuthPromptView(
-                    request: request,
-                    subtitle: addressSubtitle,
-                    onSubmit: { activeModel.submitInput(request, answers: $0, savePassphrase: $1) },
-                    onCancel: { activeModel.cancelInput(request) }
-                )
-                .id(request.id)
+            if let model = activeModel {
+                switch model.phase {
+                case .input(let request):
+                    AuthPromptView(
+                        request: request,
+                        subtitle: addressSubtitle,
+                        onSubmit: { model.submitInput(request, answers: $0, savePassphrase: $1) },
+                        onCancel: { model.cancelInput(request) }
+                    )
+                    .id(request.id)
 
-            case .connecting:
-                statusCard {
-                    ProgressView()
-                        .controlSize(.large)
-                    VStack(spacing: 4) {
-                        Text(hostTitle)
-                            .font(.title3.bold())
-                            .multilineTextAlignment(.center)
-                        Text(addressSubtitle)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("Connecting…")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    Button(role: .cancel) {
-                        closeConnection()
-                    } label: {
-                        Text("Cancel")
-                            .frame(maxWidth: .infinity)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                }
+                case .connecting:
+                    connectingCard
 
-            case .prompt(let key):
-                HostKeyPromptView(
-                    hostname: activeModel.hostname,
-                    port: activeModel.port,
-                    key: key,
-                    onTrust: { activeModel.trust(key) },
-                    onCancel: { activeModel.cancelPrompt() }
-                )
+                case .prompt(let key):
+                    HostKeyPromptView(
+                        hostname: model.hostKeyPromptHostname,
+                        port: model.hostKeyPromptPort,
+                        key: key,
+                        onTrust: { model.trust(key) },
+                        onCancel: { model.cancelPrompt() }
+                    )
 
-            case .mismatch(let stored, let presented):
-                HostKeyMismatchView(
-                    hostname: activeModel.hostname,
-                    port: activeModel.port,
-                    stored: stored,
-                    presented: presented,
-                    onReplace: { activeModel.replaceStoredKey(with: presented) },
-                    onClose: { closeConnection() }
-                )
+                case .mismatch(let stored, let presented):
+                    HostKeyMismatchView(
+                        hostname: model.hostKeyPromptHostname,
+                        port: model.hostKeyPromptPort,
+                        stored: stored,
+                        presented: presented,
+                        onReplace: { model.replaceStoredKey(with: presented) },
+                        onClose: { closeConnection() }
+                    )
 
-            case .connected:
-                statusCard {
-                    ProgressView()
-                        .controlSize(.large)
-                    VStack(spacing: 4) {
-                        Text(hostTitle)
-                            .font(.title3.bold())
-                            .multilineTextAlignment(.center)
-                        Text(addressSubtitle)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("Opening session…")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-
-            case .keyMissing(let keyName):
-                KeyMissingView(
-                    host: host,
-                    keyName: keyName,
-                    onRetry: {
-                        activeModel.refresh(from: host)
-                        activeModel.start()
-                    },
-                    onClose: { closeConnection() }
-                )
-
-            case .failed(let message):
-                statusCard {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 36, weight: .semibold))
-                        .foregroundStyle(.red)
-                        .accessibilityHidden(true)
-
-                    VStack(spacing: 4) {
-                        Text(hostTitle)
-                            .font(.title3.bold())
-                            .multilineTextAlignment(.center)
-                        Text(addressSubtitle)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                    }
-
-                    Text(message)
-                        .font(.subheadline)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-
-                    VStack(spacing: 10) {
-                        Button {
-                            AppHaptics.impact(.light)
-                            activeModel.retry()
-                        } label: {
-                            Text("Retry")
-                                .frame(maxWidth: .infinity)
+                case .connected:
+                    statusCard {
+                        ProgressView()
+                            .controlSize(.large)
+                        VStack(spacing: 4) {
+                            Text(hostTitle)
+                                .font(.title3.bold())
+                                .multilineTextAlignment(.center)
+                            Text(addressSubtitle)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
+                        Text("Opening session…")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
 
-                        Button(role: .cancel) {
-                            closeConnection()
-                        } label: {
-                            Text(onCancel == nil ? "Close" : "Close Tab")
-                                .frame(maxWidth: .infinity)
+                case .keyMissing(let keyName):
+                    KeyMissingView(
+                        host: host,
+                        keyName: keyName,
+                        onRetry: {
+                            model.refresh(from: host)
+                            model.start()
+                        },
+                        onClose: { closeConnection() }
+                    )
+
+                case .failed(let message):
+                    statusCard {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 36, weight: .semibold))
+                            .foregroundStyle(.red)
+                            .accessibilityHidden(true)
+
+                        VStack(spacing: 4) {
+                            Text(hostTitle)
+                                .font(.title3.bold())
+                                .multilineTextAlignment(.center)
+                            Text(addressSubtitle)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.bordered)
-                        .controlSize(.large)
+
+                        Text(message)
+                            .font(.subheadline)
+                            .foregroundStyle(.red)
+                            .multilineTextAlignment(.center)
+
+                        VStack(spacing: 10) {
+                            Button {
+                                AppHaptics.impact(.light)
+                                model.retry()
+                            } label: {
+                                Text("Retry")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.large)
+
+                            Button(role: .cancel) {
+                                closeConnection()
+                            } label: {
+                                Text(onCancel == nil ? "Close" : "Close Tab")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+                        }
                     }
                 }
+            } else {
+                connectingCard
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -187,40 +171,89 @@ struct HostConnectionView: View {
             }
         }
         .onAppear {
-            guard externalModel == nil, !didStart else { return }
-            didStart = true
-            let currentModel = activeModel
-            // Title and tmux are read when the connection lands, so an edit made from the key-missing screen applies.
-            currentModel.onConnected = { [manager, openTab, hostID = host.id, onConnected, dismiss, weak currentModel] conn, bridge in
-                let title = currentModel?.title ?? ""
-                let tmux = currentModel?.tmux
-                let live = manager.open(
-                    hostID: hostID,
-                    title: title,
-                    session: conn,
-                    bridge: bridge,
-                    ephemeralHost: host.modelContext == nil ? host : nil
-                ) // wiring: T8
-                TmuxAttach.send(tmux, via: bridge) // wiring: T9
-                if let onConnected {
-                    onConnected(live.id)
-                } else {
-                    openTab(live.id)
-                    dismiss()
+            startOwnedModelIfNeeded()
+        }
+        .onChange(of: externalModel != nil) { _, hasExternalModel in
+            if hasExternalModel {
+                if let ownedModel {
+                    ownedModel.teardown()
+                    self.ownedModel = nil
                 }
+                didStart = false
+            } else {
+                startOwnedModelIfNeeded()
             }
-            currentModel.start()
         }
         .onDisappear {
             if externalModel == nil {
-                activeModel.teardown()
+                activeModel?.teardown()
+                didStart = false
             }
         }
     }
 
+    private var connectingCard: some View {
+        statusCard {
+            ProgressView()
+                .controlSize(.large)
+            VStack(spacing: 4) {
+                Text(hostTitle)
+                    .font(.title3.bold())
+                    .multilineTextAlignment(.center)
+                Text(addressSubtitle)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Text("Connecting…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Button(role: .cancel) {
+                closeConnection()
+            } label: {
+                Text("Cancel")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+        }
+    }
+
+    private func startOwnedModelIfNeeded() {
+        guard externalModel == nil, !didStart else { return }
+        let currentModel: HostConnectionModel
+        if let ownedModel {
+            currentModel = ownedModel
+        } else {
+            let created = HostConnectionModel(host: host)
+            ownedModel = created
+            currentModel = created
+        }
+        didStart = true
+        // Title and tmux are read when the connection lands, so an edit made from the key-missing screen applies.
+        currentModel.onConnected = { [manager, openTab, hostID = host.id, onConnected, dismiss, weak currentModel] conn, bridge in
+            let title = currentModel?.title ?? ""
+            let tmux = currentModel?.tmux
+            let live = manager.open(
+                hostID: hostID,
+                title: title,
+                session: conn,
+                bridge: bridge,
+                ephemeralHost: host.modelContext == nil ? host : nil
+            ) // wiring: T8
+            TmuxAttach.send(tmux, via: bridge) // wiring: T9
+            if let onConnected {
+                onConnected(live.id)
+            } else {
+                openTab(live.id)
+                dismiss()
+            }
+        }
+        currentModel.start()
+    }
+
     private func closeConnection() {
         AppHaptics.impact(.light)
-        activeModel.teardown()
+        activeModel?.teardown()
         if let onCancel {
             onCancel()
         } else {

@@ -10,8 +10,14 @@ final class ProStore {
     private(set) var product: Product?
     private(set) var isPurchased = false
     private(set) var isTestFlight = false
-    private(set) var isLoading = false
+    private(set) var isLoadingProducts = false
+    private(set) var isPurchasing = false
+    private(set) var isRestoring = false
     private(set) var errorMessage: String?
+
+    var isLoading: Bool {
+        isPurchasing || isRestoring
+    }
 
     @ObservationIgnored
     nonisolated(unsafe) private var updatesTask: Task<Void, Never>?
@@ -31,9 +37,6 @@ final class ProStore {
     init() {
         updatesTask = observeTransactionUpdates()
         Task { [weak self] in
-            await self?.refreshAppEnvironment()
-        }
-        Task { [weak self] in
             await self?.loadInitialState()
         }
     }
@@ -43,10 +46,10 @@ final class ProStore {
     }
 
     func loadProducts(reportErrors: Bool = true) async {
-        guard !isLoading else { return }
-        isLoading = true
+        guard !isLoadingProducts else { return }
+        isLoadingProducts = true
         if reportErrors { errorMessage = nil }
-        defer { isLoading = false }
+        defer { isLoadingProducts = false }
 
         do {
             let products = try await Product.products(for: [Self.productID])
@@ -71,9 +74,7 @@ final class ProStore {
     }
 
     func refreshEntitlements() async {
-        Task { [weak self] in
-            await self?.refreshAppEnvironment()
-        }
+        await refreshAppEnvironment()
         var entitled = false
         for await result in Transaction.currentEntitlements {
             guard case .verified(let transaction) = result else { continue }
@@ -87,9 +88,9 @@ final class ProStore {
 
     func purchase() async {
         guard !isLoading else { return }
-        isLoading = true
+        isPurchasing = true
         errorMessage = nil
-        defer { isLoading = false }
+        defer { isPurchasing = false }
 
         do {
             let targetProduct: Product
@@ -127,9 +128,9 @@ final class ProStore {
 
     func restorePurchases() async {
         guard !isLoading else { return }
-        isLoading = true
+        isRestoring = true
         errorMessage = nil
-        defer { isLoading = false }
+        defer { isRestoring = false }
 
         do {
             try await AppStore.sync()
@@ -170,6 +171,7 @@ final class ProStore {
     ) async {
         switch verificationResult {
         case .verified(let transaction):
+            guard transaction.productID == Self.productID else { return }
             await transaction.finish()
             await refreshEntitlements()
         case .unverified(_, let error):

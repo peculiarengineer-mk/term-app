@@ -589,13 +589,22 @@ struct HostListView: View {
         context.delete(host)
         do {
             try context.save()
-            HostSecrets.deletePassword(for: hostID)
-            PortForwardStore.deleteAll(for: hostID)
-            HostProjectStore.deleteAll(for: hostID)
-            AppHaptics.notify(.warning)
         } catch {
             context.rollback()
             deleteError = "Could not delete host: \(error.localizedDescription)"
+            return
+        }
+        let matchingSessionIDs = manager.sessions.filter { $0.hostID == hostID }.map(\.id)
+        for sessionID in matchingSessionIDs {
+            manager.close(sessionID)
+        }
+        PortForwardStore.deleteAll(for: hostID)
+        HostProjectStore.deleteAll(for: hostID)
+        do {
+            try HostSecrets.tryDeletePassword(for: hostID)
+            AppHaptics.notify(.warning)
+        } catch {
+            deleteError = "Host deleted, but its saved password could not be removed: \(error.localizedDescription)"
         }
     }
 }

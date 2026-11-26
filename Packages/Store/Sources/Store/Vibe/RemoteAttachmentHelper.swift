@@ -6,14 +6,14 @@ public enum RemoteAttachmentHelper {
     private static let defaultExtension = "png"
     private static let maxExtensionLength = 8
 
-    /// Produces a shell-safe remote path `<directory>/termapp-attach-<8hex>.<ext>` with sanitized extension and directory.
+    /// Produces a shell-safe remote path `<directory>/termapp-attach-<16hex>.<ext>` with sanitized extension and directory.
     public static func remotePath(
         filename: String,
         id: UUID = UUID(),
         directory: String = "/tmp"
     ) -> String {
         let cleanDir = sanitizeDirectory(directory)
-        let shortHex = String(id.uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(8))
+        let shortHex = String(id.uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(16))
         let ext = sanitizeExtension(from: filename)
         let leaf = "termapp-attach-\(shortHex).\(ext)"
 

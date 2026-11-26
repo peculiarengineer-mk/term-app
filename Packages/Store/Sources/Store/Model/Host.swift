@@ -20,6 +20,10 @@ public final class Host {
     public var updatedAt: Date = Date()
     /// Assigned once per insert, never changed; tie-break when deduplicating synced copies.
     public var copyID: UUID = UUID()
+    /// Optional ID of another saved `Host` to tunnel through via SSH ProxyJump (`-J`).
+    public var proxyJumpHostID: UUID? = nil
+    /// Enables SSH Agent Forwarding (`-A`) when connecting to this host.
+    public var forwardAgent: Bool = false
 
     public init(
         id: UUID = UUID(),
@@ -34,7 +38,9 @@ public final class Host {
         source: String = "manual",
         createdAt: Date = Date(),
         updatedAt: Date = Date(),
-        copyID: UUID = UUID()
+        copyID: UUID = UUID(),
+        proxyJumpHostID: UUID? = nil,
+        forwardAgent: Bool = false
     ) {
         self.id = id
         self.label = label
@@ -49,6 +55,8 @@ public final class Host {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.copyID = copyID
+        self.proxyJumpHostID = proxyJumpHostID
+        self.forwardAgent = forwardAgent
     }
 
     public func touch() { updatedAt = .now }

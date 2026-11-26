@@ -1,4 +1,7 @@
 import Foundation
+import os
+import Security
+import SwiftData
 import SwiftUI
 import SSHKit
 import Store
@@ -14,6 +17,7 @@ struct AgentHostTarget: Sendable, Identifiable {
     let authMethod: String
     let keyID: UUID?
     let activeSession: (any Session)?
+    let jumpResolution: Result<[SSHOptionsBuilder.JumpHopSpec], AgentRemoteError>
 
     var displayName: String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -26,8 +30,35 @@ struct AgentHostTarget: Sendable, Identifiable {
         return "\(userPart)\(hostname)\(portPart)"
     }
 
+    init(
+        id: UUID = UUID(),
+        label: String,
+        hostname: String,
+        port: Int = 22,
+        username: String = "root",
+        authMethod: String,
+        keyID: UUID? = nil,
+        activeSession: (any Session)? = nil,
+        jumpResolution: Result<[SSHOptionsBuilder.JumpHopSpec], AgentRemoteError> = .success([])
+    ) {
+        self.id = id
+        self.label = label
+        self.hostname = hostname
+        self.port = port
+        self.username = username
+        self.authMethod = authMethod
+        self.keyID = keyID
+        self.activeSession = activeSession
+        self.jumpResolution = jumpResolution
+    }
+
     @MainActor
-    init(host: Host, sessionManager: SessionManager) {
+    init(
+        host: Host,
+        sessionManager: SessionManager,
+        allHosts: [Host]? = nil,
+        keyStore: KeyStore = KeyStore()
+    ) {
         self.id = host.id
         self.label = host.label
         self.hostname = host.hostname
@@ -36,10 +67,40 @@ struct AgentHostTarget: Sendable, Identifiable {
         self.authMethod = host.authMethod
         self.keyID = host.keyID
         self.activeSession = sessionManager.connectedSession(for: host.id)?.session
+
+        let resolvedHosts = allHosts ?? (try? host.modelContext?.fetch(FetchDescriptor<Host>())) ?? []
+        do {
+            let specs = try SSHOptionsBuilder.buildJumpHopSpecs(
+                for: host,
+                allHosts: resolvedHosts,
+                keyStore: keyStore
+            )
+            self.jumpResolution = .success(specs)
+        } catch let error as SSHOptionsError {
+            self.jumpResolution = .failure(Self.mapJumpOptionsError(error))
+        } catch {
+            self.jumpResolution = .failure(.commandFailed(error.localizedDescription))
+        }
+    }
+
+    private static func mapJumpOptionsError(_ error: SSHOptionsError) -> AgentRemoteError {
+        switch error {
+        case .jumpHostMissingKey, .jumpHostSecureEnclaveUnavailable:
+            .missingCredentials(error.localizedDescription)
+        case .jumpHostEncryptedKeyNeedsPassphrase,
+             .jumpHostMissingPassword,
+             .jumpHostRequiresInteractiveAuth:
+            .needsInteractiveAuth(error.localizedDescription)
+        case .cycleDetected,
+             .maxHopsExceeded,
+             .jumpHostNotFound,
+             .invalidJumpHostEndpoint:
+            .commandFailed(error.localizedDescription)
+        }
     }
 }
 
-enum AgentRemoteError: LocalizedError {
+enum AgentRemoteError: LocalizedError, Equatable {
     case missingCredentials(String)
     case needsInteractiveAuth(String)
     case untrustedHostKey(String)
@@ -70,6 +131,7 @@ enum AgentRemoteError: LocalizedError {
 /// Non-interactive SSH auth & one-shot `exec` helper for background agent scans and folder browsing.
 enum AgentAuthHelper {
     static let defaultTimeout: Duration = .seconds(10)
+    private static let logger = Logger(subsystem: "com.peculiarengineer.termapp", category: "agent-auth")
 
     /// Builds `SSHAuth` non-interactively from `KeyStore` and `HostSecrets`, never prompting UI.
     static func buildAuth(for target: AgentHostTarget) throws -> SSHAuth {
@@ -96,7 +158,7 @@ enum AgentAuthHelper {
             return .privateKey(pem: pem, passphrase: passphrase)
 
         case "password":
-            guard let password = HostSecrets.password(for: target.id) else {
+            guard let password = try HostSecrets.readPassword(for: target.id) else {
                 throw AgentRemoteError.needsInteractiveAuth(
                     "No saved password for \(target.displayName). Connect a terminal session first."
                 )
@@ -109,13 +171,20 @@ enum AgentAuthHelper {
             )
 
         default:
-            guard let password = HostSecrets.password(for: target.id) else {
-                throw AgentRemoteError.needsInteractiveAuth(
-                    "Credentials for \(target.displayName) require an active session."
-                )
-            }
-            return .password(password)
+            throw AgentRemoteError.needsInteractiveAuth(
+                "Unsupported authentication method for \(target.displayName). Connect a terminal session first."
+            )
         }
+    }
+
+    private struct RejectedHostKeyInfo: Sendable {
+        let displayName: String
+        let hadStoredFingerprint: Bool
+    }
+
+    private struct VerifierErrorInfo: Sendable {
+        let displayName: String
+        let error: Error
     }
 
     /// Host-key verifier that ONLY trusts already-known fingerprints so background scans never pop TOFU dialogs.
@@ -124,11 +193,43 @@ enum AgentAuthHelper {
         port: Int,
         knownHosts: KnownHostsStore = KnownHostsStore()
     ) -> @Sendable (HostKey) async -> HostKeyDecision {
+        trustedOnlyHostKeyVerifier(
+            host: host,
+            port: port,
+            displayName: host,
+            knownHosts: knownHosts,
+            onReject: nil,
+            onError: nil
+        )
+    }
+
+    private static func trustedOnlyHostKeyVerifier(
+        host: String,
+        port: Int,
+        displayName: String,
+        knownHosts: KnownHostsStore,
+        onReject: (@Sendable (RejectedHostKeyInfo) -> Void)?,
+        onError: (@Sendable (VerifierErrorInfo) -> Void)?
+    ) -> @Sendable (HostKey) async -> HostKeyDecision {
         { presented in
-            guard let stored = try? knownHosts.fingerprint(host: host, port: port) else {
+            do {
+                guard let stored = try knownHosts.fingerprint(host: host, port: port) else {
+                    onReject?(RejectedHostKeyInfo(displayName: displayName, hadStoredFingerprint: false))
+                    return .reject
+                }
+                if stored == presented.fingerprint {
+                    return .trust
+                }
+                onReject?(RejectedHostKeyInfo(displayName: displayName, hadStoredFingerprint: true))
+                return .reject
+            } catch let error as KeychainError where error.status == errSecItemNotFound {
+                onReject?(RejectedHostKeyInfo(displayName: displayName, hadStoredFingerprint: false))
+                return .reject
+            } catch {
+                logger.error("Failed reading known host key for \(host, privacy: .private):\(port): \(String(describing: error), privacy: .public)")
+                onError?(VerifierErrorInfo(displayName: displayName, error: error))
                 return .reject
             }
-            return stored == presented.fingerprint ? .trust : .reject
         }
     }
 
@@ -146,9 +247,42 @@ enum AgentAuthHelper {
             }
         }
 
+        let jumpSpecs = try target.jumpResolution.get()
         let auth = try buildAuth(for: target)
         let knownHosts = KnownHostsStore()
-        let storedFingerprint = try? knownHosts.fingerprint(host: target.hostname, port: target.port)
+        let storedFingerprint: String?
+        do {
+            storedFingerprint = try knownHosts.fingerprint(host: target.hostname, port: target.port)
+        } catch let error as KeychainError where error.status == errSecItemNotFound {
+            storedFingerprint = nil
+        } catch {
+            throw AgentRemoteError.commandFailed(keychainHostKeyErrorMessage(error, displayName: target.displayName))
+        }
+
+        let rejectedHostKey = OSAllocatedUnfairLock<RejectedHostKeyInfo?>(initialState: nil)
+        let verifierError = OSAllocatedUnfairLock<VerifierErrorInfo?>(initialState: nil)
+        let recordReject: @Sendable (RejectedHostKeyInfo) -> Void = { info in
+            rejectedHostKey.withLock {
+                if $0 == nil { $0 = info }
+            }
+        }
+        let recordError: @Sendable (VerifierErrorInfo) -> Void = { info in
+            verifierError.withLock {
+                if $0 == nil { $0 = info }
+            }
+        }
+        let jumpHops = jumpSpecs.map { spec in
+            spec.makeJumpHop(
+                verifyHostKey: trustedOnlyHostKeyVerifier(
+                    host: spec.host,
+                    port: Int(spec.port),
+                    displayName: "jump host \(spec.displayName)",
+                    knownHosts: knownHosts,
+                    onReject: recordReject,
+                    onError: recordError
+                )
+            )
+        }
 
         do {
             return try await SSHExec.runCommand(
@@ -158,35 +292,62 @@ enum AgentAuthHelper {
                 auth: auth,
                 command: command,
                 timeout: timeout,
+                jumpHops: jumpHops,
                 verifyHostKey: trustedOnlyHostKeyVerifier(
                     host: target.hostname,
                     port: target.port,
-                    knownHosts: knownHosts
+                    displayName: target.displayName,
+                    knownHosts: knownHosts,
+                    onReject: recordReject,
+                    onError: recordError
                 )
             )
         } catch let error as SSHError {
-            throw mapSSHError(error, target: target, hadStoredFingerprint: storedFingerprint != nil)
+            if case .hostKeyRejected = error,
+               let keychainError = verifierError.withLock({ $0 }) {
+                throw AgentRemoteError.commandFailed(
+                    keychainHostKeyErrorMessage(keychainError.error, displayName: keychainError.displayName)
+                )
+            }
+            let rejected = rejectedHostKey.withLock { $0 }
+            throw mapSSHError(
+                error,
+                target: target,
+                hasJumpHops: !jumpHops.isEmpty,
+                rejectedDisplayName: rejected?.displayName ?? target.displayName,
+                hadStoredFingerprint: rejected?.hadStoredFingerprint ?? (storedFingerprint != nil)
+            )
         }
+    }
+
+    private static func keychainHostKeyErrorMessage(_ error: Error, displayName: String) -> String {
+        if let keychainError = error as? KeychainError {
+            return "Could not read trusted host key for \(displayName) from Keychain (OSStatus \(keychainError.status))."
+        }
+        return "Could not read trusted host key for \(displayName): \(error.localizedDescription)"
     }
 
     private static func mapSSHError(
         _ error: SSHError,
         target: AgentHostTarget,
+        hasJumpHops: Bool,
+        rejectedDisplayName: String,
         hadStoredFingerprint: Bool
     ) -> Error {
         switch error {
         case .hostKeyRejected:
             if hadStoredFingerprint {
                 return AgentRemoteError.hostKeyMismatch(
-                    "Host key changed for \(target.displayName). Open a terminal session to verify."
+                    "Host key changed for \(rejectedDisplayName). Open a terminal session to verify."
                 )
             }
             return AgentRemoteError.untrustedHostKey(
-                "Host key for \(target.displayName) is not trusted yet. Connect once to trust it."
+                "Host key for \(rejectedDisplayName) is not trusted yet. Connect once to trust it."
             )
         case .authenticationFailed:
+            let subject = hasJumpHops ? "\(target.displayName) or its jump host" : target.displayName
             return AgentRemoteError.needsInteractiveAuth(
-                "Authentication failed for \(target.displayName). Connect a terminal session to re-authenticate."
+                "Authentication failed for \(subject). Connect a terminal session to re-authenticate."
             )
         case .timeout:
             return AgentRemoteError.commandFailed("\(target.displayName) timed out.")

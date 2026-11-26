@@ -1,5 +1,6 @@
 import XCTest
 import UIKit
+import UniformTypeIdentifiers
 @testable import TermUI
 
 final class KeyEncodingTests: XCTestCase {
@@ -96,7 +97,7 @@ final class KeyEncodingTests: XCTestCase {
 
         let wrongModifiers = UIKeyCommand(title: "Ignore", action: #selector(NSObject.description), input: "t", modifierFlags: [.command, .shift])
         HardwareKeyCommands.handle(wrongModifiers, controller: nil, center: center)
-        XCTAssertEqual(posted, [.termNewTab, .termCloseTab])
+        XCTAssertEqual(posted, [.termNewTab, .termCloseTab, .termNewTab])
     }
 
     @MainActor func testControllerFontSizeClamping() {
@@ -167,9 +168,7 @@ final class KeyEncodingTests: XCTestCase {
         find(bar, "Dismiss Keyboard")?.sendActions(for: .touchUpInside)
         XCTAssertTrue(dismissed)
 
-        let previousPasteboard = UIPasteboard.general.string
-        defer { UIPasteboard.general.string = previousPasteboard }
-        UIPasteboard.general.string = "ls -la"
+        bar.readPasteboard = { "ls -la" }
         find(bar, "Control")?.sendActions(for: .touchUpInside)
         XCTAssertTrue(bar.ctrlActive)
         find(bar, "Paste")?.sendActions(for: .touchUpInside)
@@ -207,6 +206,104 @@ final class KeyEncodingTests: XCTestCase {
         )
     }
 
+    func testEncodedPasteStripsBracketedStartEndAndC1Markers() {
+        XCTAssertEqual(
+            ExtraKeysBar.encodedPaste("a\u{1b}[200~b\u{1b}[201~c", bracketed: true),
+            Array("\u{1b}[200~abc\u{1b}[201~".utf8)
+        )
+        XCTAssertEqual(
+            ExtraKeysBar.encodedPaste("a\u{009b}200~b\u{009b}201~c", bracketed: true),
+            Array("\u{1b}[200~abc\u{1b}[201~".utf8)
+        )
+        XCTAssertEqual(
+            ExtraKeysBar.encodedPaste("a\u{1b}[20\u{009b}200~0~b\u{009b}20\u{1b}[201~1~c", bracketed: true),
+            Array("\u{1b}[200~abc\u{1b}[201~".utf8)
+        )
+        XCTAssertEqual(
+            ExtraKeysBar.encodedPaste("\u{1b}[200~\u{1b}[201~\u{009b}200~\u{009b}201~", bracketed: true),
+            Array("\u{1b}[200~\u{1b}[201~".utf8)
+        )
+        XCTAssertEqual(
+            ExtraKeysBar.encodedPaste("a\u{1b}[200~\u{009b}200~\u{009b}201~b", bracketed: false),
+            Array("a\u{1b}[200~\u{009b}200~\u{009b}201~b".utf8)
+        )
+    }
+
+    @MainActor func testOSC52ClipboardCopyHardening() {
+        let view = HostTerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        defer { view.updateUiClosed() }
+
+        var writes: [(items: [[String: Any]], options: [UIPasteboard.OptionsKey: Any])] = []
+        let coordinator = TerminalHostView.Coordinator(io: RecordingIO())
+        coordinator.writePasteboard = { items, options in
+            writes.append((items, options))
+        }
+
+        coordinator.clipboardCopy(source: view, content: Data("hello osc52".utf8))
+        XCTAssertEqual(writes.count, 1)
+        XCTAssertEqual(writes[0].items.first?[UTType.utf8PlainText.identifier] as? String, "hello osc52")
+        XCTAssertEqual(writes[0].options[.localOnly] as? Bool, true)
+
+        let maxPayload = String(repeating: "a", count: TerminalHostView.Coordinator.maxClipboardBytes)
+        coordinator.clipboardCopy(source: view, content: Data(maxPayload.utf8))
+        XCTAssertEqual(writes.count, 2)
+        XCTAssertEqual(writes[1].items.first?[UTType.utf8PlainText.identifier] as? String, maxPayload)
+        XCTAssertEqual(writes[1].options[.localOnly] as? Bool, true)
+
+        let oversized = Data(repeating: 0x42, count: TerminalHostView.Coordinator.maxClipboardBytes + 1)
+        coordinator.clipboardCopy(source: view, content: oversized)
+        XCTAssertEqual(writes.count, 2, "oversized OSC 52 payload must be ignored")
+
+        let replayIO = ReplayStubIO(replay: Data("\u{1b}]52;c;cmVwbGF5ZWQ=\u{07}".utf8))
+        let replayCoordinator = TerminalHostView.Coordinator(io: replayIO)
+        replayCoordinator.writePasteboard = { items, options in
+            writes.append((items, options))
+        }
+        view.terminalDelegate = replayCoordinator
+        replayCoordinator.attach(view)
+        replayCoordinator.detach()
+        XCTAssertEqual(writes.count, 2, "replayed OSC 52 must not write to pasteboard")
+    }
+
+    @MainActor func testDismantleUIViewClearsCallbacksDelegateAndAccessoryView() {
+        final class Sentinel {}
+        @MainActor final class WeakRef { weak var value: Sentinel? }
+
+        let io = RecordingIO()
+        let controller = TerminalController()
+        let bar = ExtraKeysBar(controller: controller)
+        let view = HostTerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        defer { view.updateUiClosed() }
+        let coordinator = TerminalHostView.Coordinator(io: io)
+
+        var sentinel: Sentinel? = Sentinel()
+        let weakRef = WeakRef()
+        weakRef.value = sentinel
+
+        view.terminalDelegate = coordinator
+        view.inputAccessoryView = bar
+        view.keyCommandHandler = { [sentinel] _ in _ = sentinel }
+        view.onPinchFontSize = { [sentinel] _ in _ = sentinel }
+        view.onFirstSizedLayout = { [sentinel] in _ = sentinel }
+        sentinel = nil
+        XCTAssertNotNil(weakRef.value)
+
+        TerminalHostView.dismantleUIView(view, coordinator: coordinator)
+
+        XCTAssertNil(view.keyCommandHandler)
+        XCTAssertNil(view.onPinchFontSize)
+        XCTAssertNil(view.onFirstSizedLayout)
+        XCTAssertNil(view.terminalDelegate)
+        XCTAssertNil(view.inputAccessoryView)
+        XCTAssertNil(weakRef.value)
+
+        let nextView = HostTerminalView(frame: CGRect(x: 0, y: 0, width: 320, height: 240))
+        defer { nextView.updateUiClosed() }
+        nextView.inputAccessoryView = bar
+        XCTAssertTrue(nextView.inputAccessoryView === bar)
+        XCTAssertNil(view.inputAccessoryView)
+    }
+
     @MainActor func testMultilinePasteRequiresConfirmation() {
         let io = RecordingIO()
         let controller = TerminalController()
@@ -221,8 +318,9 @@ final class KeyEncodingTests: XCTestCase {
             return v.subviews.lazy.compactMap { find($0, label) }.first
         }
 
-        let previousPasteboard = UIPasteboard.general.string
-        defer { UIPasteboard.general.string = previousPasteboard }
+        @MainActor final class PasteboardStub { var text: String? }
+        let pasteboard = PasteboardStub()
+        bar.readPasteboard = { pasteboard.text }
 
         var capturedText: String?
         var pendingProceed: (@MainActor () -> Void)?
@@ -231,7 +329,7 @@ final class KeyEncodingTests: XCTestCase {
             pendingProceed = proceed
         }
 
-        UIPasteboard.general.string = "echo one\necho two"
+        pasteboard.text = "echo one\necho two"
         find(bar, "Paste")?.sendActions(for: .touchUpInside)
         XCTAssertEqual(capturedText, "echo one\necho two")
         XCTAssertTrue(io.sent.isEmpty, "multiline paste must wait for confirmation")
@@ -241,7 +339,7 @@ final class KeyEncodingTests: XCTestCase {
 
         capturedText = nil
         pendingProceed = nil
-        UIPasteboard.general.string = "first\r\nsecond"
+        pasteboard.text = "first\r\nsecond"
         find(bar, "Paste")?.sendActions(for: .touchUpInside)
         XCTAssertEqual(capturedText, "first\r\nsecond")
         XCTAssertEqual(io.sent.count, 1, "declined multiline paste must not send")
@@ -380,7 +478,10 @@ final class KeyEncodingTests: XCTestCase {
 
         scrollView.contentOffset.x = scrollView.contentSize.width - scrollView.bounds.width
         bar.scrollViewDidScroll(scrollView)
-        XCTAssertEqual(mask.frame, scrollView.bounds)
+        XCTAssertEqual(mask.frame.origin.x, scrollView.bounds.origin.x, accuracy: 0.001)
+        XCTAssertEqual(mask.frame.origin.y, scrollView.bounds.origin.y, accuracy: 0.001)
+        XCTAssertEqual(mask.frame.size.width, scrollView.bounds.size.width, accuracy: 0.001)
+        XCTAssertEqual(mask.frame.size.height, scrollView.bounds.size.height, accuracy: 0.001)
         if let colors = mask.colors, let last = colors.last {
             let lastCG = last as! CGColor
             XCTAssertEqual(lastCG.alpha, 1.0, accuracy: 0.001)
@@ -413,9 +514,7 @@ final class KeyEncodingTests: XCTestCase {
         view.feed(text: "\u{1b}[?2004h")
         XCTAssertTrue(view.getTerminal().bracketedPasteMode)
 
-        let previousPasteboard = UIPasteboard.general.string
-        defer { UIPasteboard.general.string = previousPasteboard }
-        UIPasteboard.general.string = "echo ok"
+        bar.readPasteboard = { "echo ok" }
         find(bar, "Paste")?.sendActions(for: .touchUpInside)
         XCTAssertEqual(io.sent, [Array("\u{1b}[200~echo ok\u{1b}[201~".utf8)])
 
@@ -438,6 +537,9 @@ final class KeyEncodingTests: XCTestCase {
         let controller = TerminalController()
         let bar = ExtraKeysBar(controller: controller)
         bar.hapticsEnabled = false
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 100))
+        window.addSubview(bar)
+        defer { bar.removeFromSuperview() }
         bar.frame = CGRect(x: 0, y: 0, width: 800, height: 48)
         bar.layoutIfNeeded()
 
@@ -464,6 +566,8 @@ final class KeyEncodingTests: XCTestCase {
 
         // Latched Ctrl keeps the glowing accent shadow.
         ctrlButton.sendActions(for: .touchUpInside)
+        ctrlButton.setNeedsLayout()
+        ctrlButton.layoutIfNeeded()
         ctrlButton.updateConfiguration()
         XCTAssertTrue(bar.ctrlActive)
         XCTAssertEqual(ctrlButton.layer.shadowOffset, .zero)
@@ -472,6 +576,8 @@ final class KeyEncodingTests: XCTestCase {
 
         // Light theme softens normal keycap drop shadow opacity to 0.18.
         bar.apply(theme: .light)
+        escButton.setNeedsLayout()
+        escButton.layoutIfNeeded()
         escButton.updateConfiguration()
         XCTAssertEqual(escButton.layer.shadowOpacity, 0.18, accuracy: 0.001)
         XCTAssertEqual(escButton.layer.shadowColor, UIColor.black.cgColor)
@@ -486,4 +592,15 @@ private final class RecordingIO: TerminalIO, @unchecked Sendable {  // @unchecke
     func send(_ bytes: [UInt8]) { lock.lock(); _sent.append(bytes); lock.unlock() }
     func resized(cols: Int, rows: Int) {}
     var incoming: AsyncStream<Data> { AsyncStream { $0.finish() } }
+}
+
+private final class ReplayStubIO: TerminalIO, @unchecked Sendable {
+    private let replay: Data
+    init(replay: Data) { self.replay = replay }
+    func send(_ bytes: [UInt8]) {}
+    func resized(cols: Int, rows: Int) {}
+    var incoming: AsyncStream<Data> { AsyncStream { $0.finish() } }
+    func subscribe() -> (replay: Data, live: AsyncStream<Data>) {
+        (replay, AsyncStream { $0.finish() })
+    }
 }

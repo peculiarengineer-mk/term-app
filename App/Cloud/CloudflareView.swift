@@ -970,15 +970,19 @@ struct CloudflareTunnelDetailView: View {
     let tunnel: CFTunnel
 
     @Environment(\.openURL) private var openURL
+    @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @State private var rules: [CFTunnelIngressRule] = []
     @State private var isLoading = false
     @State private var loadError: String?
     @State private var copiedRuleID: String?
     @State private var copyResetTask: Task<Void, Never>?
 
+    private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
+
     var body: some View {
         let connectorText = tunnel.connectionCount == 1 ? "1 connector" : "\(tunnel.connectionCount) connectors"
-        let ledColor = CloudflareView.tunnelLEDColor(for: tunnel.status)
+        let ledColor = CloudflareView.tunnelLEDColor(for: tunnel.status, palette: palette)
 
         List {
             Section("Tunnel") {
@@ -1141,8 +1145,29 @@ enum CloudflareDNSFormatter {
         guard !trimmedHost.isEmpty, !trimmedHost.contains("*") else {
             return nil
         }
-        let urlString = trimmedHost.contains("://") ? trimmedHost : "https://\(trimmedHost)"
-        guard var components = URLComponents(string: urlString) else {
+
+        let urlString: String
+        if trimmedHost.contains("://") {
+            urlString = trimmedHost
+        } else if let colonIndex = trimmedHost.firstIndex(of: ":"),
+                  !trimmedHost.hasPrefix("[") {
+            // Preserve `<scheme>:<opaque>` (e.g. `javascript:...`, `tel:...`) so scheme validation rejects it,
+            // while allowing explicit `<host>:<port>` targets.
+            let beforeColon = trimmedHost[..<colonIndex]
+            let afterColon = trimmedHost[trimmedHost.index(after: colonIndex)...]
+            let portToken = afterColon.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false).first ?? ""
+            let isHostPort = (beforeColon.contains(".") || beforeColon.caseInsensitiveCompare("localhost") == .orderedSame)
+                && !beforeColon.contains("/")
+                && (UInt16(portToken).map { $0 > 0 } ?? false)
+            urlString = isHostPort ? "https://\(trimmedHost)" : trimmedHost
+        } else {
+            urlString = "https://\(trimmedHost)"
+        }
+
+        guard var components = URLComponents(string: urlString),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              !(components.host?.isEmpty ?? true) else {
             return nil
         }
         if let rawPath = path?.trimmingCharacters(in: .whitespacesAndNewlines), !rawPath.isEmpty {

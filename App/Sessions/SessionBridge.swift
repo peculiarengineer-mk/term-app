@@ -119,7 +119,9 @@ final class SessionBridge: TerminalIO {
                     for c in f.subscribers.values { c.yield(data) }
                     return f.onOutputChunk
                 }
-                outputObserver?(Array(data))
+                if let outputObserver {
+                    outputObserver(Array(data))
+                }
             }
             // Detach under the lock, finish outside it (finish re-enters the lock via onTermination).
             let ending: [AsyncStream<Data>.Continuation] = state.withLock { f in

@@ -1,4 +1,6 @@
 import Foundation
+import OSLog
+import Security
 
 /// Local-only Keychain store for the user's DigitalOcean personal access token.
 /// Always persists with `synchronizable: false` (`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`)
@@ -7,13 +9,20 @@ public enum DigitalOceanTokenStore {
     public static let service = "termapp.digitalocean.token"
     public static let account = "pat"
 
+    private static let logger = Logger(subsystem: "com.peculiarengineer.termapp", category: "digitalocean")
+
     /// Reads the locally stored DigitalOcean personal access token, if present and non-empty.
     public static func read(keychain: KeychainStore = KeychainStore()) -> String? {
         read(storage: keychain)
     }
 
+    /// Reads the locally stored DigitalOcean personal access token, throwing on Keychain or UTF-8 decoding failures.
+    public static func readToken(keychain: KeychainStore = KeychainStore()) throws -> String? {
+        try readToken(storage: keychain)
+    }
+
     /// Trims whitespace and stores the token locally (`synchronizable: false`).
-    /// Throws `DOError.missingToken` if the trimmed token is empty.
+    /// Throws `DOError.missingToken` if empty or `DOError.invalidToken` if it contains whitespace or control characters.
     public static func save(_ token: String, keychain: KeychainStore = KeychainStore()) throws {
         try save(token, storage: keychain)
     }
@@ -29,19 +38,27 @@ public enum DigitalOceanTokenStore {
     }
 
     internal static func read(storage: any KeychainStoring) -> String? {
-        guard let data = try? storage.read(service: service, account: account, synchronizable: false),
-              let raw = String(data: data, encoding: .utf8) else {
+        do {
+            return try readToken(storage: storage)
+        } catch {
+            logger.error("Failed to read DigitalOcean token from Keychain: \(String(describing: error), privacy: .public)")
             return nil
+        }
+    }
+
+    internal static func readToken(storage: any KeychainStoring) throws -> String? {
+        guard let data = try storage.read(service: service, account: account, synchronizable: false) else {
+            return nil
+        }
+        guard let raw = String(data: data, encoding: .utf8) else {
+            throw KeychainError(status: errSecDecode)
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
 
     internal static func save(_ token: String, storage: any KeychainStoring) throws {
-        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw DOError.missingToken
-        }
+        let trimmed = try DigitalOceanClient.validatedToken(token)
         try storage.save(Data(trimmed.utf8), service: service, account: account, synchronizable: false)
     }
 
@@ -57,6 +74,7 @@ public enum DigitalOceanTokenStore {
 /// Errors produced by `DigitalOceanClient` and `DigitalOceanTokenStore`.
 public enum DOError: Error, Equatable, Sendable, LocalizedError {
     case missingToken
+    case invalidToken
     case unauthorized
     case httpError(Int, String)
     case invalidResponse
@@ -66,6 +84,8 @@ public enum DOError: Error, Equatable, Sendable, LocalizedError {
         switch self {
         case .missingToken:
             return "DigitalOcean API token is missing."
+        case .invalidToken:
+            return "DigitalOcean API token contains invalid whitespace or control characters."
         case .unauthorized:
             return "DigitalOcean API token is invalid or unauthorized (401)."
         case .httpError(let statusCode, let message):
@@ -424,6 +444,9 @@ public struct DOCreateDropletRequest: Codable, Equatable, Sendable {
 /// Async REST API v2 client for DigitalOcean.
 public struct DigitalOceanClient: Sendable {
     public static let baseURL = URL(string: "https://api.digitalocean.com/v2")!
+    private static let expectedHost = "api.digitalocean.com"
+    private static let maxPaginationPages = 20
+    private static let requestTimeoutSeconds: TimeInterval = 30
 
     private let token: String
     private let session: URLSession
@@ -433,14 +456,13 @@ public struct DigitalOceanClient: Sendable {
         self.session = session
     }
 
-    /// Lists up to 100 droplets on the account (`GET /droplets?per_page=100`).
+    /// Lists droplets on the account (`GET /droplets?per_page=100`), following pagination up to 20 pages.
     public func listDroplets() async throws -> [DODroplet] {
-        let response: DropletsEnvelope = try await sendJSON(
+        try await sendPaginated(
             path: "droplets",
             queryItems: [URLQueryItem(name: "per_page", value: "100")],
-            responseType: DropletsEnvelope.self
+            envelopeType: DropletsEnvelope.self
         )
-        return response.droplets
     }
 
     /// Creates a new droplet (`POST /droplets`).
@@ -470,14 +492,13 @@ public struct DigitalOceanClient: Sendable {
         try await sendVoid(path: "droplets/\(id)", method: "DELETE")
     }
 
-    /// Lists up to 100 SSH keys registered on the account (`GET /account/keys?per_page=100`).
+    /// Lists SSH keys registered on the account (`GET /account/keys?per_page=100`), following pagination up to 20 pages.
     public func listSSHKeys() async throws -> [DOSSHKey] {
-        let response: SSHKeysEnvelope = try await sendJSON(
+        try await sendPaginated(
             path: "account/keys",
             queryItems: [URLQueryItem(name: "per_page", value: "100")],
-            responseType: SSHKeysEnvelope.self
+            envelopeType: SSHKeysEnvelope.self
         )
-        return response.sshKeys
     }
 
     /// Registers a new SSH public key on the account (`POST /account/keys`).
@@ -492,24 +513,24 @@ public struct DigitalOceanClient: Sendable {
         return response.sshKey
     }
 
-    /// Lists available regions (`GET /regions?per_page=100`, filtered to `available == true`).
+    /// Lists available regions (`GET /regions?per_page=100`, filtered to `available == true`), following pagination up to 20 pages.
     public func listRegions() async throws -> [DORegion] {
-        let response: RegionsEnvelope = try await sendJSON(
+        let regions = try await sendPaginated(
             path: "regions",
             queryItems: [URLQueryItem(name: "per_page", value: "100")],
-            responseType: RegionsEnvelope.self
+            envelopeType: RegionsEnvelope.self
         )
-        return response.regions.filter(\.available)
+        return regions.filter(\.available)
     }
 
-    /// Lists available sizes sorted by monthly price (`GET /sizes?per_page=100`, filtered to `available == true`).
+    /// Lists available sizes sorted by monthly price (`GET /sizes?per_page=100`, filtered to `available == true`), following pagination up to 20 pages.
     public func listSizes() async throws -> [DOSize] {
-        let response: SizesEnvelope = try await sendJSON(
+        let sizes = try await sendPaginated(
             path: "sizes",
             queryItems: [URLQueryItem(name: "per_page", value: "100")],
-            responseType: SizesEnvelope.self
+            envelopeType: SizesEnvelope.self
         )
-        return response.sizes
+        return sizes
             .filter(\.available)
             .sorted { lhs, rhs in
                 lhs.priceMonthly == rhs.priceMonthly
@@ -518,17 +539,16 @@ public struct DigitalOceanClient: Sendable {
             }
     }
 
-    /// Lists distribution images (`GET /images?type=distribution&per_page=100`).
+    /// Lists distribution images (`GET /images?type=distribution&per_page=100`), following pagination up to 20 pages.
     public func listDistributionImages() async throws -> [DOImage] {
-        let response: ImagesEnvelope = try await sendJSON(
+        try await sendPaginated(
             path: "images",
             queryItems: [
                 URLQueryItem(name: "type", value: "distribution"),
                 URLQueryItem(name: "per_page", value: "100"),
             ],
-            responseType: ImagesEnvelope.self
+            envelopeType: ImagesEnvelope.self
         )
-        return response.images
     }
 
     /// Destroys the droplet and forgets its cached TOFU host key so future IP reuse never false-alarms.
@@ -563,16 +583,21 @@ public struct DigitalOceanClient: Sendable {
 
     // MARK: - Private HTTP Helpers
 
-    private func makeRequest(
-        path: String,
-        queryItems: [URLQueryItem] = [],
-        method: String = "GET",
-        bodyData: Data? = nil
-    ) throws -> URLRequest {
-        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedToken.isEmpty else {
+    internal static func validatedToken(_ rawToken: String) throws -> String {
+        let trimmed = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
             throw DOError.missingToken
         }
+        let hasInvalidScalar = trimmed.unicodeScalars.contains {
+            CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0)
+        }
+        guard !hasInvalidScalar else {
+            throw DOError.invalidToken
+        }
+        return trimmed
+    }
+
+    private func makeURL(path: String, queryItems: [URLQueryItem] = []) throws -> URL {
         var components = URLComponents(url: Self.baseURL, resolvingAgainstBaseURL: false)
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
         components?.path = Self.baseURL.path + normalizedPath
@@ -582,13 +607,54 @@ public struct DigitalOceanClient: Sendable {
         guard let url = components?.url else {
             throw DOError.invalidResponse
         }
+        return url
+    }
+
+    private func makeRequest(
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        method: String = "GET",
+        bodyData: Data? = nil
+    ) throws -> URLRequest {
+        let url = try makeURL(path: path, queryItems: queryItems)
+        return try makeAuthorizedRequest(url: url, method: method, bodyData: bodyData)
+    }
+
+    private func makeAuthorizedRequest(
+        url: URL,
+        method: String = "GET",
+        bodyData: Data? = nil
+    ) throws -> URLRequest {
+        let validatedToken = try Self.validatedToken(token)
         var request = URLRequest(url: url)
         request.httpMethod = method
-        request.setValue("Bearer \(trimmedToken)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = Self.requestTimeoutSeconds
+        request.setValue("Bearer \(validatedToken)", forHTTPHeaderField: "Authorization")
+        if bodyData != nil {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        }
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.httpBody = bodyData
         return request
+    }
+
+    private func validatedNextPageURL(_ raw: String?) throws -> URL? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else {
+            return nil
+        }
+        guard let url = URL(string: trimmed),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.scheme?.lowercased() == "https",
+              components.host?.lowercased() == Self.expectedHost,
+              components.user == nil,
+              components.password == nil,
+              components.port == nil || components.port == 443
+        else {
+            throw DOError.invalidResponse
+        }
+        return url
     }
 
     private func encodeJSON<Body: Encodable>(_ body: Body) throws -> Data {
@@ -602,11 +668,16 @@ public struct DigitalOceanClient: Sendable {
     }
 
     private func send(_ request: URLRequest) async throws -> Data {
+        if Task.isCancelled {
+            throw CancellationError()
+        }
         let data: Data
         let response: URLResponse
         do {
             (data, response) = try await session.data(for: request)
         } catch is CancellationError {
+            throw CancellationError()
+        } catch let urlError as URLError where urlError.code == .cancelled {
             throw CancellationError()
         } catch {
             if Task.isCancelled {
@@ -628,6 +699,45 @@ public struct DigitalOceanClient: Sendable {
         }
 
         return data
+    }
+
+    private func sendPaginated<Envelope: DOPaginatedEnvelope>(
+        path: String,
+        queryItems: [URLQueryItem] = [],
+        envelopeType: Envelope.Type
+    ) async throws -> [Envelope.Item] {
+        var collected: [Envelope.Item] = []
+        var nextURL: URL? = try makeURL(path: path, queryItems: queryItems)
+        var seenURLs: Set<URL> = []
+
+        for _ in 0..<Self.maxPaginationPages {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            guard let currentURL = nextURL, seenURLs.insert(currentURL).inserted else {
+                break
+            }
+            let request = try makeAuthorizedRequest(url: currentURL)
+            let data = try await send(request)
+            let envelope: Envelope
+            do {
+                envelope = try JSONDecoder().decode(Envelope.self, from: data)
+            } catch {
+                throw DOError.invalidResponse
+            }
+            let pageItems = envelope.items
+            collected.append(contentsOf: pageItems)
+
+            guard !pageItems.isEmpty else {
+                break
+            }
+            nextURL = try validatedNextPageURL(envelope.links?.pages?.next)
+            if nextURL == nil {
+                break
+            }
+        }
+
+        return collected
     }
 
     private func sendJSON<Response: Decodable>(
@@ -671,19 +781,38 @@ public struct DigitalOceanClient: Sendable {
 
 // MARK: - Private API Envelopes & Request Bodies
 
-private struct DropletsEnvelope: Decodable {
+private protocol DOPaginatedEnvelope: Decodable {
+    associatedtype Item
+    var items: [Item] { get }
+    var links: DOLinks? { get }
+}
+
+private struct DOLinks: Decodable {
+    let pages: DOPages?
+}
+
+private struct DOPages: Decodable {
+    let next: String?
+}
+
+private struct DropletsEnvelope: DOPaginatedEnvelope {
     let droplets: [DODroplet]
+    let links: DOLinks?
+    var items: [DODroplet] { droplets }
 }
 
 private struct DropletEnvelope: Decodable {
     let droplet: DODroplet
 }
 
-private struct SSHKeysEnvelope: Decodable {
+private struct SSHKeysEnvelope: DOPaginatedEnvelope {
     let sshKeys: [DOSSHKey]
+    let links: DOLinks?
+    var items: [DOSSHKey] { sshKeys }
 
     enum CodingKeys: String, CodingKey {
         case sshKeys = "ssh_keys"
+        case links
     }
 }
 
@@ -695,16 +824,22 @@ private struct SSHKeyEnvelope: Decodable {
     }
 }
 
-private struct RegionsEnvelope: Decodable {
+private struct RegionsEnvelope: DOPaginatedEnvelope {
     let regions: [DORegion]
+    let links: DOLinks?
+    var items: [DORegion] { regions }
 }
 
-private struct SizesEnvelope: Decodable {
+private struct SizesEnvelope: DOPaginatedEnvelope {
     let sizes: [DOSize]
+    let links: DOLinks?
+    var items: [DOSize] { sizes }
 }
 
-private struct ImagesEnvelope: Decodable {
+private struct ImagesEnvelope: DOPaginatedEnvelope {
     let images: [DOImage]
+    let links: DOLinks?
+    var items: [DOImage] { images }
 }
 
 private struct ActionBody: Encodable {

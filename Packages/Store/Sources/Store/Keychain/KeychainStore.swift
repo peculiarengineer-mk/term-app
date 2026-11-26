@@ -11,6 +11,8 @@ internal protocol KeychainStoring: Sendable {
     func read(service: String, account: String) throws -> Data?
     func read(service: String, account: String, synchronizable: Bool) throws -> Data?
     func readAll(service: String) throws -> [(account: String, data: Data, synchronizable: Bool)]
+    func accountExists(service: String, account: String, synchronizable: Bool?) throws -> Bool
+    func listAccounts(service: String) throws -> Set<String>
     func delete(service: String, account: String) throws
     func setSynchronizable(_ synchronizable: Bool, service: String, account: String) throws
 }
@@ -109,6 +111,38 @@ public struct KeychainStore: Sendable, KeychainStoring {
             let sync = (d[kSecAttrSynchronizable as String] as? Bool) ?? ((d[kSecAttrSynchronizable as String] as? NSNumber)?.boolValue ?? false)
             return (a, v, sync)
         }
+    }
+
+    /// Checks whether an item exists for `(service, account)` without reading secret bytes into memory.
+    public func accountExists(service: String, account: String, synchronizable: Bool? = nil) throws -> Bool {
+        var q = baseQuery(service: service, account: account)
+        if let synchronizable {
+            q[kSecAttrSynchronizable as String] = synchronizable ? kCFBooleanTrue! : kCFBooleanFalse!
+        }
+        q[kSecReturnAttributes as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &result)
+        if status == errSecItemNotFound { return false }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        return result != nil
+    }
+
+    /// Lists all account identifiers under `service` without reading secret bytes into memory.
+    public func listAccounts(service: String) throws -> Set<String> {
+        let q: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny,
+            kSecReturnAttributes as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(q as CFDictionary, &result)
+        if status == errSecItemNotFound { return [] }
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+        let items = result as? [[String: Any]] ?? []
+        return Set(items.compactMap { $0[kSecAttrAccount as String] as? String })
     }
 
     /// Deleting a missing item is not an error.

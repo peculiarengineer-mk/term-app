@@ -44,6 +44,11 @@ final class DigitalOceanClientTests: XCTestCase {
         XCTAssertThrowsError(try DigitalOceanTokenStore.save("   \n\t  ", storage: storage)) { error in
             XCTAssertEqual(error as? DOError, .missingToken)
         }
+        for badToken in ["dop token", "dop\r\ntoken", "dop\0token", "dop\ttoken"] {
+            XCTAssertThrowsError(try DigitalOceanTokenStore.save(badToken, storage: storage)) { error in
+                XCTAssertEqual(error as? DOError, .invalidToken)
+            }
+        }
 
         // Seed a synced entry with the same service/account to ensure read ignores it and save removes it.
         try storage.save(
@@ -53,10 +58,29 @@ final class DigitalOceanClientTests: XCTestCase {
             synchronizable: true
         )
         XCTAssertNil(DigitalOceanTokenStore.read(storage: storage))
+        XCTAssertNil(try DigitalOceanTokenStore.readToken(storage: storage))
 
         // Saving trims whitespace and persists strictly with synchronizable == false.
         try DigitalOceanTokenStore.save("  dop_v1_abc123 \n", storage: storage)
         XCTAssertEqual(DigitalOceanTokenStore.read(storage: storage), "dop_v1_abc123")
+        XCTAssertEqual(try DigitalOceanTokenStore.readToken(storage: storage), "dop_v1_abc123")
+
+        // Corrupt UTF-8 throws errSecDecode on readToken while read returns nil.
+        try storage.save(Data([0xFF, 0xFE]), service: DigitalOceanTokenStore.service, account: DigitalOceanTokenStore.account, synchronizable: false)
+        XCTAssertThrowsError(try DigitalOceanTokenStore.readToken(storage: storage)) { error in
+            XCTAssertEqual(error as? KeychainError, KeychainError(status: errSecDecode))
+        }
+        XCTAssertNil(DigitalOceanTokenStore.read(storage: storage))
+
+        // Storage error throws from readToken while read returns nil.
+        storage.readError = KeychainError(status: errSecIO)
+        XCTAssertThrowsError(try DigitalOceanTokenStore.readToken(storage: storage)) { error in
+            XCTAssertEqual(error as? KeychainError, KeychainError(status: errSecIO))
+        }
+        XCTAssertNil(DigitalOceanTokenStore.read(storage: storage))
+        storage.readError = nil
+
+        try DigitalOceanTokenStore.save("  dop_v1_abc123 \n", storage: storage)
         XCTAssertTrue(DigitalOceanTokenStore.hasToken(storage: storage))
         XCTAssertEqual(
             storage.syncFlag(service: DigitalOceanTokenStore.service, account: DigitalOceanTokenStore.account),
@@ -148,8 +172,9 @@ final class DigitalOceanClientTests: XCTestCase {
             XCTAssertEqual(request.httpMethod, "GET")
             XCTAssertEqual(request.url?.absoluteString, "https://api.digitalocean.com/v2/droplets?per_page=100")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(Self.testToken)")
-            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Content-Type"))
             XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+            XCTAssertEqual(request.timeoutInterval, 30)
             XCTAssertNil(body)
             return (Self.httpResponse(url: request.url!, statusCode: 200), Data(payload.utf8))
         }
@@ -225,6 +250,7 @@ final class DigitalOceanClientTests: XCTestCase {
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(Self.testToken)")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+            XCTAssertEqual(request.timeoutInterval, 30)
 
             let rawBody = try XCTUnwrap(body)
             let json = try XCTUnwrap(JSONSerialization.jsonObject(with: rawBody) as? [String: Any])
@@ -577,6 +603,117 @@ final class DigitalOceanClientTests: XCTestCase {
             // Keychain unavailable in unhosted/sandboxed test runner; MockHostKeyForgetter above covered forget behavior.
         }
     }
+
+    func testPaginationUntrustedNextURLCapAndTokenCancellation() async throws {
+        // Multi-page pagination across droplets, ssh_keys, regions, sizes, images (including 20-page cap).
+        let pagedClient = makeStubbedClient { request, _ in
+            let url = request.url!
+            let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+            let page = Int(comps.queryItems?.first(where: { $0.name == "page" })?.value ?? "1") ?? 1
+            let path = comps.path
+
+            if path.hasSuffix("/droplets") {
+                let next = page < 25 ? "\"https://api.digitalocean.com/v2/droplets?page=\(page + 1)&per_page=100\"" : "null"
+                let json = """
+                {
+                  "droplets": [{"id":\(page),"name":"d\(page)","status":"active","memory":1024,"vcpus":1,"disk":25,"region":{"slug":"nyc3","name":"NYC3"},"size_slug":"s-1vcpu-1gb","image":{"name":"24.04","distribution":"Ubuntu"}}],
+                  "links": {"pages": {"next": \(next)}}
+                }
+                """
+                return (Self.httpResponse(url: url, statusCode: 200), Data(json.utf8))
+            } else if path.hasSuffix("/account/keys") {
+                let next = page == 1 ? "\"https://api.digitalocean.com/v2/account/keys?page=2&per_page=100\"" : "null"
+                let json = """
+                {"ssh_keys":[{"id":\(page),"name":"k\(page)","fingerprint":"fp","public_key":"ssh-ed25519 AAAA"}],"links":{"pages":{"next":\(next)}}}
+                """
+                return (Self.httpResponse(url: url, statusCode: 200), Data(json.utf8))
+            } else if path.hasSuffix("/regions") {
+                let next = page == 1 ? "\"https://api.digitalocean.com/v2/regions?page=2&per_page=100\"" : "null"
+                let avail = page == 2 ? "true" : "false"
+                let json = """
+                {"regions":[{"slug":"r\(page)","name":"Region \(page)","available":\(avail)}],"links":{"pages":{"next":\(next)}}}
+                """
+                return (Self.httpResponse(url: url, statusCode: 200), Data(json.utf8))
+            } else if path.hasSuffix("/sizes") {
+                let next = page == 1 ? "\"https://api.digitalocean.com/v2/sizes?page=2&per_page=100\"" : "null"
+                let price = page == 1 ? 20.0 : 5.0
+                let json = """
+                {"sizes":[{"slug":"s\(page)","memory":1024,"vcpus":1,"disk":25,"price_monthly":\(price),"available":true}],"links":{"pages":{"next":\(next)}}}
+                """
+                return (Self.httpResponse(url: url, statusCode: 200), Data(json.utf8))
+            } else if path.hasSuffix("/images") {
+                let next = page == 1 ? "\"https://api.digitalocean.com/v2/images?type=distribution&page=2&per_page=100\"" : "null"
+                let json = """
+                {"images":[{"id":\(page),"slug":"img-\(page)","name":"Img \(page)","distribution":"Ubuntu"}],"links":{"pages":{"next":\(next)}}}
+                """
+                return (Self.httpResponse(url: url, statusCode: 200), Data(json.utf8))
+            }
+            return (Self.httpResponse(url: url, statusCode: 404), Data())
+        }
+
+        let droplets = try await pagedClient.listDroplets()
+        XCTAssertEqual(droplets.count, 20)
+        XCTAssertEqual(droplets.first?.id, 1)
+        XCTAssertEqual(droplets.last?.id, 20)
+
+        let keys = try await pagedClient.listSSHKeys()
+        XCTAssertEqual(keys.map(\.id), [1, 2])
+
+        let regions = try await pagedClient.listRegions()
+        XCTAssertEqual(regions.map(\.slug), ["r2"])
+
+        let sizes = try await pagedClient.listSizes()
+        XCTAssertEqual(sizes.map(\.slug), ["s2", "s1"])
+
+        let images = try await pagedClient.listDistributionImages()
+        XCTAssertEqual(images.map(\.id), [1, 2])
+
+        // Untrusted next URL (http or wrong host or userinfo) must fail closed without contacting it.
+        for badNext in [
+            "http://api.digitalocean.com/v2/droplets?page=2",
+            "https://evil.example.com/v2/droplets?page=2",
+            "https://api.digitalocean.com.evil.com/v2/droplets?page=2",
+            "https://user@api.digitalocean.com/v2/droplets?page=2",
+        ] {
+            let evilClient = makeStubbedClient { request, _ in
+                XCTAssertEqual(request.url?.host, "api.digitalocean.com")
+                XCTAssertEqual(request.url?.scheme, "https")
+                let json = """
+                {"droplets":[{"id":1,"name":"d1","status":"active","memory":1024,"vcpus":1,"disk":25,"region":{"slug":"nyc3","name":"NYC3"},"size_slug":"s-1vcpu-1gb","image":{"name":"24.04","distribution":"Ubuntu"}}],"links":{"pages":{"next":"\(badNext)"}}}
+                """
+                return (Self.httpResponse(url: request.url!, statusCode: 200), Data(json.utf8))
+            }
+            do {
+                _ = try await evilClient.listDroplets()
+                XCTFail("Expected DOError.invalidResponse for next=\(badNext)")
+            } catch let error as DOError {
+                XCTAssertEqual(error, .invalidResponse)
+            }
+        }
+
+        // Token with whitespace/control characters -> DOError.invalidToken.
+        let badTokenClient = makeStubbedClient(token: "dop\r\nbad") { _, _ in
+            XCTFail("Network should not be called with invalid token")
+            return (Self.httpResponse(url: DigitalOceanClient.baseURL, statusCode: 500), Data())
+        }
+        do {
+            _ = try await badTokenClient.listDroplets()
+            XCTFail("Expected DOError.invalidToken")
+        } catch let error as DOError {
+            XCTAssertEqual(error, .invalidToken)
+        }
+
+        // URLError(.cancelled) maps to CancellationError.
+        let cancelClient = makeStubbedClient { _, _ in
+            throw URLError(.cancelled)
+        }
+        do {
+            _ = try await cancelClient.listDroplets()
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // Expected
+        }
+    }
 }
 
 // MARK: - Test Doubles
@@ -670,6 +807,7 @@ private final class MockTokenKeychainStorage: KeychainStoring, @unchecked Sendab
 
     private var items: [ItemKey: Data] = [:]
     private(set) var saveHistory: [(service: String, account: String, synchronizable: Bool)] = []
+    var readError: Error?
 
     func syncFlag(service: String, account: String) -> Bool? {
         if items[ItemKey(service: service, account: account, synchronizable: true)] != nil { return true }
@@ -684,18 +822,32 @@ private final class MockTokenKeychainStorage: KeychainStoring, @unchecked Sendab
     }
 
     func read(service: String, account: String) throws -> Data? {
+        if let readError { throw readError }
         if let synced = try read(service: service, account: account, synchronizable: true) { return synced }
         return try read(service: service, account: account, synchronizable: false)
     }
 
     func read(service: String, account: String, synchronizable: Bool) throws -> Data? {
-        items[ItemKey(service: service, account: account, synchronizable: synchronizable)]
+        if let readError { throw readError }
+        return items[ItemKey(service: service, account: account, synchronizable: synchronizable)]
     }
 
     func readAll(service: String) throws -> [(account: String, data: Data, synchronizable: Bool)] {
         items.compactMap { key, data in
             key.service == service ? (key.account, data, key.synchronizable) : nil
         }
+    }
+
+    func accountExists(service: String, account: String, synchronizable: Bool?) throws -> Bool {
+        if let synchronizable {
+            return items[ItemKey(service: service, account: account, synchronizable: synchronizable)] != nil
+        }
+        return items[ItemKey(service: service, account: account, synchronizable: true)] != nil
+            || items[ItemKey(service: service, account: account, synchronizable: false)] != nil
+    }
+
+    func listAccounts(service: String) throws -> Set<String> {
+        Set(items.keys.compactMap { $0.service == service ? $0.account : nil })
     }
 
     func delete(service: String, account: String) throws {

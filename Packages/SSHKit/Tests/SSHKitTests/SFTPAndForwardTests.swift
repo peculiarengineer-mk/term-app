@@ -109,6 +109,15 @@ final class SFTPAndForwardTests: XCTestCase {
         }
 
         do {
+            try await conn.sftpUploadFile(data: Data("hi".utf8), remotePath: "/tmp/hi.txt", exclusive: true)
+            XCTFail("Expected SFTPError.notConnected")
+        } catch let error as SFTPError {
+            XCTAssertEqual(error, .notConnected)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        do {
             try await conn.sftpUploadFile(data: Data("hi".utf8), remotePath: "/tmp/hi.txt")
             XCTFail("Expected SFTPError.notConnected")
         } catch let error as SFTPError {
@@ -185,6 +194,34 @@ final class SFTPAndForwardTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+    }
+
+    func testSFTPUploadFlagsLengthValidationAndHardeningConstants() throws {
+        let normalFlags = SFTPUtil.uploadOpenFlags(exclusive: false)
+        XCTAssertNotEqual(normalFlags & UInt(LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC), 0)
+        XCTAssertEqual(normalFlags & UInt(LIBSSH2_FXF_EXCL), 0)
+
+        let exclusiveFlags = SFTPUtil.uploadOpenFlags(exclusive: true)
+        XCTAssertEqual(exclusiveFlags & UInt(LIBSSH2_FXF_EXCL), UInt(LIBSSH2_FXF_EXCL))
+        XCTAssertEqual(exclusiveFlags & normalFlags, normalFlags)
+
+        XCTAssertEqual(try SFTPUtil.sftpLength(byteCount: 0), 0)
+        XCTAssertEqual(try SFTPUtil.sftpLength(byteCount: Int(UInt32.max)), UInt32.max)
+        XCTAssertThrowsError(try SFTPUtil.sftpLength(byteCount: -1)) { error in
+            guard case SFTPError.ioFailed = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+        if MemoryLayout<Int>.size >= 8 {
+            XCTAssertThrowsError(try SFTPUtil.sftpLength(byteCount: Int(UInt32.max) + 1)) { error in
+                guard case SFTPError.ioFailed = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+            }
+        }
+
+        XCTAssertEqual(SSHConnection.sftpOperationTimeout, .seconds(30))
+        XCTAssertEqual(SSHConnection.maxForwardConcurrentClients, 64)
     }
 
     func testSFTPUtilHelpers() {

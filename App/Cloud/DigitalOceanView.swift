@@ -33,6 +33,7 @@ struct DigitalOceanView: View {
     @State private var isSyncing = false
     @State private var busyDropletIDs: Set<Int> = []
     @State private var loadError: String?
+    @State private var sshKeysError: String?
     @State private var actionError: String?
     @State private var statusBanner: String?
 
@@ -94,6 +95,7 @@ struct DigitalOceanView: View {
                 droplets = []
                 accountKeys = []
                 loadError = nil
+                sshKeysError = nil
                 statusBanner = nil
             }
         }
@@ -190,6 +192,28 @@ struct DigitalOceanView: View {
                         }
                     }
                     .padding(.vertical, 2)
+                }
+            }
+
+            if let sshKeysError {
+                Section {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(sshKeysError)
+                            .font(.footnote)
+                            .foregroundStyle(.primary)
+                        Spacer(minLength: 8)
+                        Button {
+                            self.sshKeysError = nil
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Dismiss SSH key warning")
+                    }
                 }
             }
 
@@ -384,7 +408,14 @@ struct DigitalOceanView: View {
             droplets = fetched
             loadError = nil
             AppHaptics.notify(.success)
-            accountKeys = (try? await client.listSSHKeys()) ?? []
+            do {
+                accountKeys = try await client.listSSHKeys()
+                sshKeysError = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                sshKeysError = "Could not load DigitalOcean SSH keys: \(error.localizedDescription)"
+            }
         } catch {
             tokenError = error.localizedDescription
             AppHaptics.notify(.error)
@@ -407,7 +438,14 @@ struct DigitalOceanView: View {
             async let fetchedDroplets = client.listDroplets()
             async let fetchedKeys = client.listSSHKeys()
             droplets = try await fetchedDroplets
-            accountKeys = (try? await fetchedKeys) ?? accountKeys
+            do {
+                accountKeys = try await fetchedKeys
+                sshKeysError = nil
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                sshKeysError = "Could not load DigitalOcean SSH keys: \(error.localizedDescription)"
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -429,9 +467,18 @@ struct DigitalOceanView: View {
             async let fetchedDroplets = client.listDroplets()
             async let fetchedKeys = client.listSSHKeys()
             let latestDroplets = try await fetchedDroplets
-            let latestKeys = (try? await fetchedKeys) ?? accountKeys
+            let latestKeys: [DOSSHKey]
+            do {
+                latestKeys = try await fetchedKeys
+                accountKeys = latestKeys
+                sshKeysError = nil
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                latestKeys = accountKeys
+                sshKeysError = "Could not load DigitalOcean SSH keys: \(error.localizedDescription)"
+            }
             droplets = latestDroplets
-            accountKeys = latestKeys
 
             let result = try CloudHostSync.sync(
                 droplets: latestDroplets,
@@ -488,7 +535,8 @@ struct DigitalOceanView: View {
             try await client.performAction(action, dropletID: droplet.id)
             AppHaptics.notify(.success)
             statusBanner = "\(actionDisplayTitle(action)) requested for \(droplet.name)."
-            try? await Task.sleep(for: .seconds(1.5))
+            try await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
             await loadDroplets(showSpinner: false)
         } catch is CancellationError {
             return
@@ -571,10 +619,13 @@ struct CreateDropletSheet: View {
 
     @State private var isLoadingOptions = true
     @State private var loadError: String?
+    @State private var sshKeysError: String?
+    @State private var isRetryingKeys = false
     @State private var isCreating = false
     @State private var pushingLocalKeyID: UUID?
     @State private var statusMessage: String?
     @State private var errorMessage: String?
+    @State private var createTask: Task<Void, Never>?
     @State private var dnsWaitTask: Task<Void, any Error>?
     @State private var createdDropletForFollowUp: DODroplet?
 
@@ -684,14 +735,18 @@ struct CreateDropletSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(createdDropletForFollowUp == nil ? "Cancel" : "Done") {
+                        createTask?.cancel()
+                        createTask = nil
                         dnsWaitTask?.cancel()
+                        dnsWaitTask = nil
                         dismiss()
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button {
                         AppHaptics.impact(.light)
-                        Task { await createDroplet() }
+                        createTask?.cancel()
+                        createTask = Task { await createDroplet() }
                     } label: {
                         if isCreating && dnsWaitTask == nil {
                             ProgressView()
@@ -707,6 +762,8 @@ struct CreateDropletSheet: View {
                 await loadOptions()
             }
             .onDisappear {
+                createTask?.cancel()
+                createTask = nil
                 dnsWaitTask?.cancel()
                 dnsWaitTask = nil
             }
@@ -752,7 +809,27 @@ struct CreateDropletSheet: View {
 
     private var sshKeysSection: some View {
         Section {
-            if accountKeys.isEmpty {
+            if let sshKeysError {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("Could not load account SSH keys: \(sshKeysError)", systemImage: "exclamationmark.triangle.fill")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        Task { await retrySSHKeys() }
+                    } label: {
+                        if isRetryingKeys {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Retry SSH Keys")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isCreating || isRetryingKeys)
+                }
+            } else if accountKeys.isEmpty {
                 Text("No SSH keys registered on your DigitalOcean account yet.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -805,7 +882,7 @@ struct CreateDropletSheet: View {
                     }
                     .disabled(pushingLocalKeyID != nil || isCreating)
                 }
-            } else if accountKeys.isEmpty && localKeys.isEmpty {
+            } else if sshKeysError == nil && accountKeys.isEmpty && localKeys.isEmpty {
                 Text("Tip: Generate an SSH key in the Keys tab to avoid emailed root passwords.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -908,7 +985,16 @@ struct CreateDropletSheet: View {
             let loadedRegions = try await fetchedRegions
             let loadedSizes = try await fetchedSizes
             let loadedImages = Self.prioritizedImages(try await fetchedImages)
-            let loadedKeys = (try? await fetchedKeys) ?? []
+            let loadedKeys: [DOSSHKey]
+            do {
+                loadedKeys = try await fetchedKeys
+                sshKeysError = nil
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                loadedKeys = []
+                sshKeysError = error.localizedDescription
+            }
 
             regions = loadedRegions
             sizes = loadedSizes
@@ -927,17 +1013,7 @@ struct CreateDropletSheet: View {
                 selectedImageID = loadedImages.first?.id
             }
 
-            if selectedKeyIDs.isEmpty {
-                let localNormalized = Set(localKeys.map { CloudHostSync.normalizePublicKey($0.publicKey) })
-                let matchingAccountKeys = loadedKeys.filter {
-                    localNormalized.contains(CloudHostSync.normalizePublicKey($0.publicKey))
-                }
-                if !matchingAccountKeys.isEmpty {
-                    selectedKeyIDs = Set(matchingAccountKeys.map(\.id))
-                } else if let firstKey = loadedKeys.first {
-                    selectedKeyIDs = [firstKey.id]
-                }
-            }
+            applyDefaultSelectedKeys(from: loadedKeys)
 
             isLoadingOptions = false
         } catch is CancellationError {
@@ -945,6 +1021,36 @@ struct CreateDropletSheet: View {
         } catch {
             loadError = error.localizedDescription
             isLoadingOptions = false
+        }
+    }
+
+    private func retrySSHKeys() async {
+        guard let token = DigitalOceanTokenStore.read() else { return }
+        isRetryingKeys = true
+        defer { isRetryingKeys = false }
+
+        do {
+            let loadedKeys = try await DigitalOceanClient(token: token).listSSHKeys()
+            accountKeys = loadedKeys
+            sshKeysError = nil
+            applyDefaultSelectedKeys(from: loadedKeys)
+        } catch is CancellationError {
+            return
+        } catch {
+            sshKeysError = error.localizedDescription
+        }
+    }
+
+    private func applyDefaultSelectedKeys(from loadedKeys: [DOSSHKey]) {
+        guard selectedKeyIDs.isEmpty else { return }
+        let localNormalized = Set(localKeys.map { CloudHostSync.normalizePublicKey($0.publicKey) })
+        let matchingAccountKeys = loadedKeys.filter {
+            localNormalized.contains(CloudHostSync.normalizePublicKey($0.publicKey))
+        }
+        if !matchingAccountKeys.isEmpty {
+            selectedKeyIDs = Set(matchingAccountKeys.map(\.id))
+        } else if let firstKey = loadedKeys.first {
+            selectedKeyIDs = [firstKey.id]
         }
     }
 
@@ -1005,10 +1111,15 @@ struct CreateDropletSheet: View {
         )
 
         let doClient = DigitalOceanClient(token: token)
+        defer { createTask = nil }
         do {
             let created = try await doClient.createDroplet(request)
             createdDropletForFollowUp = created
             onCreated(created)
+            guard !Task.isCancelled else {
+                isCreating = false
+                return
+            }
             AppHaptics.notify(.success)
 
             if pointDNS, let zone = selectedZone, let cfToken = CloudflareTokenStore.read() {
@@ -1053,10 +1164,17 @@ struct CreateDropletSheet: View {
                 )
                 isCreating = false
                 dismiss()
+            } catch is CancellationError {
+                isCreating = false
             } catch {
                 isCreating = false
                 errorMessage = "Droplet created, but DNS creation failed: \(error.localizedDescription)"
             }
+            return
+        }
+
+        guard !Task.isCancelled else {
+            isCreating = false
             return
         }
 
@@ -1066,7 +1184,9 @@ struct CreateDropletSheet: View {
             for _ in 0..<15 {
                 try Task.checkCancellation()
                 try await Task.sleep(for: .seconds(2))
+                try Task.checkCancellation()
                 let list = try await doClient.listDroplets()
+                try Task.checkCancellation()
                 if let match = list.first(where: { $0.id == droplet.id }) {
                     latestDroplet = match
                     createdDropletForFollowUp = match

@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import PhotosUI
 import SwiftUI
 import UIKit
@@ -6,9 +7,10 @@ import SSHKit
 import Store
 
 /// Errors raised while preparing or uploading an attached image over SFTP.
-enum PhotoAttachmentError: LocalizedError, Sendable {
+enum PhotoAttachmentError: LocalizedError, Sendable, Equatable {
     case notSSHConnection
     case loadFailed
+    case fileTooLarge
     case invalidImage
     case encodingFailed
 
@@ -18,6 +20,8 @@ enum PhotoAttachmentError: LocalizedError, Sendable {
             "An active SSH session is required to upload attachments."
         case .loadFailed:
             "Could not load the selected photo."
+        case .fileTooLarge:
+            "The selected photo exceeds the 50 MB size limit."
         case .invalidImage:
             "The selected item could not be decoded as an image."
         case .encodingFailed:
@@ -36,6 +40,7 @@ struct PreparedPhotoAttachment: Sendable {
 enum PhotoAttachmentUploader {
     static let maxLongestEdge: CGFloat = 2048
     static let maxPNGBytes = 2 * 1024 * 1024
+    static let maxRawBytes = 50 * 1024 * 1024
 
     /// Loads `item`, resizes/encodes it off the main thread, uploads via SFTP, and returns the remote POSIX path.
     static func upload(item: PhotosPickerItem, session: any Session) async throws -> String {
@@ -45,52 +50,71 @@ enum PhotoAttachmentUploader {
         guard let rawData = try await item.loadTransferable(type: Data.self) else {
             throw PhotoAttachmentError.loadFailed
         }
+        guard rawData.count <= maxRawBytes else {
+            throw PhotoAttachmentError.fileTooLarge
+        }
 
         let prepared = try await Task.detached(priority: .userInitiated) {
             try prepareAttachment(from: rawData)
         }.value
 
         let remotePath = RemoteAttachmentHelper.remotePath(filename: prepared.filename)
-        try await sshConnection.sftpUploadFile(data: prepared.data, remotePath: remotePath)
+        try await sshConnection.sftpUploadFile(
+            data: prepared.data,
+            remotePath: remotePath,
+            permissions: 0o600,
+            exclusive: true
+        )
         return remotePath
     }
 
-    /// Downscales `rawData` to at most `maxLongestEdge` px and encodes as PNG (falling back to JPEG if > 2 MB).
+    /// Downscales `rawData` to at most `maxLongestEdge` px via ImageIO without EXIF and encodes as PNG (falling back to JPEG if > 2 MB).
     nonisolated static func prepareAttachment(from rawData: Data) throws -> PreparedPhotoAttachment {
-        guard let image = UIImage(data: rawData) else {
+        guard !rawData.isEmpty else {
+            throw PhotoAttachmentError.invalidImage
+        }
+        guard rawData.count <= maxRawBytes else {
+            throw PhotoAttachmentError.fileTooLarge
+        }
+
+        let sourceOptions: [CFString: Any] = [
+            kCGImageSourceShouldCache: false,
+        ]
+        guard let imageSource = CGImageSourceCreateWithData(rawData as CFData, sourceOptions as CFDictionary) else {
             throw PhotoAttachmentError.invalidImage
         }
 
-        let pixelWidth = image.size.width * image.scale
-        let pixelHeight = image.size.height * image.scale
-        guard pixelWidth > 0, pixelHeight > 0 else {
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: Int(maxLongestEdge),
+            kCGImageSourceShouldCache: false,
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, thumbnailOptions as CFDictionary),
+              cgImage.width > 0,
+              cgImage.height > 0 else {
             throw PhotoAttachmentError.invalidImage
         }
 
-        let longestEdge = max(pixelWidth, pixelHeight)
-        let scaleFactor = longestEdge > maxLongestEdge ? (maxLongestEdge / longestEdge) : 1.0
-        let targetSize = CGSize(
-            width: max(1, (pixelWidth * scaleFactor).rounded()),
-            height: max(1, (pixelHeight * scaleFactor).rounded())
-        )
-
+        let targetSize = CGSize(width: cgImage.width, height: cgImage.height)
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1
         format.opaque = false
 
         let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
         let rendered = renderer.image { _ in
-            image.draw(in: CGRect(origin: .zero, size: targetSize))
+            UIImage(cgImage: cgImage).draw(in: CGRect(origin: .zero, size: targetSize))
         }
 
-        if let pngData = rendered.pngData(), pngData.count <= maxPNGBytes {
+        let pngData = rendered.pngData()
+        if let pngData, pngData.count <= maxPNGBytes {
             return PreparedPhotoAttachment(data: pngData, filename: "screenshot.png")
         }
         if let jpegData = rendered.jpegData(compressionQuality: 0.85) {
             return PreparedPhotoAttachment(data: jpegData, filename: "screenshot.jpg")
         }
-        if let pngFallback = rendered.pngData() {
-            return PreparedPhotoAttachment(data: pngFallback, filename: "screenshot.png")
+        if let pngData {
+            return PreparedPhotoAttachment(data: pngData, filename: "screenshot.png")
         }
         throw PhotoAttachmentError.encodingFailed
     }

@@ -185,6 +185,8 @@ struct SessionTabsView<HostList: View>: View {
     @State private var inspectingSecurity: SecurityInspection?
     @State private var activeToolSheet: SessionToolSheet?
     @State private var closingTab: LiveSession?
+    @State private var splitState = SplitPaneState()
+    @State private var splitPickerRequest: SplitPickerRequest?
 
     private struct SecurityInspection: Identifiable {
         let id: UUID
@@ -192,7 +194,13 @@ struct SessionTabsView<HostList: View>: View {
         let algorithms: NegotiatedAlgorithms
     }
 
+    private struct SplitPickerRequest: Identifiable {
+        let id = UUID()
+        let axis: SplitPaneState.SplitAxis
+    }
+
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     private var windowLiveSessions: [LiveSession] {
         manager.sessions.filter { $0.windowID == windowID }
@@ -218,6 +226,55 @@ struct SessionTabsView<HostList: View>: View {
         return pendingConnections.first(where: { $0.id == selection })
     }
 
+    private var secondaryLive: LiveSession? {
+        guard horizontalSizeClass == .regular,
+              let primary = selectedLive,
+              let secondaryID = splitState.secondarySessionID,
+              secondaryID != primary.id else {
+            return nil
+        }
+        return windowLiveSessions.first(where: { $0.id == secondaryID })
+    }
+
+    private var secondaryPending: PendingConnection? {
+        guard horizontalSizeClass == .regular,
+              let primary = selectedLive,
+              let secondaryID = splitState.secondarySessionID,
+              secondaryID != primary.id else {
+            return nil
+        }
+        return pendingConnections.first(where: { $0.id == secondaryID })
+    }
+
+    private var isSplitVisible: Bool {
+        selectedLive != nil && (secondaryLive != nil || secondaryPending != nil)
+    }
+
+    private var focusedLive: LiveSession? {
+        guard let primary = selectedLive else { return nil }
+        if isSplitVisible, splitState.focusedPane == .secondary, let secondary = secondaryLive {
+            return secondary
+        }
+        return primary
+    }
+
+    private var focusedTabID: UUID? {
+        if isSplitVisible, splitState.focusedPane == .secondary {
+            return secondaryLive?.id ?? secondaryPending?.id ?? selection
+        }
+        return selection
+    }
+
+    private var orderedWindowLiveSessions: [LiveSession] {
+        let byID = Dictionary(uniqueKeysWithValues: windowLiveSessions.map { ($0.id, $0) })
+        var ordered = tabOrder.compactMap { byID[$0] }
+        let seen = Set(ordered.map(\.id))
+        for live in windowLiveSessions where !seen.contains(live.id) {
+            ordered.append(live)
+        }
+        return ordered
+    }
+
     private var isTerminalActive: Bool {
         selectedLive != nil || selectedPending != nil
     }
@@ -227,7 +284,7 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     private var isModalOverSelectedTerminal: Bool {
-        activeToolSheet != nil || switching || inspectingSecurity != nil
+        activeToolSheet != nil || switching || inspectingSecurity != nil || splitPickerRequest != nil
     }
 
     private var activeSessionPill: ActiveSessionPill? {
@@ -301,16 +358,24 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     var body: some View {
+        withModalPresentations(withWindowAndNotificationLifecycle(withSplitAndSelectionLifecycle(mainTabsContent)))
+    }
+
+    private var mainTabsContent: some View {
         VStack(spacing: 0) {
             if selectedLive != nil || selectedPending != nil {
                 tabBar
             }
             if let live = selectedLive {
-                TerminalPane(
-                    live: live,
-                    onOpenGitDiff: { openGitDiffShortcut() },
-                    onOpenDevPreview: { openDevServerPreviewShortcut() }
-                )
+                if isSplitVisible {
+                    splitWorkspace(primary: live)
+                } else {
+                    TerminalPane(
+                        live: live,
+                        onOpenGitDiff: { openGitDiffShortcut() },
+                        onOpenDevPreview: { openDevServerPreviewShortcut() }
+                    )
+                }
             } else if let pending = selectedPending {
                 HostConnectionView(
                     host: pending.host,
@@ -333,7 +398,7 @@ struct SessionTabsView<HostList: View>: View {
         }
         .background(SceneReader(scene: $scene))
         .background {
-            if let scene {
+            if let scene, !appLock.isLocked {
                 TabNotifications(
                     scene: scene,
                     onNewTab: { newTab() },
@@ -343,84 +408,133 @@ struct SessionTabsView<HostList: View>: View {
             }
         }
         .background { keyboardShortcutsLayer }
-        .onChange(of: selection) { _, newSelection in
-            if let newSelection {
-                lastSelectedID = newSelection
+    }
+
+    private func withSplitAndSelectionLifecycle<Content: View>(_ content: Content) -> some View {
+        content
+            .onChange(of: selection) { _, newSelection in
+                if let newSelection {
+                    lastSelectedID = newSelection
+                }
+                reconcileSplitState()
+                syncModalPresentationState()
             }
-        }
-        .onChange(of: selectedLive?.id) { oldID, newID in
-            if let oldID, oldID != newID {
-                manager.session(id: oldID)?.hasModalSheetPresented = false
+            .onChange(of: selectedLive?.id) { oldID, newID in
+                if let oldID, oldID != newID {
+                    manager.session(id: oldID)?.hasModalSheetPresented = false
+                }
+                syncModalPresentationState()
             }
-            if let newID {
-                manager.session(id: newID)?.hasModalSheetPresented = isModalOverSelectedTerminal
+            .onChange(of: secondaryLive?.id) { oldID, newID in
+                if let oldID, oldID != newID {
+                    manager.session(id: oldID)?.hasModalSheetPresented = false
+                }
+                syncModalPresentationState()
             }
-        }
-        .onChange(of: isModalOverSelectedTerminal) { _, isPresented in
-            selectedLive?.hasModalSheetPresented = isPresented
-        }
-        .onChange(of: windowLiveSessions.map(\.id)) { _, liveIDs in
-            let liveSet = Set(liveIDs)
-            let pendingSet = Set(pendingConnections.map(\.id))
-            tabOrder.removeAll { !liveSet.contains($0) && !pendingSet.contains($0) }
-            if let s = selection, !tabOrder.contains(s) {
-                selection = tabOrder.last
+            .onChange(of: horizontalSizeClass) { _, _ in
+                syncModalPresentationState()
             }
-        }
-        .onAppear {
-            selectedLive?.hasModalSheetPresented = isModalOverSelectedTerminal
-            consumeAndFocusPendingAgentSessionIfUnlocked()
-            consumePendingMergeBackIfNeeded()
-            consumePendingNewTabIfNeeded()
-        }
-        .onDisappear {
-            selectedLive?.hasModalSheetPresented = false
-        }
-        .onChange(of: manager.pendingMergeBackSessionID) { _, _ in
-            consumePendingMergeBackIfNeeded()
-        }
-        .onChange(of: manager.pendingNewTabRequestID) { _, _ in
-            consumePendingNewTabIfNeeded()
-        }
-        .onChange(of: appLock.isLocked) { _, isLocked in
-            if !isLocked {
+            .onChange(of: isModalOverSelectedTerminal) { _, _ in
+                syncModalPresentationState()
+            }
+            .onChange(of: splitState.secondarySessionID) { _, _ in
+                reconcileSplitState()
+                syncModalPresentationState()
+            }
+    }
+
+    private func withWindowAndNotificationLifecycle<Content: View>(_ content: Content) -> some View {
+        content
+            .onChange(of: windowLiveSessions.map(\.id)) { _, liveIDs in
+                let liveSet = Set(liveIDs)
+                let pendingSet = Set(pendingConnections.map(\.id))
+                tabOrder.removeAll { !liveSet.contains($0) && !pendingSet.contains($0) }
+                if let s = selection, !tabOrder.contains(s) {
+                    selection = tabOrder.last
+                }
+                reconcileSplitState()
+                syncModalPresentationState()
+            }
+            .onChange(of: pendingConnections.map(\.id)) { _, _ in
+                reconcileSplitState()
+            }
+            .onAppear {
+                reconcileSplitState()
+                syncModalPresentationState()
                 consumeAndFocusPendingAgentSessionIfUnlocked()
+                consumePendingMergeBackIfNeeded()
+                consumePendingNewTabIfNeeded()
             }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .termFocusAgentSession)) { note in
-            if let id = note.userInfo?[AgentNotificationManager.sessionIDKey] as? UUID {
-                focusAgentSessionIfUnlocked(id)
-            }
-        }
-        .sheet(isPresented: $switching) {
-            SessionSwitcher(
-                selectedID: selection,
-                onSelect: { addTab($0) },
-                onOpenInWindow: { moveToWindow($0) }
-            )
-            .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-            .tint(theme.accentColor)
-        }
-        .sessionToolSheets(item: $activeToolSheet, theme: theme)
-        .confirmationDialog(
-            "Close active session?",
-            isPresented: Binding(get: { closingTab != nil }, set: { if !$0 { closingTab = nil } }),
-            titleVisibility: .visible,
-            presenting: closingTab
-        ) { live in
-            if live.ephemeralHost != nil {
-                Button("Save Host", systemImage: "bookmark.badge.plus") {
-                    manager.saveEphemeralHost(for: live.id, in: modelContext)
+            .onDisappear {
+                for live in windowLiveSessions {
+                    live.hasModalSheetPresented = false
                 }
             }
-            Button("Close Session", role: .destructive) {
-                AppHaptics.impact(.light)
-                manager.close(live.id)
+            .onChange(of: manager.pendingMergeBackSessionID) { _, _ in
+                consumePendingMergeBackIfNeeded()
             }
-            Button("Cancel", role: .cancel) {}
-        } message: { live in
-            Text("Closing \"\(live.title)\" will disconnect the active SSH session.")
-        }
+            .onChange(of: manager.pendingNewTabRequestID) { _, _ in
+                consumePendingNewTabIfNeeded()
+            }
+            .onChange(of: appLock.isLocked) { _, isLocked in
+                if !isLocked {
+                    consumeAndFocusPendingAgentSessionIfUnlocked()
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .termFocusAgentSession)) { note in
+                if let id = note.userInfo?[AgentNotificationManager.sessionIDKey] as? UUID {
+                    focusAgentSessionIfUnlocked(id)
+                }
+            }
+    }
+
+    private func withModalPresentations<Content: View>(_ content: Content) -> some View {
+        content
+            .sheet(isPresented: $switching) {
+                SessionSwitcher(
+                    selectedID: selection,
+                    onSelect: { addTab($0) },
+                    onOpenInWindow: { moveToWindow($0) }
+                )
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+            }
+            .sheet(item: $splitPickerRequest) { request in
+                SplitPanePickerSheet(
+                    axis: request.axis,
+                    primarySessionID: selection,
+                    currentWindowID: windowID,
+                    theme: theme,
+                    onSelectSession: { sessionID in
+                        splitWithExistingSession(sessionID, axis: request.axis)
+                    },
+                    onConnectHost: { host in
+                        connectHost(host, splitAxis: request.axis)
+                    }
+                )
+                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+                .tint(theme.accentColor)
+            }
+            .sessionToolSheets(item: $activeToolSheet, theme: theme)
+            .confirmationDialog(
+                "Close active session?",
+                isPresented: Binding(get: { closingTab != nil }, set: { if !$0 { closingTab = nil } }),
+                titleVisibility: .visible,
+                presenting: closingTab
+            ) { live in
+                if live.ephemeralHost != nil {
+                    Button("Save Host", systemImage: "bookmark.badge.plus") {
+                        manager.saveEphemeralHost(for: live.id, in: modelContext)
+                    }
+                }
+                Button("Close Session", role: .destructive) {
+                    AppHaptics.impact(.light)
+                    manager.close(live.id)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: { live in
+                Text("Closing \"\(live.title)\" will disconnect the active SSH session.")
+            }
     }
 
     private var tabBar: some View {
@@ -459,9 +573,9 @@ struct SessionTabsView<HostList: View>: View {
                 }
 
                 HStack(spacing: 2) {
-                    if let selectedLive {
+                    if let activeLive = focusedLive {
                         SessionToolsMenu(
-                            live: selectedLive,
+                            live: activeLive,
                             isProUnlocked: proStore.isProUnlocked,
                             foregroundColor: theme.foregroundColor
                         ) { tool in
@@ -469,12 +583,16 @@ struct SessionTabsView<HostList: View>: View {
                         }
                     }
 
-                    if horizontalSizeClass != .compact, let selectedLive, let algorithms = selectedLive.algorithms {
+                    if horizontalSizeClass == .regular, selectedLive != nil {
+                        splitMenuButton
+                    }
+
+                    if horizontalSizeClass != .compact, let activeLive = focusedLive, let algorithms = activeLive.algorithms {
                         Button {
                             AppHaptics.impact(.light)
                             inspectingSecurity = SecurityInspection(
-                                id: selectedLive.id,
-                                title: selectedLive.title,
+                                id: activeLive.id,
+                                title: activeLive.title,
                                 algorithms: algorithms
                             )
                         } label: {
@@ -533,6 +651,7 @@ struct SessionTabsView<HostList: View>: View {
 
     private func liveTabChip(for live: LiveSession) -> some View {
         let isSelected = selection == live.id
+        let isSecondaryPane = isSplitVisible && splitState.secondarySessionID == live.id
         return HStack(spacing: 4) {
             Button {
                 AppHaptics.impact(.light)
@@ -540,6 +659,12 @@ struct SessionTabsView<HostList: View>: View {
             } label: {
                 HStack(spacing: 6) {
                     ConnectionStatusDot(status: live.connectionStatus)
+                    if isSecondaryPane {
+                        Image(systemName: splitState.axis == .horizontal ? "rectangle.righthalf.inset.filled" : "rectangle.bottomhalf.inset.filled")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(theme.accentColor)
+                            .accessibilityHidden(true)
+                    }
                     if let ai = live.aiAgentContext {
                         Image(systemName: AgentVisuals.agentSymbol(for: ai.agent))
                             .font(.caption2.weight(.semibold))
@@ -584,7 +709,12 @@ struct SessionTabsView<HostList: View>: View {
         )
         .overlay(
             Capsule()
-                .strokeBorder(isSelected ? theme.accentColor.opacity(0.45) : Color.clear, lineWidth: 1)
+                .strokeBorder(
+                    isSelected
+                        ? theme.accentColor.opacity(0.45)
+                        : (isSecondaryPane ? theme.accentColor.opacity(0.30) : Color.clear),
+                    lineWidth: 1
+                )
         )
         .contextMenu {
             if live.ephemeralHost != nil {
@@ -603,6 +733,7 @@ struct SessionTabsView<HostList: View>: View {
 
     private func pendingTabChip(for pending: PendingConnection) -> some View {
         let isSelected = selection == pending.id
+        let isSecondaryPane = isSplitVisible && splitState.secondarySessionID == pending.id
         let chipTitle = pending.model.title.isEmpty ? pending.title : pending.model.title
         let dotStatus = pendingStatus(for: pending.model.phase)
         let statusValue = dotStatus == .disconnected ? "Connection error" : "Connecting"
@@ -614,6 +745,12 @@ struct SessionTabsView<HostList: View>: View {
             } label: {
                 HStack(spacing: 6) {
                     ConnectionStatusDot(status: dotStatus)
+                    if isSecondaryPane {
+                        Image(systemName: splitState.axis == .horizontal ? "rectangle.righthalf.inset.filled" : "rectangle.bottomhalf.inset.filled")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(theme.accentColor)
+                            .accessibilityHidden(true)
+                    }
                     Text(chipTitle)
                         .lineLimit(1)
                         .font(.subheadline.weight(isSelected ? .semibold : .medium))
@@ -652,7 +789,12 @@ struct SessionTabsView<HostList: View>: View {
         )
         .overlay(
             Capsule()
-                .strokeBorder(isSelected ? theme.accentColor.opacity(0.45) : Color.clear, lineWidth: 1)
+                .strokeBorder(
+                    isSelected
+                        ? theme.accentColor.opacity(0.45)
+                        : (isSecondaryPane ? theme.accentColor.opacity(0.30) : Color.clear),
+                    lineWidth: 1
+                )
         )
         .contextMenu {
             Button("Close", systemImage: "xmark", role: .destructive) {
@@ -678,7 +820,8 @@ struct SessionTabsView<HostList: View>: View {
     func connectHost(
         _ host: Host,
         aiAgentContext: AIAgentLaunchContext? = nil,
-        pendingLaunchCommand: String? = nil
+        pendingLaunchCommand: String? = nil,
+        splitAxis: SplitPaneState.SplitAxis? = nil
     ) {
         let pendingID = UUID()
         let hostTitle = host.label.isEmpty ? host.hostname : host.label
@@ -694,10 +837,15 @@ struct SessionTabsView<HostList: View>: View {
         )
         pendingConnections.append(pending)
         tabOrder.append(pendingID)
-        selection = pendingID
+        if let splitAxis, horizontalSizeClass == .regular, selection != nil {
+            splitState.split(with: pendingID, axis: splitAxis)
+        } else {
+            selection = pendingID
+        }
 
-        model.onConnected = { conn, bridge in
-            guard pendingConnections.contains(where: { $0.id == pendingID }) else {
+        model.onConnected = { [weak model] conn, bridge in
+            defer { model?.onConnected = nil }
+            guard let model, pendingConnections.contains(where: { $0.id == pendingID }) else {
                 Task { await conn.close() }
                 return
             }
@@ -732,6 +880,9 @@ struct SessionTabsView<HostList: View>: View {
         if selection == pendingID {
             selection = liveID
         }
+        if splitState.secondarySessionID == pendingID {
+            splitState.secondarySessionID = liveID
+        }
         if lastSelectedID == pendingID {
             lastSelectedID = liveID
         }
@@ -747,9 +898,13 @@ struct SessionTabsView<HostList: View>: View {
         if selection == pendingID {
             selection = tabOrder.last
         }
+        if splitState.secondarySessionID == pendingID {
+            splitState.closeSplit()
+        }
         if lastSelectedID == pendingID {
             lastSelectedID = nil
         }
+        reconcileSplitState()
     }
 
     private func requestCloseLive(_ live: LiveSession) {
@@ -764,6 +919,11 @@ struct SessionTabsView<HostList: View>: View {
 
     func addTab(_ id: UUID) {
         guard manager.session(id: id) != nil else { return }
+        if horizontalSizeClass == .regular, splitState.secondarySessionID == id, selectedLive != nil {
+            splitState.focusedPane = .secondary
+            manager.session(id: id)?.shouldAutoFocus = true
+            return
+        }
         manager.show(id, in: windowID) // moves it out of any other window
         if !tabOrder.contains(id) { tabOrder.append(id) }
         selection = id
@@ -802,9 +962,11 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     private func moveToWindow(_ id: UUID) {
+        manager.session(id: id)?.hasModalSheetPresented = false
         manager.detach(id)
         tabOrder.removeAll { $0 == id }
         if selection == id { selection = tabOrder.last }
+        if splitState.secondarySessionID == id { splitState.closeSplit() }
         if lastSelectedID == id { lastSelectedID = nil }
         openWindow(value: id)
     }
@@ -816,12 +978,12 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     fileprivate func closeCurrent() {
-        guard let s = selection else { return }
-        if let live = windowLiveSessions.first(where: { $0.id == s }) {
+        guard let targetID = focusedTabID ?? selection else { return }
+        if let live = windowLiveSessions.first(where: { $0.id == targetID }) {
             requestCloseLive(live)
-        } else if pendingConnections.contains(where: { $0.id == s }) {
+        } else if pendingConnections.contains(where: { $0.id == targetID }) {
             AppHaptics.impact(.light)
-            cancelPending(s)
+            cancelPending(targetID)
         }
     }
 
@@ -850,7 +1012,8 @@ struct SessionTabsView<HostList: View>: View {
               !switching,
               closingTab == nil,
               inspectingSecurity == nil,
-              let live = selectedLive,
+              splitPickerRequest == nil,
+              let live = focusedLive,
               let sheet = SessionToolSheet.gitDiff(for: live, isProUnlocked: proStore.isProUnlocked) else {
             return
         }
@@ -863,7 +1026,8 @@ struct SessionTabsView<HostList: View>: View {
               !switching,
               closingTab == nil,
               inspectingSecurity == nil,
-              let live = selectedLive,
+              splitPickerRequest == nil,
+              let live = focusedLive,
               let sheet = SessionToolSheet.devServerPreview(for: live, isProUnlocked: proStore.isProUnlocked) else {
             return
         }
@@ -871,9 +1035,397 @@ struct SessionTabsView<HostList: View>: View {
         activeToolSheet = sheet
     }
 
+    // MARK: - iPad Split Panes
+
+    private var splitMenuButton: some View {
+        Menu {
+            if isSplitVisible {
+                Button {
+                    AppHaptics.impact(.light)
+                    splitState.toggleAxis()
+                } label: {
+                    Label(
+                        splitState.axis == .horizontal ? "Switch to Top & Bottom" : "Switch to Side-by-Side",
+                        systemImage: splitState.axis == .horizontal ? "rectangle.split.1x2" : "rectangle.split.2x1"
+                    )
+                }
+
+                Button("Swap Panes", systemImage: "arrow.left.arrow.right") {
+                    AppHaptics.impact(.light)
+                    var primaryID = selection
+                    splitState.swap(primary: &primaryID)
+                    selection = primaryID
+                }
+
+                Button("Switch Focus", systemImage: "scope") {
+                    toggleSplitFocus()
+                }
+
+                Button("Change Secondary Pane…", systemImage: "plus.rectangle.on.rectangle") {
+                    AppHaptics.impact(.light)
+                    splitPickerRequest = SplitPickerRequest(axis: splitState.axis)
+                }
+
+                Divider()
+
+                Button("Close Split", systemImage: "xmark.rectangle") {
+                    AppHaptics.impact(.light)
+                    splitState.closeSplit()
+                }
+            } else {
+                Button("Split Right", systemImage: "rectangle.split.2x1") {
+                    triggerSplit(axis: .horizontal, allowCycleWhenSplit: false)
+                }
+
+                Button("Split Down", systemImage: "rectangle.split.1x2") {
+                    triggerSplit(axis: .vertical, allowCycleWhenSplit: false)
+                }
+
+                Divider()
+
+                Button("Pick Session or Host…", systemImage: "plus.rectangle.on.rectangle") {
+                    AppHaptics.impact(.light)
+                    splitPickerRequest = SplitPickerRequest(axis: .horizontal)
+                }
+            }
+        } label: {
+            Image(systemName: "rectangle.split.2x1")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(isSplitVisible ? theme.accentColor : theme.foregroundColor)
+                .minTapTarget()
+        }
+        .accessibilityLabel(isSplitVisible ? "Split Pane Options" : "Split Pane")
+    }
+
+    @ViewBuilder
+    private func splitWorkspace(primary: LiveSession) -> some View {
+        GeometryReader { proxy in
+            let dividerThickness = DraggableSplitDivider.thickness
+            let totalLength = splitState.axis == .horizontal ? proxy.size.width : proxy.size.height
+            let availableLength = max(0, totalLength - dividerThickness)
+            let primaryLength = availableLength * splitState.ratio
+            let secondaryLength = max(0, availableLength - primaryLength)
+
+            if splitState.axis == .horizontal {
+                HStack(spacing: 0) {
+                    primarySplitPane(primary)
+                        .frame(width: primaryLength, height: proxy.size.height)
+
+                    DraggableSplitDivider(
+                        axis: .horizontal,
+                        ratio: $splitState.ratio,
+                        totalLength: proxy.size.width,
+                        theme: theme
+                    )
+
+                    secondarySplitPane()
+                        .frame(width: secondaryLength, height: proxy.size.height)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    primarySplitPane(primary)
+                        .frame(width: proxy.size.width, height: primaryLength)
+
+                    DraggableSplitDivider(
+                        axis: .vertical,
+                        ratio: $splitState.ratio,
+                        totalLength: proxy.size.height,
+                        theme: theme
+                    )
+
+                    secondarySplitPane()
+                        .frame(width: proxy.size.width, height: secondaryLength)
+                }
+            }
+        }
+        .padding(4)
+        .background(theme.backgroundColor)
+    }
+
+    private func primarySplitPane(_ primary: LiveSession) -> some View {
+        let isFocused = splitState.focusedPane == .primary
+        return splitPaneContainer(
+            pane: .primary,
+            title: primary.title,
+            status: primary.connectionStatus,
+            agentContext: primary.aiAgentContext,
+            agentActivity: primary.agentActivityState,
+            isFocused: isFocused
+        ) {
+            TerminalPane(
+                live: primary,
+                isFocusedPane: isFocused,
+                onFocusPane: { focusPane(.primary) },
+                onOpenGitDiff: {
+                    focusPane(.primary)
+                    openGitDiffShortcut()
+                },
+                onOpenDevPreview: {
+                    focusPane(.primary)
+                    openDevServerPreviewShortcut()
+                }
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func secondarySplitPane() -> some View {
+        let isFocused = splitState.focusedPane == .secondary
+        if let secondary = secondaryLive {
+            splitPaneContainer(
+                pane: .secondary,
+                title: secondary.title,
+                status: secondary.connectionStatus,
+                agentContext: secondary.aiAgentContext,
+                agentActivity: secondary.agentActivityState,
+                isFocused: isFocused
+            ) {
+                TerminalPane(
+                    live: secondary,
+                    isFocusedPane: isFocused,
+                    onFocusPane: { focusPane(.secondary) },
+                    onOpenGitDiff: {
+                        focusPane(.secondary)
+                        openGitDiffShortcut()
+                    },
+                    onOpenDevPreview: {
+                        focusPane(.secondary)
+                        openDevServerPreviewShortcut()
+                    }
+                )
+            }
+        } else if let pending = secondaryPending {
+            let pendingTitle = pending.model.title.isEmpty ? pending.title : pending.model.title
+            splitPaneContainer(
+                pane: .secondary,
+                title: pendingTitle,
+                status: pendingStatus(for: pending.model.phase),
+                agentContext: pending.aiAgentContext,
+                agentActivity: .idle,
+                isFocused: isFocused
+            ) {
+                HostConnectionView(
+                    host: pending.host,
+                    model: pending.model,
+                    onConnected: { _ in },
+                    onCancel: { cancelPending(pending.id) }
+                )
+                .id(pending.id)
+            }
+        }
+    }
+
+    private func splitPaneContainer<Content: View>(
+        pane: SplitPaneState.SplitFocus,
+        title: String,
+        status: LiveSession.ConnectionStatus,
+        agentContext: AIAgentLaunchContext?,
+        agentActivity: AgentActivityState,
+        isFocused: Bool,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        let cornerRadius: CGFloat = 6
+        return VStack(spacing: 0) {
+            splitPaneHeader(
+                pane: pane,
+                title: title,
+                status: status,
+                agentContext: agentContext,
+                agentActivity: agentActivity,
+                isFocused: isFocused
+            )
+
+            content()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .strokeBorder(
+                    isFocused ? theme.accentColor.opacity(0.85) : palette.borderSubtle,
+                    lineWidth: isFocused ? 1.5 : 1
+                )
+                .allowsHitTesting(false)
+        }
+        .simultaneousGesture(
+            TapGesture().onEnded {
+                focusPane(pane)
+            }
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityValue(isFocused ? "Focused pane" : "Inactive pane")
+    }
+
+    private func splitPaneHeader(
+        pane: SplitPaneState.SplitFocus,
+        title: String,
+        status: LiveSession.ConnectionStatus,
+        agentContext: AIAgentLaunchContext?,
+        agentActivity: AgentActivityState,
+        isFocused: Bool
+    ) -> some View {
+        HStack(spacing: 6) {
+            ConnectionStatusDot(status: status, size: 6, glow: isFocused)
+
+            if let ai = agentContext {
+                Image(systemName: AgentVisuals.agentSymbol(for: ai.agent))
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(AgentVisuals.agentTint(for: ai.agent))
+                    .accessibilityHidden(true)
+            }
+
+            Text(title)
+                .font(.caption.weight(isFocused ? .semibold : .medium))
+                .foregroundStyle(isFocused ? theme.foregroundColor : theme.secondaryForegroundColor)
+                .lineLimit(1)
+
+            AgentActivityBadge(state: agentActivity)
+
+            Spacer(minLength: 4)
+
+            Button {
+                AppHaptics.impact(.light)
+                unsplitKeepingOther(closing: pane)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(theme.secondaryForegroundColor)
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close \(title) split pane")
+        }
+        .padding(.leading, 8)
+        .padding(.trailing, 2)
+        .frame(height: 26)
+        .background(
+            isFocused
+                ? theme.accentColor.opacity(theme.isDark ? 0.14 : 0.10)
+                : theme.foregroundColor.opacity(theme.isDark ? 0.04 : 0.03)
+        )
+        .background(theme.backgroundColor)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(palette.hairline)
+                .frame(height: 0.5)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            focusPane(pane)
+        }
+    }
+
+    private func focusPane(_ pane: SplitPaneState.SplitFocus) {
+        if splitState.focusedPane != pane {
+            splitState.focusedPane = pane
+        }
+    }
+
+    private func toggleSplitFocus() {
+        guard isSplitVisible else { return }
+        AppHaptics.impact(.light)
+        splitState.toggleFocus()
+        focusedLive?.shouldAutoFocus = true
+    }
+
+    private func unsplitKeepingOther(closing pane: SplitPaneState.SplitFocus) {
+        if pane == .primary, let secondaryID = splitState.secondarySessionID {
+            selection = secondaryID
+        }
+        splitState.closeSplit()
+    }
+
+    private func triggerSplit(axis: SplitPaneState.SplitAxis, allowCycleWhenSplit: Bool) {
+        guard horizontalSizeClass == .regular, let primary = selectedLive else { return }
+        let candidates = orderedWindowLiveSessions.filter { $0.id != primary.id }
+
+        if isSplitVisible {
+            guard allowCycleWhenSplit else { return }
+            AppHaptics.impact(.light)
+            if splitState.axis != axis {
+                splitState.axis = axis
+                return
+            }
+            if candidates.count > 1,
+               let currentID = splitState.secondarySessionID,
+               let idx = candidates.firstIndex(where: { $0.id == currentID }) {
+                let next = candidates[(idx + 1) % candidates.count]
+                splitState.split(with: next.id, axis: axis)
+                next.shouldAutoFocus = true
+            } else {
+                splitPickerRequest = SplitPickerRequest(axis: axis)
+            }
+            return
+        }
+
+        AppHaptics.impact(.light)
+        if let target = candidates.first {
+            splitState.split(with: target.id, axis: axis)
+            target.shouldAutoFocus = true
+        } else {
+            splitPickerRequest = SplitPickerRequest(axis: axis)
+        }
+    }
+
+    private func splitWithExistingSession(_ sessionID: UUID, axis: SplitPaneState.SplitAxis) {
+        guard horizontalSizeClass == .regular,
+              let primaryID = selection,
+              sessionID != primaryID,
+              manager.session(id: sessionID) != nil else {
+            return
+        }
+        manager.show(sessionID, in: windowID)
+        if !tabOrder.contains(sessionID) {
+            tabOrder.append(sessionID)
+        }
+        splitState.split(with: sessionID, axis: axis)
+        manager.session(id: sessionID)?.shouldAutoFocus = true
+    }
+
+    private func handleBracketShortcut(forward: Bool) {
+        guard horizontalSizeClass == .regular else { return }
+        if isSplitVisible {
+            toggleSplitFocus()
+            return
+        }
+        let entries = tabEntries
+        guard entries.count > 1,
+              let current = selection,
+              let idx = entries.firstIndex(where: { $0.id == current }) else {
+            return
+        }
+        let nextIndex = forward
+            ? (idx + 1) % entries.count
+            : (idx - 1 + entries.count) % entries.count
+        let targetID = entries[nextIndex].id
+        if selection != targetID {
+            AppHaptics.impact(.light)
+            selection = targetID
+        }
+    }
+
+    private func reconcileSplitState() {
+        let validIDs = Set(windowLiveSessions.map(\.id)).union(pendingConnections.map(\.id))
+        splitState.reconcile(primaryID: selection, validIDs: validIDs)
+    }
+
+    private func syncModalPresentationState() {
+        let primaryID = selectedLive?.id
+        let secondaryID = secondaryLive?.id
+        let isModal = isModalOverSelectedTerminal
+        for live in windowLiveSessions {
+            if live.id == primaryID || live.id == secondaryID {
+                live.hasModalSheetPresented = isModal
+            } else if live.hasModalSheetPresented {
+                live.hasModalSheetPresented = false
+            }
+        }
+    }
+
     @ViewBuilder
     private var keyboardShortcutsLayer: some View {
-        let modalFree = activeToolSheet == nil && !switching && closingTab == nil && inspectingSecurity == nil
+        let modalFree = activeToolSheet == nil && !switching && closingTab == nil && inspectingSecurity == nil && splitPickerRequest == nil && !appLock.isLocked
         ZStack {
             if isTerminalActive && modalFree {
                 SessionShortcutButton("Hosts Quick Connect", key: "t", modifiers: .command) {
@@ -895,7 +1447,25 @@ struct SessionTabsView<HostList: View>: View {
                     }
                 }
 
-                if selectedLive != nil {
+                if horizontalSizeClass == .regular && (isSplitVisible || tabEntries.count > 1) {
+                    SessionShortcutButton(isSplitVisible ? "Next Pane" : "Next Tab", key: "]", modifiers: .command) {
+                        handleBracketShortcut(forward: true)
+                    }
+                    SessionShortcutButton(isSplitVisible ? "Previous Pane" : "Previous Tab", key: "[", modifiers: .command) {
+                        handleBracketShortcut(forward: false)
+                    }
+                }
+
+                if horizontalSizeClass == .regular && selectedLive != nil {
+                    SessionShortcutButton("Split Right", key: "d", modifiers: .command) {
+                        triggerSplit(axis: .horizontal, allowCycleWhenSplit: true)
+                    }
+                    SessionShortcutButton("Split Down", key: "e", modifiers: [.command, .shift]) {
+                        triggerSplit(axis: .vertical, allowCycleWhenSplit: true)
+                    }
+                }
+
+                if focusedLive != nil {
                     SessionShortcutButton("Increase Font Size", key: "=", modifiers: .command) {
                         adjustFontSize(by: 1)
                     }

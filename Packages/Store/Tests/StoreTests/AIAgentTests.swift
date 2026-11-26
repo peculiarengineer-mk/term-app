@@ -133,8 +133,12 @@ final class AIAgentTests: XCTestCase {
         XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: ""), "\"$HOME\"")
         XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "~"), "\"$HOME\"")
         XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "~/"), "\"$HOME\"")
+        XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "  ~/  "), "\"$HOME\"")
+        XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "  ~/projects/app"), "\"$HOME\"/'projects/app'")
         XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "~/my projects/term's"), "\"$HOME\"/'my projects/term'\\''s'")
         XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "/srv/app $(evil)"), "'/srv/app $(evil)'")
+        XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "/srv/app\nrm -rf /"), "'/srv/apprm -rf /'")
+        XCTAssertEqual(TMuxSessionHelper.shellPathExpression(for: "~/dir\r\nid"), "\"$HOME\"/'dirid'")
     }
 
     // MARK: - Session Naming
@@ -210,21 +214,56 @@ final class AIAgentTests: XCTestCase {
         )
         XCTAssertTrue(overridden.contains("tmux new-session -A -s 'custom-session-1' -c '/opt/$(evil)'"))
         XCTAssertTrue(overridden.contains("goose session --debug"))
+
+        // Non-tmux fallback wraps agentCmd in `sh -lc '...'` so breakout tokens cannot escape `if ... fi`.
+        let breakoutAttempt = TMuxSessionHelper.launchOrAttachCommand(
+            agent: AIAgentDescriptor(custom: CustomAIAgentPreset(
+                name: "Breakout",
+                command: "echo hi; }; touch /tmp/pwned; if true; then :",
+                defaultArgs: "'"
+            )),
+            workingDirectory: "~/projects/test"
+        )
+        XCTAssertFalse(breakoutAttempt.contains("\n"))
+        XCTAssertFalse(breakoutAttempt.contains("\r"))
+        XCTAssertFalse(breakoutAttempt.contains("&& { "))
+        XCTAssertTrue(breakoutAttempt.contains("&& sh -lc '"))
+
+        #if os(macOS)
+        for shellPath in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: shellPath)
+            process.arguments = ["-n", "-c", breakoutAttempt]
+            try process.run()
+            process.waitUntilExit()
+            XCTAssertEqual(process.terminationStatus, 0, "\(shellPath) -n failed on breakoutAttempt")
+        }
+        #endif
     }
 
     func testAttachKillAndListCommands() {
         XCTAssertTrue(
             TMuxSessionHelper.attachCommand(sessionName: "termapp-ai-claude-app")
-                .contains("tmux attach-session -t 'termapp-ai-claude-app'")
+                .contains("tmux attach-session -t '=termapp-ai-claude-app'")
         )
         XCTAssertTrue(
             TMuxSessionHelper.attachCommand(sessionName: "odd'name")
-                .contains("tmux attach-session -t 'odd'\\''name'")
+                .contains("tmux attach-session -t '=odd'\\''name'")
         )
         XCTAssertTrue(
             TMuxSessionHelper.killSessionCommand(sessionName: "termapp-ai-agy-repo")
-                .contains("tmux kill-session -t 'termapp-ai-agy-repo'")
+                .contains("tmux kill-session -t '=termapp-ai-agy-repo'")
         )
+
+        let injectedAttach = TMuxSessionHelper.attachCommand(sessionName: "sess\r\nrm -rf /")
+        XCTAssertFalse(injectedAttach.contains("\n"))
+        XCTAssertFalse(injectedAttach.contains("\r"))
+        XCTAssertTrue(injectedAttach.contains("tmux attach-session -t '=sessrm -rf /'"))
+
+        let injectedKill = TMuxSessionHelper.killSessionCommand(sessionName: "sess\nkillall tmux")
+        XCTAssertFalse(injectedKill.contains("\n"))
+        XCTAssertFalse(injectedKill.contains("\r"))
+        XCTAssertTrue(injectedKill.contains("tmux kill-session -t '=sesskillall tmux'"))
 
         let listCmd = TMuxSessionHelper.listSessionsCommand()
         XCTAssertFalse(listCmd.contains("\n"))
@@ -386,10 +425,12 @@ final class AIAgentTests: XCTestCase {
         XCTAssertFalse(cmd.contains("\n"))
         XCTAssertFalse(cmd.contains("\r"))
         XCTAssertTrue(cmd.contains("export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\""))
-        XCTAssertTrue(cmd.contains("if command -v tmux >/dev/null 2>&1; then tmux attach-session -t 'termapp-ai-claude-app'; fi"))
+        XCTAssertTrue(cmd.contains("if command -v tmux >/dev/null 2>&1; then tmux attach-session -t '=termapp-ai-claude-app'; fi"))
 
-        let odd = TMuxSessionHelper.safeAttachCommand(sessionName: "odd'name$(id)")
-        XCTAssertTrue(odd.contains("if command -v tmux >/dev/null 2>&1; then tmux attach-session -t 'odd'\\''name$(id)'; fi"))
+        let odd = TMuxSessionHelper.safeAttachCommand(sessionName: "odd'name$(id)\r\nid")
+        XCTAssertFalse(odd.contains("\n"))
+        XCTAssertFalse(odd.contains("\r"))
+        XCTAssertTrue(odd.contains("if command -v tmux >/dev/null 2>&1; then tmux attach-session -t '=odd'\\''name$(id)id'; fi"))
     }
 
     // MARK: - Output Parsing

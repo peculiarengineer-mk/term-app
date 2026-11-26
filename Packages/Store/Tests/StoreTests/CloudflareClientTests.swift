@@ -106,10 +106,21 @@ final class CloudflareClientTests: XCTestCase {
         return data
     }
 
-    private static func assertStandardHeaders(_ request: URLRequest, token: String = "cf-test-token", file: StaticString = #filePath, line: UInt = #line) {
+    private static func assertStandardHeaders(
+        _ request: URLRequest,
+        token: String = "cf-test-token",
+        expectContentType: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(token)", file: file, line: line)
-        XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json", file: file, line: line)
+        if expectContentType {
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Content-Type"), "application/json", file: file, line: line)
+        } else {
+            XCTAssertNil(request.value(forHTTPHeaderField: "Content-Type"), file: file, line: line)
+        }
         XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json", file: file, line: line)
+        XCTAssertEqual(request.timeoutInterval, 30, file: file, line: line)
     }
 
     // MARK: - Mock Keychain Storage for Deterministic Token Store Tests
@@ -123,6 +134,7 @@ final class CloudflareClientTests: XCTestCase {
         private let lock = NSLock()
         private var entries: [String: Entry] = [:]
         var savedSynchronizableFlags: [Bool] = []
+        var readError: Error?
 
         private func key(_ service: String, _ account: String) -> String {
             "\(service)|\(account)"
@@ -138,12 +150,14 @@ final class CloudflareClientTests: XCTestCase {
         func read(service: String, account: String) throws -> Data? {
             lock.lock()
             defer { lock.unlock() }
+            if let readError { throw readError }
             return entries[key(service, account)]?.data
         }
 
         func read(service: String, account: String, synchronizable: Bool) throws -> Data? {
             lock.lock()
             defer { lock.unlock() }
+            if let readError { throw readError }
             guard let entry = entries[key(service, account)], entry.synchronizable == synchronizable else {
                 return nil
             }
@@ -158,6 +172,24 @@ final class CloudflareClientTests: XCTestCase {
                 guard parts.count == 2, String(parts[0]) == service else { return nil }
                 return (String(parts[1]), entry.data, entry.synchronizable)
             }
+        }
+
+        func accountExists(service: String, account: String, synchronizable: Bool?) throws -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let entry = entries[key(service, account)] else { return false }
+            if let synchronizable { return entry.synchronizable == synchronizable }
+            return true
+        }
+
+        func listAccounts(service: String) throws -> Set<String> {
+            lock.lock()
+            defer { lock.unlock() }
+            return Set(entries.keys.compactMap { k in
+                let parts = k.split(separator: "|", maxSplits: 1)
+                guard parts.count == 2, String(parts[0]) == service else { return nil }
+                return String(parts[1])
+            })
         }
 
         func delete(service: String, account: String) throws {
@@ -192,20 +224,43 @@ final class CloudflareClientTests: XCTestCase {
         XCTAssertThrowsError(try CloudflareTokenStore.save("   \n\t ", storage: mockStorage)) { error in
             XCTAssertEqual(error as? CloudflareError, .missingToken)
         }
+        for badToken in ["cf token", "cf\r\ntoken", "cf\0token", "cf\ttoken"] {
+            XCTAssertThrowsError(try CloudflareTokenStore.save(badToken, storage: mockStorage)) { error in
+                XCTAssertEqual(error as? CloudflareError, .invalidToken)
+            }
+        }
         XCTAssertTrue(mockStorage.savedSynchronizableFlags.isEmpty)
         XCTAssertNil(CloudflareTokenStore.read(storage: mockStorage))
+        XCTAssertNil(try CloudflareTokenStore.readToken(storage: mockStorage))
 
         try CloudflareTokenStore.save("  cf_live_token_123 \n", storage: mockStorage)
         XCTAssertEqual(mockStorage.savedSynchronizableFlags, [false])
         XCTAssertEqual(CloudflareTokenStore.read(storage: mockStorage), "cf_live_token_123")
+        XCTAssertEqual(try CloudflareTokenStore.readToken(storage: mockStorage), "cf_live_token_123")
+
+        // Corrupt UTF-8 throws errSecDecode from readToken, while read returns nil.
+        try mockStorage.save(Data([0xFF, 0xFE]), service: CloudflareTokenStore.service, account: CloudflareTokenStore.account, synchronizable: false)
+        XCTAssertThrowsError(try CloudflareTokenStore.readToken(storage: mockStorage)) { error in
+            XCTAssertEqual(error as? KeychainError, KeychainError(status: errSecDecode))
+        }
+        XCTAssertNil(CloudflareTokenStore.read(storage: mockStorage))
+
+        // Keychain error propagates from readToken while read returns nil.
+        mockStorage.readError = KeychainError(status: errSecIO)
+        XCTAssertThrowsError(try CloudflareTokenStore.readToken(storage: mockStorage)) { error in
+            XCTAssertEqual(error as? KeychainError, KeychainError(status: errSecIO))
+        }
+        XCTAssertNil(CloudflareTokenStore.read(storage: mockStorage))
+        mockStorage.readError = nil
 
         // Never returns a synchronizable item even if one somehow existed.
         try mockStorage.save(Data("synced_copy".utf8), service: CloudflareTokenStore.service, account: CloudflareTokenStore.account, synchronizable: true)
         XCTAssertNil(CloudflareTokenStore.read(storage: mockStorage))
+        XCTAssertNil(try CloudflareTokenStore.readToken(storage: mockStorage))
 
         try CloudflareTokenStore.save("local_replacement", storage: mockStorage)
         XCTAssertEqual(CloudflareTokenStore.read(storage: mockStorage), "local_replacement")
-        XCTAssertEqual(mockStorage.savedSynchronizableFlags, [false, true, false])
+        XCTAssertEqual(mockStorage.savedSynchronizableFlags, [false, false, true, false])
 
         try CloudflareTokenStore.delete(storage: mockStorage)
         XCTAssertNil(CloudflareTokenStore.read(storage: mockStorage))
@@ -414,7 +469,7 @@ final class CloudflareClientTests: XCTestCase {
 
     func testCreateAndUpdateDNSRecordSendExactJSONBody() async throws {
         let (client, cleanup) = makeStubClient { request in
-            Self.assertStandardHeaders(request)
+            Self.assertStandardHeaders(request, expectContentType: true)
             let bodyData = try XCTUnwrap(Self.readBody(from: request))
             let jsonObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
 
@@ -608,13 +663,25 @@ final class CloudflareClientTests: XCTestCase {
             XCTAssertEqual(error, .unauthorized)
         }
 
-        // 403 -> .unauthorized
+        // 403 with Cloudflare errors array -> surfaces .apiError instead of discarding
         let (forbiddenClient, cleanupForbidden) = makeStubClient { _ in
             (403, Data(#"{"success":false,"errors":[{"code":9109,"message":"Forbidden"}]}"#.utf8))
         }
         defer { cleanupForbidden() }
         do {
             _ = try await forbiddenClient.listZones()
+            XCTFail("Expected .apiError")
+        } catch let error as CloudflareError {
+            XCTAssertEqual(error, .apiError("Forbidden"))
+        }
+
+        // 403 without errors array -> .unauthorized
+        let (bareForbiddenClient, cleanupBareForbidden) = makeStubClient { _ in
+            (403, Data(#"{"success":false,"errors":[]}"#.utf8))
+        }
+        defer { cleanupBareForbidden() }
+        do {
+            _ = try await bareForbiddenClient.listZones()
             XCTFail("Expected .unauthorized")
         } catch let error as CloudflareError {
             XCTAssertEqual(error, .unauthorized)
@@ -720,5 +787,108 @@ final class CloudflareClientTests: XCTestCase {
         let rule = CFTunnelIngressRule(hostname: "ssh.example.com", service: "ssh://localhost:22", path: "/ssh")
         XCTAssertEqual(try decoder.decode(CFTunnelIngressRule.self, from: encoder.encode(rule)), rule)
         XCTAssertEqual(rule.id, "ssh.example.com|/ssh|ssh://localhost:22")
+    }
+
+    func testPathTraversalRejectionInvalidTokenPaginationAndCancellation() async throws {
+        // Path segment traversal & whitespace/control rejection without network calls.
+        let (guardClient, cleanupGuard) = makeStubClient { _ in
+            XCTFail("Network should not be called for invalid path segments or invalid token")
+            return (500, Data())
+        }
+        defer { cleanupGuard() }
+
+        for badSegment in ["", ".", "..", "a/b", "a\\b", "zone id", "zone\nid", "zone\0id"] {
+            do {
+                _ = try await guardClient.listDNSRecords(zoneID: badSegment)
+                XCTFail("Expected .invalidResponse for segment \(badSegment.debugDescription)")
+            } catch let error as CloudflareError {
+                XCTAssertEqual(error, .invalidResponse)
+            }
+        }
+
+        // Token with whitespace/control characters is rejected with .invalidToken.
+        let badTokenClient = CloudflareClient(token: "bad\r\ntoken", session: .shared)
+        do {
+            _ = try await badTokenClient.listAccounts()
+            XCTFail("Expected .invalidToken")
+        } catch let error as CloudflareError {
+            XCTAssertEqual(error, .invalidToken)
+        }
+
+        // Bounded pagination for listAccounts, listZones, listDNSRecords, listTunnels (including 20-page cap).
+        let (pagedClient, cleanupPaged) = makeStubClient { request in
+            let urlStr = request.url?.absoluteString ?? ""
+            let comps = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)!
+            let pageParam = comps.queryItems?.first(where: { $0.name == "page" })?.value
+            let page = Int(pageParam ?? "1") ?? 1
+            if page == 1 {
+                XCTAssertNil(pageParam)
+            }
+            let path = comps.path
+
+            if path.hasSuffix("/accounts") {
+                let json = """
+                {"success":true,"errors":[],"result":[{"id":"acc-\(page)","name":"Acc \(page)"}],"result_info":{"page":\(page),"total_pages":3}}
+                """
+                return (200, Data(json.utf8))
+            } else if path.hasSuffix("/zones") {
+                let json = """
+                {"success":true,"errors":[],"result":[{"id":"z-\(page)","name":"z\(page).com","status":"active"}],"result_info":{"page":\(page),"total_pages":50}}
+                """
+                return (200, Data(json.utf8))
+            } else if path.hasSuffix("/dns_records") {
+                let json = """
+                {"success":true,"errors":[],"result":[{"id":"r-\(page)","type":"A","name":"a\(page).z.com","content":"1.1.1.\(page)"}],"result_info":{"page":\(page),"total_pages":2}}
+                """
+                return (200, Data(json.utf8))
+            } else if path.hasSuffix("/cfd_tunnel") {
+                let json = """
+                {"success":true,"errors":[],"result":[{"id":"t-\(page)","name":"tun\(page)","status":"healthy"}],"result_info":{"page":\(page),"total_pages":2}}
+                """
+                return (200, Data(json.utf8))
+            }
+            XCTFail("Unexpected path \(urlStr)")
+            return (404, Data())
+        }
+        defer { cleanupPaged() }
+
+        let accounts = try await pagedClient.listAccounts()
+        XCTAssertEqual(accounts.map(\.id), ["acc-1", "acc-2", "acc-3"])
+
+        let zones = try await pagedClient.listZones()
+        XCTAssertEqual(zones.count, 20)
+        XCTAssertEqual(zones.first?.id, "z-1")
+        XCTAssertEqual(zones.last?.id, "z-20")
+
+        let records = try await pagedClient.listDNSRecords(zoneID: "z-1")
+        XCTAssertEqual(records.map(\.id), ["r-1", "r-2"])
+        XCTAssertTrue(records.allSatisfy { $0.zoneID == "z-1" })
+
+        let tunnels = try await pagedClient.listTunnels(accountID: "acc-1")
+        XCTAssertEqual(tunnels.map(\.id), ["t-1", "t-2"])
+
+        // URLError(.cancelled) maps to CancellationError rather than CloudflareError.networkError.
+        let (cancelledClient, cleanupCancelled) = makeStubClient { _ in
+            throw URLError(.cancelled)
+        }
+        defer { cleanupCancelled() }
+        do {
+            _ = try await cancelledClient.listAccounts()
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // Expected
+        }
+
+        // Pre-cancelled Task throws CancellationError immediately.
+        let task = Task {
+            try await cancelledClient.listAccounts()
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected CancellationError")
+        } catch is CancellationError {
+            // Expected
+        }
     }
 }

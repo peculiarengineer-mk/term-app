@@ -165,4 +165,23 @@ enum SFTPUtil {
             return .ioFailed("\(context) (SFTP status \(status))")
         }
     }
+
+    static func uploadOpenFlags(exclusive: Bool) -> UInt {
+        var flags = UInt(LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC)
+        if exclusive {
+            flags |= UInt(LIBSSH2_FXF_EXCL)
+        }
+        return flags
+    }
+
+    static func sftpLength(byteCount: Int) throws -> UInt32 {
+        guard let len = UInt32(exactly: byteCount) else {
+            throw SFTPError.ioFailed("Remote path exceeds maximum SFTP length")
+        }
+        return len
+    }
+
+    static func pathLength(_ path: String) throws -> UInt32 {
+        try sftpLength(byteCount: path.utf8.count)
+    }
 }

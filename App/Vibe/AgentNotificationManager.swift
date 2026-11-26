@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftUI
 import UIKit
 import UserNotifications
@@ -16,7 +17,11 @@ private final class NotificationCenterDelegateProxy: NSObject, UNUserNotificatio
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        completionHandler([.banner, .sound])
+        if notification.request.identifier.hasPrefix(AgentNotificationManager.requestIdentifierPrefix) {
+            completionHandler([.banner, .sound])
+        } else {
+            completionHandler([])
+        }
     }
 
     func userNotificationCenter(
@@ -41,7 +46,9 @@ private final class NotificationCenterDelegateProxy: NSObject, UNUserNotificatio
 final class AgentNotificationManager {
     static let shared = AgentNotificationManager()
     static let notificationsEnabledKey = "agents.notificationsEnabled"
+    nonisolated static let requestIdentifierPrefix = "termapp.agent."
     nonisolated static let sessionIDKey = "sessionID"
+    private static let logger = Logger(subsystem: "com.peculiarengineer.termapp", category: "notifications")
 
     private let delegateProxy = NotificationCenterDelegateProxy()
     private let notificationCenter: NotificationCenter
@@ -73,8 +80,12 @@ final class AgentNotificationManager {
             defer { self?.isRequestingAuthorization = false }
             let center = UNUserNotificationCenter.current()
             let settings = await center.notificationSettings()
-            guard settings.authorizationStatus == .notDetermined else { return }
-            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+            guard let self, self.isEnabled, settings.authorizationStatus == .notDetermined else { return }
+            do {
+                _ = try await center.requestAuthorization(options: [.alert, .sound, .badge])
+            } catch {
+                Self.logger.error("Notification authorization request failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
@@ -126,13 +137,15 @@ final class AgentNotificationManager {
 
         configureDelegate()
         let idToken = sessionID?.uuidString ?? UUID().uuidString
-        let requestID = "termapp.agent.\(idToken).\(payload.suffix)"
+        let requestID = "\(Self.requestIdentifierPrefix)\(idToken).\(payload.suffix)"
         let sessionIDString = sessionID?.uuidString
 
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
             let center = UNUserNotificationCenter.current()
             let settings = await center.notificationSettings()
-            guard settings.authorizationStatus == .authorized
+            guard let self,
+                  self.isEnabled,
+                  settings.authorizationStatus == .authorized
                     || settings.authorizationStatus == .provisional
                     || settings.authorizationStatus == .ephemeral else {
                 return
@@ -152,7 +165,11 @@ final class AgentNotificationManager {
 
             let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.2, repeats: false)
             let request = UNNotificationRequest(identifier: requestID, content: content, trigger: trigger)
-            try? await center.add(request)
+            do {
+                try await center.add(request)
+            } catch {
+                Self.logger.error("Failed to schedule agent notification \(requestID, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 

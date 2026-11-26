@@ -155,21 +155,30 @@ public enum TMuxSessionHelper {
 
     /// Expands a leading `~` / `~/` safely into `"$HOME"` while single-quoting literal path suffixes.
     public static func shellPathExpression(for path: String) -> String {
-        let cleaned = path
-            .replacingOccurrences(of: "\0", with: "")
-            .trimmingCharacters(in: .newlines)
+        let cleaned = stripControlNewlines(path)
         let trimmed = cleaned.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty || trimmed == "~" || trimmed == "~/" {
             return "\"$HOME\""
         }
-        if cleaned.hasPrefix("~/") {
-            let rest = String(cleaned.dropFirst(2))
+        if trimmed.hasPrefix("~/") {
+            let rest = String(trimmed.dropFirst(2))
             if rest.isEmpty {
                 return "\"$HOME\""
             }
             return "\"$HOME\"/\(shellQuote(rest))"
         }
         return shellQuote(cleaned)
+    }
+
+    private static func stripControlNewlines(_ value: String) -> String {
+        String(value.unicodeScalars.filter { scalar in
+            scalar.value != 0 && !CharacterSet.newlines.contains(scalar)
+        })
+    }
+
+    private static func quotedSessionTarget(_ sessionName: String) -> String {
+        let clean = stripControlNewlines(sessionName)
+        return shellQuote("=\(clean)")
     }
 
     /// Sanitizes an arbitrary string into a lowercase `[a-z0-9-]` slug bounded to `maxLength`.
@@ -264,7 +273,8 @@ public enum TMuxSessionHelper {
 
         let commandParts = [agent.command, agent.defaultArgs, extraArgs]
             .map {
-                $0.replacingOccurrences(of: "\r", with: " ")
+                $0.replacingOccurrences(of: "\0", with: "")
+                    .replacingOccurrences(of: "\r", with: " ")
                     .replacingOccurrences(of: "\n", with: " ")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             }
@@ -278,23 +288,24 @@ public enum TMuxSessionHelper {
         let innerScript =
             "\(innerPathPrefix)\(agentCmd); _st=$?; printf \"\\n[agent exited (%s) - starting shell]\\n\" \"$_st\"; exec \"${SHELL:-sh}\" -l"
         let quotedInnerCmd = shellQuote("sh -lc \(shellQuote(innerScript))")
+        let fallbackScript = "\(innerPathPrefix)\(agentCmd)"
 
         let missingTmuxNotice = shellQuote(
             "tmux is not installed on this host. Install tmux for persistent AI sessions - running directly in this shell."
         )
 
-        return "\(guardedPathExport); if command -v tmux >/dev/null 2>&1; then tmux new-session -A -s \(quotedSession) -c \(dirExpr) \(quotedInnerCmd); else printf '%s\\n' \(missingTmuxNotice); cd -- \(dirExpr) && { \(agentCmd); }; fi"
+        return "\(guardedPathExport); if command -v tmux >/dev/null 2>&1; then tmux new-session -A -s \(quotedSession) -c \(dirExpr) \(quotedInnerCmd); else printf '%s\\n' \(missingTmuxNotice); cd -- \(dirExpr) && sh -lc \(shellQuote(fallbackScript)); fi"
     }
 
     /// Builds a POSIX command to attach to an existing `tmux` session.
     public static func attachCommand(sessionName: String) -> String {
-        let quoted = shellQuote(sessionName)
+        let quoted = quotedSessionTarget(sessionName)
         return "export PATH=\"\(standardPATH):$PATH\"; tmux attach-session -t \(quoted)"
     }
 
     /// Builds a POSIX command to attach to an existing `tmux` session only if `tmux` is installed.
     public static func safeAttachCommand(sessionName: String) -> String {
-        let quoted = shellQuote(sessionName)
+        let quoted = quotedSessionTarget(sessionName)
         return "export PATH=\"\(standardPATH):$PATH\"; if command -v tmux >/dev/null 2>&1; then tmux attach-session -t \(quoted); fi"
     }
 
@@ -362,7 +373,7 @@ public enum TMuxSessionHelper {
 
     /// Builds a POSIX command to kill a specific `tmux` session.
     public static func killSessionCommand(sessionName: String) -> String {
-        let quoted = shellQuote(sessionName)
+        let quoted = quotedSessionTarget(sessionName)
         return "export PATH=\"\(standardPATH):$PATH\"; tmux kill-session -t \(quoted)"
     }
 

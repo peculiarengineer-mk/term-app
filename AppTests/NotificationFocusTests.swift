@@ -48,9 +48,9 @@ final class NotificationFocusTests: XCTestCase {
         XCTAssertNil(manager.pendingFocusSessionID)
     }
 
-    func testAppLockManagerLockAndDisableResetsAuthenticationState() {
+    func testAppLockManagerLockAndDisableResetsAuthenticationState() throws {
         let suiteName = "com.peculiarengineer.termapp.tests.applock.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
 
         defaults.set(true, forKey: AppLockManager.defaultsKey)

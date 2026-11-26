@@ -10,7 +10,21 @@ OPENSSL_URL="https://github.com/openssl/openssl/releases/download/openssl-${OPEN
 LIBSSH2_COMMIT="dd1546700d0ed8ff7138bc1ccc288286fb3ab2b4"
 LIBSSH2_SHA256="67d20d434055faef76439c6829ab253c892fcdd68d9a9c86cf5824bd8366e6eb"
 LIBSSH2_URL="https://github.com/libssh2/libssh2/archive/${LIBSSH2_COMMIT}.tar.gz"
-CMAKE="${CMAKE:-$(command -v cmake || echo /usr/local/bin/cmake)}"
+if [ -z "${CMAKE:-}" ]; then
+  if command -v cmake >/dev/null 2>&1; then
+    CMAKE="$(command -v cmake)"
+  elif [ -x /opt/homebrew/bin/cmake ]; then
+    CMAKE="/opt/homebrew/bin/cmake"
+  elif [ -x /usr/local/bin/cmake ]; then
+    CMAKE="/usr/local/bin/cmake"
+  else
+    CMAKE=""
+  fi
+fi
+if [ -z "$CMAKE" ] || [ ! -x "$CMAKE" ]; then
+  echo "error: cmake not found or not executable (checked PATH, /opt/homebrew/bin/cmake, /usr/local/bin/cmake)" >&2
+  exit 1
+fi
 MIN_IOS="18.0"
 # Keep host settings out of the cross build: no macOS deployment target, no pkg-config probing of Homebrew.
 unset MACOSX_DEPLOYMENT_TARGET
@@ -53,6 +67,7 @@ build_one() {
   tar -xzf "$WORK/src/libssh2.tar.gz" -C "$dir/src-ssh2" --strip-components=1
   ( cd "$dir/src-ssh2"
     "$CMAKE" -S . -B build -DCMAKE_INSTALL_PREFIX="$prefix" -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_SYSTEM_NAME=iOS \
       -DCMAKE_C_COMPILER="$cc" -DCMAKE_C_FLAGS="$cflags" \
       -DCMAKE_OSX_SYSROOT="$sysroot" -DCMAKE_OSX_ARCHITECTURES="$arch" \
       -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
