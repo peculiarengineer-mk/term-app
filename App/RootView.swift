@@ -1,3 +1,4 @@
+import Store
 import SwiftUI
 import TermUI
 
@@ -40,7 +41,10 @@ struct RootView: View {
     private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
 
     var body: some View {
-        SessionTabsView(onFocusHosts: { selectedTab = .hosts }) { activeSessionPill in // wiring: T8
+        SessionTabsView(
+            onFocusHosts: { selectedTab = .hosts },
+            onFocusAgents: { selectedTab = .agents }
+        ) { activeSessionPill in // wiring: T8
             TabView(selection: $selectedTab) {
                 Tab(AppTab.hosts.title, systemImage: AppTab.hosts.systemImage, value: AppTab.hosts) {
                     tabContent(activeSessionPill: activeSessionPill) {
@@ -92,6 +96,11 @@ struct RootView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("TermAppReplayOnboarding"))) { _ in
             showingWelcome = true
+        }
+        .onOpenURL { url in
+            if let link = TermAppDeepLink.parse(url) {
+                DeepLinkRouter.shared.enqueue(link)
+            }
         }
         .sheet(isPresented: $showingWelcome, onDismiss: {
             onboardingCompleted = true

@@ -128,8 +128,32 @@ struct HostListView: View {
     @State private var deletingHost: Host?
     @State private var deleteError: String?
 
+    private struct HostSyncSignature: Equatable {
+        let id: UUID
+        let label: String
+        let hostname: String
+        let username: String
+        let tags: [String]
+        let source: String
+        let updatedAt: Date
+    }
+
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
     private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
+
+    private var hostSyncSignature: [HostSyncSignature] {
+        hosts.map {
+            HostSyncSignature(
+                id: $0.id,
+                label: $0.label,
+                hostname: $0.hostname,
+                username: $0.username,
+                tags: $0.tags,
+                source: $0.source,
+                updatedAt: $0.updatedAt
+            )
+        }
+    }
 
     private var quickConnectTarget: QuickConnectTarget? {
         QuickConnectTarget.parse(search)
@@ -289,6 +313,12 @@ struct HostListView: View {
             if let selectedTag, !tags.contains(selectedTag) {
                 self.selectedTag = nil
             }
+        }
+        .onAppear {
+            WidgetSyncCoordinator.syncHosts(hosts)
+        }
+        .onChange(of: hostSyncSignature) { _, _ in
+            WidgetSyncCoordinator.syncHosts(hosts)
         }
     }
 
@@ -601,6 +631,8 @@ struct HostListView: View {
         PortForwardStore.deleteAll(for: hostID)
         HostProjectStore.deleteAll(for: hostID)
         AISessionCacheStore.removeAll(for: hostID, defaults: manager.cacheDefaults)
+        WidgetSyncCoordinator.removeHostMetadata(for: hostID)
+        WidgetSyncCoordinator.syncHosts(hosts.filter { $0.id != hostID })
         manager.noteCacheChanged()
         do {
             try HostSecrets.tryDeletePassword(for: hostID)

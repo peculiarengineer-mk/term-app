@@ -8,6 +8,7 @@ struct TermApp: App {
 
     init() {
         AgentNotificationManager.shared.configureDelegate()
+        AgentLiveActivityManager.shared.endStaleActivities(keeping: [])
         let coordinator = SyncCoordinator(modelContainer: container) // wiring: T10
         sync = coordinator // wiring: T10
         Task { await coordinator.start() } // wiring: T10

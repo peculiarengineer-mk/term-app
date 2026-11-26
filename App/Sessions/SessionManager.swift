@@ -125,6 +125,9 @@ final class LiveSession: Identifiable {
                     agentActivityState = .idle
                 }
             }
+            if oldValue != connectionStatus, aiAgentContext != nil {
+                onAgentActivityStateChanged?()
+            }
         }
     }
     /// Drawn over the terminal by whichever tab shows this session (T9 uses it for the Reconnect prompt).
@@ -163,11 +166,21 @@ final class LiveSession: Identifiable {
     /// Live AI agent execution state inferred from terminal output and user input.
     var agentActivityState: AgentActivityState = .idle {
         didSet {
-            if case .running = agentActivityState { return }
+            if case .running = agentActivityState {
+                if oldValue != agentActivityState {
+                    onAgentActivityStateChanged?()
+                }
+                return
+            }
             completionDebounceTask?.cancel()
             completionDebounceTask = nil
+            if oldValue != agentActivityState {
+                onAgentActivityStateChanged?()
+            }
         }
     }
+
+    @ObservationIgnored var onAgentActivityStateChanged: (() -> Void)?
 
     @ObservationIgnored private var outputTailData = Data()
     @ObservationIgnored nonisolated(unsafe) private var completionDebounceTask: Task<Void, Never>?
@@ -457,10 +470,12 @@ final class SessionManager {
     private(set) var pendingNewTabRequestID: UUID?
     private(set) var cacheRevision: Int = 0
     let cacheDefaults: UserDefaults
+    let widgetDefaults: UserDefaults?
     var onSessionsChanged: (() -> Void)?
 
-    init(cacheDefaults: UserDefaults = .standard) {
+    init(cacheDefaults: UserDefaults = .standard, widgetDefaults: UserDefaults? = nil) {
         self.cacheDefaults = cacheDefaults
+        self.widgetDefaults = widgetDefaults ?? (cacheDefaults === UserDefaults.standard ? WidgetSnapshotStore.sharedDefaults() : nil)
     }
 
     /// Most recently seen cached AI `tmux` session that was still open when the app last ran.
@@ -471,6 +486,7 @@ final class SessionManager {
 
     func noteCacheChanged() {
         cacheRevision &+= 1
+        syncAgentWidgets()
     }
 
     func session(id: UUID) -> LiveSession? { sessions.first { $0.id == id } }
@@ -503,6 +519,13 @@ final class SessionManager {
             isTmuxBacked: isTmuxBacked
         )
         sessions.append(live)
+        live.onAgentActivityStateChanged = { [weak self, weak live] in
+            guard let self, let live else { return }
+            self.handleAgentActivityStateChanged(for: live)
+        }
+        if ephemeralHost == nil, let widgetDefaults {
+            WidgetSyncCoordinator.recordHostConnected(hostID: hostID, defaults: widgetDefaults)
+        }
         if let ctx = live.aiAgentContext {
             AgentNotificationManager.shared.requestAuthorizationIfNeeded()
             if live.isTmuxBacked {
@@ -510,6 +533,10 @@ final class SessionManager {
                 AISessionCacheStore.upsert(cached, defaults: cacheDefaults)
                 cacheRevision &+= 1
             }
+            if widgetDefaults != nil {
+                AgentLiveActivityManager.shared.startOrUpdate(for: live)
+            }
+            syncAgentWidgets()
         }
         if algorithms == nil { loadAlgorithms(for: live, from: session) }
         startAutoPortForwards(for: live, on: session)
@@ -553,6 +580,9 @@ final class SessionManager {
             return false
         }
         live.ephemeralHost = nil
+        if let widgetDefaults {
+            WidgetSyncCoordinator.recordHostConnected(hostID: host.id, defaults: widgetDefaults)
+        }
         AppHaptics.notify(.success)
         return true
     }
@@ -613,6 +643,8 @@ final class SessionManager {
     func close(_ id: UUID) {
         guard let i = sessions.firstIndex(where: { $0.id == id }) else { return }
         let live = sessions.remove(at: i)
+        live.onAgentActivityStateChanged = nil
+        let hadAIContext = live.aiAgentContext != nil
         if let ctx = live.aiAgentContext {
             AISessionCacheStore.markOpenInApp(
                 false,
@@ -622,12 +654,35 @@ final class SessionManager {
             )
             cacheRevision &+= 1
         }
+        if hadAIContext {
+            if widgetDefaults != nil {
+                AgentLiveActivityManager.shared.end(sessionID: live.id)
+            }
+            syncAgentWidgets()
+        }
         live.autoPortForwardsTask?.cancel()
         live.autoPortForwardsTask = nil
         live.cleanupActivityTracking()
         onSessionsChanged?()
         let session = live.session
         Task { await session.close() }
+    }
+
+    private func handleAgentActivityStateChanged(for live: LiveSession) {
+        guard live.aiAgentContext != nil else { return }
+        if widgetDefaults != nil {
+            AgentLiveActivityManager.shared.startOrUpdate(for: live)
+        }
+        syncAgentWidgets()
+    }
+
+    private func syncAgentWidgets() {
+        guard let widgetDefaults else { return }
+        WidgetSyncCoordinator.syncAgents(
+            liveSessions: sessions,
+            cacheDefaults: cacheDefaults,
+            widgetDefaults: widgetDefaults
+        )
     }
 
     private static func makeCachedAISession(

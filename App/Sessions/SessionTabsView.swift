@@ -305,6 +305,7 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     let onFocusHosts: () -> Void
+    let onFocusAgents: () -> Void
     @ViewBuilder let hostList: (ActiveSessionPill?) -> HostList
     @Environment(\.modelContext) private var modelContext
     @Environment(SessionManager.self) private var manager
@@ -319,9 +320,11 @@ struct SessionTabsView<HostList: View>: View {
 
     init(
         onFocusHosts: @escaping () -> Void = {},
+        onFocusAgents: @escaping () -> Void = {},
         @ViewBuilder hostList: @escaping (ActiveSessionPill?) -> HostList
     ) {
         self.onFocusHosts = onFocusHosts
+        self.onFocusAgents = onFocusAgents
         self.hostList = hostList
     }
     /// Lives as long as this view. If iOS rebuilds a disconnected scene, its sessions stay open and
@@ -681,6 +684,7 @@ struct SessionTabsView<HostList: View>: View {
                 reconcileSplitState()
                 syncModalPresentationState()
                 consumeAndFocusPendingAgentSessionIfUnlocked()
+                consumePendingDeepLinkIfUnlocked()
                 consumePendingMergeBackIfNeeded()
                 consumePendingNewTabIfNeeded()
             }
@@ -698,7 +702,11 @@ struct SessionTabsView<HostList: View>: View {
             .onChange(of: appLock.isLocked) { _, isLocked in
                 if !isLocked {
                     consumeAndFocusPendingAgentSessionIfUnlocked()
+                    consumePendingDeepLinkIfUnlocked()
                 }
+            }
+            .onChange(of: DeepLinkRouter.shared.pendingLink) { _, _ in
+                consumePendingDeepLinkIfUnlocked()
             }
             .onReceive(NotificationCenter.default.publisher(for: .termFocusAgentSession)) { note in
                 if let id = note.userInfo?[AgentNotificationManager.sessionIDKey] as? UUID {
@@ -1162,6 +1170,149 @@ struct SessionTabsView<HostList: View>: View {
             return
         }
         addTab(id)
+    }
+
+    private func consumePendingDeepLinkIfUnlocked() {
+        guard !appLock.isLocked,
+              let link = DeepLinkRouter.shared.consumePendingLink() else {
+            return
+        }
+        handleDeepLink(link)
+    }
+
+    private func handleDeepLink(_ link: TermAppDeepLink) {
+        switching = false
+        splitPickerRequest = nil
+        activeToolSheet = nil
+        inspectingSecurity = nil
+
+        switch link {
+        case .connectHost(let hostID):
+            if let host = findHost(id: hostID) {
+                connectHost(host)
+            } else {
+                selection = nil
+                onFocusHosts()
+            }
+
+        case .focusSession(let sessionID):
+            if manager.session(id: sessionID) != nil {
+                addTab(sessionID)
+                return
+            }
+            if proStore.isProUnlocked,
+               let snapshot = WidgetSnapshotStore.loadAgents().first(where: { $0.sessionID == sessionID }),
+               let host = findHost(id: snapshot.hostID),
+               AISessionCacheStore.load(defaults: manager.cacheDefaults).contains(where: {
+                   $0.hostID == snapshot.hostID && $0.sessionName == snapshot.sessionName
+               }) {
+                handleDeepLink(
+                    .launchAgent(
+                        hostID: host.id,
+                        agentSlug: snapshot.agentSlug,
+                        sessionName: snapshot.sessionName
+                    )
+                )
+                return
+            }
+            selection = nil
+            onFocusAgents()
+
+        case .launchAgent(let hostID, let agentSlug, let sessionName):
+            guard proStore.isProUnlocked, let host = findHost(id: hostID) else {
+                selection = nil
+                onFocusAgents()
+                return
+            }
+
+            let trimmedSession = sessionName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmedSession.isEmpty {
+                if let existing = manager.sessions.first(where: {
+                    $0.hostID == hostID && $0.aiAgentContext?.sessionName == trimmedSession
+                }) {
+                    addTab(existing.id)
+                    return
+                }
+
+                let cachedEntry = AISessionCacheStore.load(defaults: manager.cacheDefaults).first {
+                    $0.hostID == hostID && $0.sessionName == trimmedSession
+                }
+                let resolvedSlug = nonEmptyTrimmed(agentSlug)
+                    ?? cachedEntry?.agentSlug
+                    ?? HostProjectStore.lastAgentID(for: hostID)
+                    ?? BuiltInAIAgent.claude.rawValue
+                let descriptor = AgentVisuals.agentDescriptor(forSlug: resolvedSlug)
+                let workingDirectory = cachedEntry?.currentPath
+                    ?? HostProjectStore.recents(for: hostID).first
+                    ?? HostProjectStore.favorites(for: hostID).first
+                    ?? "~"
+                let context = AIAgentLaunchContext(
+                    agent: descriptor,
+                    sessionName: trimmedSession,
+                    workingDirectory: workingDirectory,
+                    hostID: host.id
+                )
+                let command = TMuxSessionHelper.attachCommand(sessionName: trimmedSession)
+                launchAIAgent(host: host, context: context, command: command)
+                return
+            }
+
+            let resolvedSlug = nonEmptyTrimmed(agentSlug)
+                ?? HostProjectStore.lastAgentID(for: hostID)
+                ?? BuiltInAIAgent.claude.rawValue
+            let descriptor = AgentVisuals.agentDescriptor(forSlug: resolvedSlug)
+            let workingDirectory = HostProjectStore.recents(for: hostID).first
+                ?? HostProjectStore.favorites(for: hostID).first
+                ?? "~"
+            let computedSessionName = TMuxSessionHelper.sessionName(
+                agentSlug: descriptor.slug,
+                workingDirectory: workingDirectory
+            )
+
+            if let existing = manager.sessions.first(where: {
+                $0.hostID == hostID
+                    && $0.aiAgentContext?.sessionName == computedSessionName
+                    && $0.connectionStatus == .connected
+            }) {
+                addTab(existing.id)
+                return
+            }
+
+            HostProjectStore.recordRecent(workingDirectory, for: host.id)
+            HostProjectStore.setLastAgentID(descriptor.id, for: host.id)
+            let context = AIAgentLaunchContext(
+                agent: descriptor,
+                sessionName: computedSessionName,
+                workingDirectory: workingDirectory,
+                hostID: host.id
+            )
+            let command = TMuxSessionHelper.launchOrAttachCommand(
+                agent: descriptor,
+                workingDirectory: workingDirectory,
+                sessionName: computedSessionName
+            )
+            launchAIAgent(host: host, context: context, command: command)
+
+        case .openAgentsTab:
+            selection = nil
+            onFocusAgents()
+        }
+    }
+
+    private func findHost(id: UUID) -> Host? {
+        if let host = hosts.first(where: { $0.id == id }) {
+            return host
+        }
+        var descriptor = FetchDescriptor<Host>(predicate: #Predicate { $0.id == id })
+        descriptor.fetchLimit = 1
+        return (try? modelContext.fetch(descriptor))?.first
+    }
+
+    private func nonEmptyTrimmed(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
     }
 
     private func consumePendingMergeBackIfNeeded() {

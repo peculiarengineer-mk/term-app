@@ -708,6 +708,10 @@ struct AgentsDashboardView: View {
             return Self.makeDiscoveredSession(from: entry, hostLabel: label)
         }
         remoteSessions = Self.sortedSessions(hydrated)
+        WidgetSyncCoordinator.syncAgents(
+            liveSessions: sessionManager.sessions,
+            cacheDefaults: sessionManager.cacheDefaults
+        )
     }
 
     private func scanAllHosts() async {
@@ -768,6 +772,10 @@ struct AgentsDashboardView: View {
             cacheDefaults: sessionManager.cacheDefaults
         )
         sessionManager.noteCacheChanged()
+        WidgetSyncCoordinator.syncAgents(
+            liveSessions: sessionManager.sessions,
+            cacheDefaults: sessionManager.cacheDefaults
+        )
         remoteSessions = discovered
         scanOutcomes = outcomes
         hasScannedOnce = true
