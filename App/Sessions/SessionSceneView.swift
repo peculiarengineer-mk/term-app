@@ -1,3 +1,4 @@
+import GameController
 import SwiftUI
 import SwiftData
 import UIKit
@@ -10,6 +11,7 @@ import TermUI
 struct TerminalPane: View {
     let live: LiveSession
     var isFocusedPane: Bool = true
+    var explicitFocusSequence: UInt64 = 0
     var onFocusPane: (() -> Void)? = nil
     var onOpenGitDiff: (() -> Void)? = nil
     var onOpenDevPreview: (() -> Void)? = nil
@@ -137,7 +139,17 @@ struct TerminalPane: View {
             live.hasInlineModalPresented = isPresented
         }
         .onChange(of: isFocusedPane) { _, focused in
-            if focused, live.shouldAutoFocus, !appLock.isLocked {
+            if focused, !appLock.isLocked {
+                focusTerminalIfNeeded(onlyIfKeyboardActiveOrHardwareAttached: true)
+            }
+        }
+        .onChange(of: explicitFocusSequence) { _, _ in
+            if isFocusedPane, !appLock.isLocked {
+                focusTerminalIfNeeded(onlyIfKeyboardActiveOrHardwareAttached: true)
+            }
+        }
+        .onChange(of: hostWindow) { _, newWindow in
+            if newWindow != nil, isFocusedPane, live.shouldAutoFocus, !appLock.isLocked {
                 focusTerminalIfNeeded()
             }
         }
@@ -203,7 +215,7 @@ struct TerminalPane: View {
         }
     }
 
-    private func focusTerminalIfNeeded() {
+    private func focusTerminalIfNeeded(onlyIfKeyboardActiveOrHardwareAttached: Bool = false) {
         guard isVisible,
               isFocusedPane,
               !appLock.isLocked,
@@ -211,12 +223,26 @@ struct TerminalPane: View {
               !inspectingSecurity,
               !hasPresentedModal,
               let hostWindow,
-              let terminalView = Self.findTerminalView(in: hostWindow, matchingAccessory: live.bar),
-              !terminalView.isFirstResponder else {
+              let terminalView = Self.findTerminalView(in: hostWindow, matchingAccessory: live.bar) else {
             return
         }
+        if onlyIfKeyboardActiveOrHardwareAttached {
+            let shouldFocus = live.shouldAutoFocus
+                || GCKeyboard.coalesced != nil
+                || Self.hasFirstResponderTerminal(in: hostWindow)
+            guard shouldFocus else { return }
+        }
+        live.shouldAutoFocus = true
+        guard !terminalView.isFirstResponder else { return }
         _ = terminalView.becomeFirstResponder()
         live.recordTerminalFocusInteraction()
+    }
+
+    private static func hasFirstResponderTerminal(in view: UIView) -> Bool {
+        if view.isFirstResponder, view.inputAccessoryView != nil {
+            return true
+        }
+        return view.subviews.contains { hasFirstResponderTerminal(in: $0) }
     }
 
     private static func findTerminalView(in view: UIView, matchingAccessory bar: UIView) -> UIView? {

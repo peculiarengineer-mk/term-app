@@ -147,8 +147,13 @@ struct WelcomeSheetView: View {
     @State private var currentPage = 0
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
     private var isLastPage: Bool { currentPage >= Self.pages.count - 1 }
     private var isCompactHeight: Bool { verticalSizeClass == .compact }
+
+    private func resolvedTint(_ rawTint: Color) -> Color {
+        rawTint == Self.appleProAmber ? palette.proBrandAmber : rawTint
+    }
 
     private var cardFill: Color {
         theme.isDark ? Color.white.opacity(0.06) : Color.black.opacity(0.04)
@@ -208,9 +213,10 @@ struct WelcomeSheetView: View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(spacing: isCompactHeight ? 14 : 20) {
                 VStack(spacing: isCompactHeight ? 8 : 12) {
+                    let heroTint = resolvedTint(page.heroTint)
                     SquircleIcon(
                         symbolName: page.heroSymbol,
-                        tint: page.heroTint,
+                        tint: heroTint,
                         fillOpacity: theme.isDark ? 0.22 : 0.14,
                         rimOpacity: 0.45,
                         size: isCompactHeight ? 52 : 64
@@ -222,8 +228,8 @@ struct WelcomeSheetView: View {
                         .tracking(0.6)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
-                        .foregroundStyle(page.heroTint)
-                        .background(page.heroTint.opacity(theme.isDark ? 0.18 : 0.12), in: Capsule())
+                        .foregroundStyle(heroTint)
+                        .background(heroTint.opacity(theme.isDark ? 0.18 : 0.12), in: Capsule())
 
                     Text(page.title)
                         .font(.title2.bold())
@@ -266,7 +272,7 @@ struct WelcomeSheetView: View {
         HStack(alignment: .top, spacing: 12) {
             SquircleIcon(
                 symbolName: item.symbolName,
-                tint: item.tint,
+                tint: resolvedTint(item.tint),
                 fillOpacity: theme.isDark ? 0.20 : 0.14,
                 rimOpacity: 0.36,
                 size: 36
@@ -300,11 +306,12 @@ struct WelcomeSheetView: View {
             } label: {
                 Text(isLastPage ? "Get Started" : "Continue")
                     .fontWeight(.semibold)
+                    .foregroundStyle(palette.proBrandAmberButtonInk)
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
-            .tint(Self.appleProAmber)
+            .tint(palette.proBrandAmber)
             .frame(maxWidth: 480)
             .padding(.horizontal, 20)
             .padding(.top, 8)

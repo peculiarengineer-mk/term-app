@@ -12,6 +12,7 @@ struct DigitalOceanView: View {
     }
 
     let onOpenTokenSettings: () -> Void
+    var showsInlineHeaderActions: Bool = false
 
     @Environment(\.modelContext) private var modelContext
     @Environment(\.connectHost) private var connectHost
@@ -42,49 +43,39 @@ struct DigitalOceanView: View {
     @State private var dnsTarget: DropletDNSTarget?
 
     var body: some View {
-        Group {
-            if authState.hasDigitalOceanToken {
-                connectedContent
-            } else {
-                CloudTokenOnboardingCard(
-                    symbolName: "drop.fill",
-                    tint: .blue,
-                    title: "Connect DigitalOcean",
-                    subtitle: "Browse your Droplets, 1-tap SSH, sync to Hosts, and spin up new cloud boxes.",
-                    scopes: CloudScopeRequirement.digitalOcean,
-                    placeholder: "Personal Access Token (dop_v1_…)",
-                    buttonTitle: "Save Token",
-                    tokenInput: $tokenInput,
-                    isConnecting: isConnectingToken,
-                    errorMessage: tokenError,
-                    onConnect: {
-                        Task { await connectWithToken() }
-                    }
-                )
+        VStack(spacing: 0) {
+            if showsInlineHeaderActions {
+                inlinePaneHeader
+                Divider()
+            }
+
+            Group {
+                if authState.hasDigitalOceanToken {
+                    connectedContent
+                } else {
+                    CloudTokenOnboardingCard(
+                        symbolName: "drop.fill",
+                        tint: .blue,
+                        title: "Connect DigitalOcean",
+                        subtitle: "Browse your Droplets, 1-tap SSH, sync to Hosts, and spin up new cloud boxes.",
+                        scopes: CloudScopeRequirement.digitalOcean,
+                        placeholder: "Personal Access Token (dop_v1_…)",
+                        buttonTitle: "Save Token",
+                        tokenInput: $tokenInput,
+                        isConnecting: isConnectingToken,
+                        errorMessage: tokenError,
+                        onConnect: {
+                            Task { await connectWithToken() }
+                        }
+                    )
+                }
             }
         }
         .toolbar {
-            if authState.hasDigitalOceanToken {
+            if !showsInlineHeaderActions && authState.hasDigitalOceanToken {
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
-                        AppHaptics.impact(.light)
-                        Task { await syncDropletsToHosts() }
-                    } label: {
-                        if isSyncing {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Label("Sync to Hosts", systemImage: "arrow.triangle.2.circlepath")
-                        }
-                    }
-                    .disabled(isSyncing || isLoading)
-
-                    Button {
-                        AppHaptics.impact(.light)
-                        showingCreateSheet = true
-                    } label: {
-                        Label("Create Droplet", systemImage: "plus")
-                    }
+                    syncDropletsButton
+                    createDropletButton
                 }
             }
         }
@@ -161,6 +152,7 @@ struct DigitalOceanView: View {
                             Image(systemName: "xmark")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .minTapTarget()
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Dismiss notice")
@@ -210,6 +202,7 @@ struct DigitalOceanView: View {
                             Image(systemName: "xmark")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
+                                .minTapTarget()
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Dismiss SSH key warning")
@@ -247,6 +240,72 @@ struct DigitalOceanView: View {
                     .buttonStyle(.borderedProminent)
                 }
             }
+        }
+    }
+
+    private var inlinePaneHeader: some View {
+        let isConnected = authState.hasDigitalOceanToken
+        return HStack(spacing: 10) {
+            ProSquircleIcon(
+                symbolName: "drop.fill",
+                tint: .blue,
+                size: .compact,
+                theme: theme,
+                statusLED: isConnected ? palette.healthy : nil,
+                statusGlow: isConnected
+            )
+
+            Text("DigitalOcean")
+                .font(.headline)
+
+            Spacer(minLength: 8)
+
+            if isConnected {
+                if !dynamicTypeSize.isAccessibilitySize {
+                    Text("Connected")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(palette.healthy)
+                }
+
+                HStack(spacing: 2) {
+                    syncDropletsButton
+                        .minTapTarget()
+                    createDropletButton
+                        .minTapTarget()
+                }
+            } else {
+                Text("Token Required")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, isConnected ? 4 : 10)
+        .frame(minHeight: 52)
+        .background(.bar)
+    }
+
+    private var syncDropletsButton: some View {
+        Button {
+            AppHaptics.impact(.light)
+            Task { await syncDropletsToHosts() }
+        } label: {
+            if isSyncing {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Label("Sync to Hosts", systemImage: "arrow.triangle.2.circlepath")
+            }
+        }
+        .disabled(isSyncing || isLoading)
+    }
+
+    private var createDropletButton: some View {
+        Button {
+            AppHaptics.impact(.light)
+            showingCreateSheet = true
+        } label: {
+            Label("Create Droplet", systemImage: "plus")
         }
     }
 

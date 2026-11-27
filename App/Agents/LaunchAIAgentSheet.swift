@@ -7,6 +7,7 @@ import TermUI
 /// Sheet for configuring and launching a `tmux`-backed AI agent session on a saved `Host`.
 struct LaunchAIAgentSheet: View {
     let initialHost: Host?
+    var onTmuxInstalled: ((UUID) -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @Environment(SessionManager.self) private var sessionManager
@@ -23,6 +24,8 @@ struct LaunchAIAgentSheet: View {
     @State private var workingDirectory: String = "~"
     @State private var extraArgs: String = ""
     @State private var reattachExisting: Bool = false
+    @State private var selectedExistingSessionName: String?
+    @State private var isSyncingExistingSession = false
     @State private var sessionLabel: String = ""
     @State private var favorites: [String] = []
     @State private var recents: [String] = []
@@ -75,8 +78,28 @@ struct LaunchAIAgentSheet: View {
         favorites.contains(normalizedWorkingDirectory)
     }
 
+    private var knownHostSessions: [CachedAISession] {
+        _ = sessionManager.cacheRevision
+        return Self.knownCachedSessions(
+            for: selectedHost?.id,
+            cacheDefaults: sessionManager.cacheDefaults
+        )
+    }
+
+    private var deterministicSessionName: String {
+        TMuxSessionHelper.sessionName(
+            agentSlug: selectedAgent.slug,
+            workingDirectory: normalizedWorkingDirectory
+        )
+    }
+
     private var resolvedSessionName: String {
         _ = sessionManager.cacheRevision
+        if reattachExisting,
+           let chosen = selectedExistingSessionName,
+           knownHostSessions.contains(where: { $0.sessionName == chosen }) {
+            return chosen
+        }
         return Self.resolveSessionName(
             agentSlug: selectedAgent.slug,
             workingDirectory: normalizedWorkingDirectory,
@@ -88,6 +111,15 @@ struct LaunchAIAgentSheet: View {
             customSuffix: sessionLabel,
             reattachExisting: reattachExisting
         )
+    }
+
+    static func knownCachedSessions(
+        for hostID: UUID?,
+        cacheDefaults: UserDefaults = .standard
+    ) -> [CachedAISession] {
+        guard let hostID else { return [] }
+        return AISessionCacheStore.load(defaults: cacheDefaults)
+            .filter { $0.hostID == hostID }
     }
 
     static func knownSessionNames(
@@ -179,6 +211,12 @@ struct LaunchAIAgentSheet: View {
                     return
                 }
                 await probeTmuxStatus(for: host)
+            }
+            .onChange(of: selectedAgentID) { _, _ in
+                syncExistingSessionAfterManualChange()
+            }
+            .onChange(of: normalizedWorkingDirectory) { _, _ in
+                syncExistingSessionAfterManualChange()
             }
             .onDisappear {
                 tmuxInstallTask?.cancel()
@@ -632,11 +670,27 @@ struct LaunchAIAgentSheet: View {
                     Text("Reattach Existing").tag(true)
                 }
                 .pickerStyle(.segmented)
-                .onChange(of: reattachExisting) { _, _ in
+                .onChange(of: reattachExisting) { _, newValue in
                     AppHaptics.impact(.light)
+                    if newValue {
+                        syncDefaultExistingSessionSelection()
+                    }
                 }
             }
             .padding(.vertical, 2)
+
+            if reattachExisting && !knownHostSessions.isEmpty {
+                Picker("Existing Session", selection: existingSessionSelectionBinding) {
+                    ForEach(knownHostSessions) { session in
+                        Text(existingSessionOptionLabel(for: session))
+                            .tag(Optional(session.sessionName))
+                    }
+                    if !knownHostSessions.contains(where: { $0.sessionName == deterministicSessionName }) {
+                        Text("Match Path (\(deterministicSessionName))")
+                            .tag(String?.none)
+                    }
+                }
+            }
 
             if !reattachExisting {
                 HStack(spacing: 10) {
@@ -733,6 +787,91 @@ struct LaunchAIAgentSheet: View {
         } else {
             selectedAgentID = BuiltInAIAgent.claude.id
         }
+
+        if reattachExisting {
+            syncDefaultExistingSessionSelection()
+        } else {
+            selectedExistingSessionName = nil
+        }
+    }
+
+    private var existingSessionSelectionBinding: Binding<String?> {
+        Binding(
+            get: {
+                if let selectedExistingSessionName,
+                   knownHostSessions.contains(where: { $0.sessionName == selectedExistingSessionName }) {
+                    return selectedExistingSessionName
+                }
+                return nil
+            },
+            set: { newValue in
+                AppHaptics.impact(.light)
+                selectedExistingSessionName = newValue
+                if let newValue,
+                   let cached = knownHostSessions.first(where: { $0.sessionName == newValue }) {
+                    applyCachedSessionSelection(cached)
+                }
+            }
+        )
+    }
+
+    private func syncDefaultExistingSessionSelection() {
+        let sessions = knownHostSessions
+        guard !sessions.isEmpty else {
+            selectedExistingSessionName = nil
+            return
+        }
+        let targetName = deterministicSessionName
+        if let exact = sessions.first(where: { $0.sessionName == targetName }) {
+            selectedExistingSessionName = exact.sessionName
+        } else if let pathAndAgentMatch = sessions.first(where: {
+            $0.agentSlug.lowercased() == selectedAgent.slug.lowercased()
+                && $0.currentPath == normalizedWorkingDirectory
+        }) {
+            selectedExistingSessionName = pathAndAgentMatch.sessionName
+        } else {
+            selectedExistingSessionName = sessions.first?.sessionName
+        }
+        if let chosen = selectedExistingSessionName,
+           let cached = sessions.first(where: { $0.sessionName == chosen }) {
+            applyCachedSessionSelection(cached)
+        }
+    }
+
+    private func applyCachedSessionSelection(_ cached: CachedAISession) {
+        isSyncingExistingSession = true
+        if let path = cached.currentPath, !path.isEmpty {
+            workingDirectory = path
+        }
+        if let preset = presets.first(where: { $0.slug.lowercased() == cached.agentSlug.lowercased() }) {
+            selectedAgentID = preset.id
+        }
+        DispatchQueue.main.async {
+            isSyncingExistingSession = false
+        }
+    }
+
+    private func syncExistingSessionAfterManualChange() {
+        guard reattachExisting, !isSyncingExistingSession else { return }
+        let targetName = deterministicSessionName
+        if let exact = knownHostSessions.first(where: { $0.sessionName == targetName }) {
+            selectedExistingSessionName = exact.sessionName
+        } else if let match = knownHostSessions.first(where: {
+            $0.agentSlug.lowercased() == selectedAgent.slug.lowercased()
+                && $0.currentPath == normalizedWorkingDirectory
+        }) {
+            selectedExistingSessionName = match.sessionName
+        } else {
+            selectedExistingSessionName = nil
+        }
+    }
+
+    private func existingSessionOptionLabel(for session: CachedAISession) -> String {
+        let descriptor = AgentVisuals.agentDescriptor(forSlug: session.agentSlug)
+        if let path = session.currentPath, !path.isEmpty {
+            return "\(descriptor.name) · \(session.sessionName) (\(path))"
+        }
+        return "\(descriptor.name) · \(session.sessionName)"
     }
 
     private func resetTmuxProbeState() {
@@ -834,6 +973,7 @@ struct LaunchAIAgentSheet: View {
                             tmuxRequiresInteractiveInstall = false
                         }
                         AppHaptics.notify(.success)
+                        onTmuxInstalled?(hostID)
                     } else {
                         tmuxAvailability = verified
                         tmuxInstallError = "Installation finished, but tmux was not found in PATH."
@@ -986,12 +1126,19 @@ struct RemoteFolderPickerSheet: View {
     @State private var browsingPath: String
     @State private var resolvedPath: String = ""
     @State private var directories: [String] = []
+    @State private var folderFilter = ""
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var loadGeneration = 0
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
     private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
+
+    private var filteredDirectories: [String] {
+        let query = folderFilter.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return directories }
+        return directories.filter { $0.localizedCaseInsensitiveContains(query) }
+    }
 
     init(target: AgentHostTarget, initialPath: String, onSelect: @escaping (String) -> Void) {
         self.target = target
@@ -1039,7 +1186,7 @@ struct RemoteFolderPickerSheet: View {
                     .disabled(isLoading)
                 }
 
-                ForEach(directories, id: \.self) { folder in
+                ForEach(filteredDirectories, id: \.self) { folder in
                     Button {
                         AppHaptics.impact(.light)
                         let base = displayedPath
@@ -1062,6 +1209,7 @@ struct RemoteFolderPickerSheet: View {
                     .disabled(isLoading)
                 }
             }
+            .searchable(text: $folderFilter, prompt: "Filter folders")
             .safeAreaInset(edge: .top, spacing: 0) {
                 VStack(spacing: 0) {
                     HStack(spacing: 8) {
@@ -1099,7 +1247,7 @@ struct RemoteFolderPickerSheet: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
                     .tint(palette.proBrandAmber)
-                    .disabled(isLoading && resolvedPath.isEmpty)
+                    .disabled(isLoading)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 12)
                 }
@@ -1129,6 +1277,12 @@ struct RemoteFolderPickerSheet: View {
                         systemImage: "folder",
                         description: Text("You can select \"\(displayedPath)\" or navigate up.")
                     )
+                } else if !isLoading && errorMessage == nil && !directories.isEmpty && filteredDirectories.isEmpty {
+                    ContentUnavailableView(
+                        "No Matching Folders",
+                        systemImage: "magnifyingglass",
+                        description: Text("Try clearing your folder filter.")
+                    )
                 }
             }
             .navigationTitle(target.displayName)
@@ -1155,6 +1309,7 @@ struct RemoteFolderPickerSheet: View {
     }
 
     private func loadDirectory(at path: String) {
+        folderFilter = ""
         browsingPath = path
         Task {
             await fetchDirectory(path: path, allowHomeFallback: false)

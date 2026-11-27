@@ -115,6 +115,10 @@ struct ConnectHostIntent: AppIntent {
     @Parameter(title: "Host")
     var host: HostEntity
 
+    static var parameterSummary: some ParameterSummary {
+        Summary("Connect to \(\.$host)")
+    }
+
     init() {}
 
     init(host: HostEntity) {
@@ -145,6 +149,10 @@ struct LaunchAIAgentIntent: AppIntent {
 
     @Parameter(title: "Host")
     var host: HostEntity
+
+    static var parameterSummary: some ParameterSummary {
+        Summary("Launch \(\.$agent) on \(\.$host)")
+    }
 
     init() {}
 

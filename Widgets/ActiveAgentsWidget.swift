@@ -29,10 +29,10 @@ struct ActiveAgentsProvider: TimelineProvider {
             sessionID: UUID(),
             hostID: UUID(),
             hostLabel: "Mac Studio",
-            sessionName: "termapp-ai-claude-term-app",
+            sessionName: "claude-api-server",
             agentSlug: "claude",
             agentName: "Claude Code",
-            projectSlug: "term-app",
+            projectSlug: "api-server",
             status: .approval,
             promptSnippet: "Run swift test? [y/N]"
         ),
@@ -40,20 +40,20 @@ struct ActiveAgentsProvider: TimelineProvider {
             sessionID: UUID(),
             hostID: UUID(),
             hostLabel: "Prod Bastion",
-            sessionName: "termapp-ai-codex-api",
+            sessionName: "codex-web-app",
             agentSlug: "codex",
             agentName: "Codex",
-            projectSlug: "api",
+            projectSlug: "web-app",
             status: .running
         ),
         WidgetAgentSnapshot(
             sessionID: nil,
             hostID: UUID(),
             hostLabel: "Dev Box",
-            sessionName: "termapp-ai-agy-web",
+            sessionName: "agy-infra",
             agentSlug: "agy",
             agentName: "Antigravity",
-            projectSlug: "web",
+            projectSlug: "infra",
             status: .idle
         ),
     ]
@@ -69,7 +69,7 @@ struct ActiveAgentsWidget: Widget {
         }
         .configurationDisplayName("AI Agents")
         .description("Monitor running, approval-waiting, and resumable AI agent tmux sessions.")
-        .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular])
+        .supportedFamilies([.systemSmall, .systemMedium, .accessoryCircular, .accessoryRectangular])
     }
 }
 
@@ -85,6 +85,9 @@ private struct ActiveAgentsWidgetView: View {
         case .systemMedium:
             mediumView
                 .containerBackground(WidgetPalette.background, for: .widget)
+        case .accessoryCircular:
+            accessoryCircularView
+                .containerBackground(.clear, for: .widget)
         case .accessoryRectangular:
             accessoryRectangularView
                 .containerBackground(.clear, for: .widget)
@@ -102,8 +105,10 @@ private struct ActiveAgentsWidgetView: View {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     WidgetSquircleIcon(symbolName: symbol, tint: tint, size: 30)
+                        .widgetAccentable()
                     Spacer(minLength: 4)
                     WidgetStatusPill(rawStatus: topAgent.status.rawValue)
+                        .widgetAccentable()
                 }
 
                 Spacer(minLength: 2)
@@ -119,9 +124,9 @@ private struct ActiveAgentsWidgetView: View {
                         .foregroundStyle(tint)
                         .lineLimit(1)
 
-                    Text(topAgent.promptSnippet ?? topAgent.hostLabel)
+                    Text(agentSubtitle(for: topAgent))
                         .font(.caption2)
-                        .foregroundStyle(topAgent.promptSnippet != nil ? WidgetPalette.amber : WidgetPalette.secondary)
+                        .foregroundStyle(hasPromptSnippet(topAgent) ? WidgetPalette.amber : WidgetPalette.secondary)
                         .lineLimit(1)
                 }
             }
@@ -145,6 +150,7 @@ private struct ActiveAgentsWidgetView: View {
                     Image(systemName: "sparkles")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(WidgetPalette.amber)
+                        .widgetAccentable()
                     Text("AI Agents")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(WidgetPalette.foreground)
@@ -153,6 +159,7 @@ private struct ActiveAgentsWidgetView: View {
                         Text("\(approvalCount) waiting")
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(WidgetPalette.amber)
+                            .widgetAccentable()
                     } else {
                         Text("\(entry.agents.count) active")
                             .font(.caption2.monospacedDigit())
@@ -161,7 +168,7 @@ private struct ActiveAgentsWidgetView: View {
                 }
 
                 VStack(spacing: 6) {
-                    ForEach(entry.agents.prefix(3)) { agent in
+                    ForEach(entry.agents.prefix(2)) { agent in
                         Link(destination: deepLink(for: agent)) {
                             agentCardRow(agent)
                         }
@@ -171,6 +178,47 @@ private struct ActiveAgentsWidgetView: View {
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    @ViewBuilder
+    private var accessoryCircularView: some View {
+        if let topAgent = entry.agents.first {
+            let approvalCount = entry.agents.count(where: { $0.status == .approval })
+            let runningCount = entry.agents.count(where: { $0.status == .running })
+            let activeCount = approvalCount > 0 ? approvalCount : runningCount
+            let displayCount = activeCount > 0 ? activeCount : entry.agents.count
+            let gaugeValue = Double(activeCount)
+            let gaugeMax = Double(max(entry.agents.count, 1))
+            let symbolName = approvalCount > 0 ? "bell.fill" : "sparkles"
+            let accessibilityText = approvalCount > 0
+                ? "\(approvalCount) AI \(approvalCount == 1 ? "agent" : "agents") waiting for approval"
+                : "\(entry.agents.count) AI \(entry.agents.count == 1 ? "agent" : "agents")"
+
+            Gauge(value: gaugeValue, in: 0...gaugeMax) {
+                Image(systemName: symbolName)
+            } currentValueLabel: {
+                Text("\(displayCount)")
+                    .font(.system(.title3, design: .rounded).bold().monospacedDigit())
+            }
+            .gaugeStyle(.accessoryCircular)
+            .tint(approvalCount > 0 ? WidgetPalette.amber : WidgetPalette.cyan)
+            .widgetAccentable()
+            .accessibilityLabel(accessibilityText)
+            .widgetURL(deepLink(for: topAgent))
+        } else {
+            ZStack {
+                AccessoryWidgetBackground()
+                VStack(spacing: 1) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 16, weight: .semibold))
+                        .widgetAccentable()
+                    Text("0")
+                        .font(.system(.caption2, design: .rounded).bold().monospacedDigit())
+                }
+            }
+            .accessibilityLabel("No active AI agents")
+            .widgetURL(TermAppDeepLink.openAgentsTab.url)
         }
     }
 
@@ -206,6 +254,7 @@ private struct ActiveAgentsWidgetView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Label("AI Agents", systemImage: "sparkles")
                     .font(.headline)
+                    .widgetAccentable()
                 Text("No active AI agents")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -225,26 +274,28 @@ private struct ActiveAgentsWidgetView: View {
                 .fill(statusColor)
                 .frame(width: 6, height: 6)
 
-            WidgetSquircleIcon(symbolName: symbol, tint: tint, size: 22)
+            WidgetSquircleIcon(symbolName: symbol, tint: tint, size: 24)
+                .widgetAccentable()
 
-            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text("\(agent.agentName) · \(agent.projectSlug)")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(WidgetPalette.foreground)
                     .lineLimit(1)
 
-                Text(agent.promptSnippet ?? agent.hostLabel)
+                Text(agentSubtitle(for: agent))
                     .font(.caption2)
-                    .foregroundStyle(agent.promptSnippet != nil ? WidgetPalette.amber : WidgetPalette.secondary)
+                    .foregroundStyle(hasPromptSnippet(agent) ? WidgetPalette.amber : WidgetPalette.secondary)
                     .lineLimit(1)
             }
 
             Spacer(minLength: 4)
 
             WidgetStatusPill(rawStatus: agent.status.rawValue)
+                .widgetAccentable()
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
         .background(WidgetPalette.cardFill, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 10, style: .continuous)
@@ -258,6 +309,7 @@ private struct ActiveAgentsWidgetView: View {
     private var emptyStateView: some View {
         VStack(spacing: 6) {
             WidgetSquircleIcon(symbolName: "sparkles", tint: WidgetPalette.amber, size: 32)
+                .widgetAccentable()
             Text("No active AI agents")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(WidgetPalette.foreground)
@@ -268,6 +320,19 @@ private struct ActiveAgentsWidgetView: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func hasPromptSnippet(_ agent: WidgetAgentSnapshot) -> Bool {
+        guard let snippet = agent.promptSnippet else { return false }
+        return !snippet.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func agentSubtitle(for agent: WidgetAgentSnapshot) -> String {
+        if let snippet = agent.promptSnippet?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !snippet.isEmpty {
+            return "\(agent.hostLabel) · \(snippet)"
+        }
+        return agent.hostLabel
     }
 
     private func deepLink(for agent: WidgetAgentSnapshot) -> URL {

@@ -20,6 +20,11 @@ struct AgentsDashboardView: View {
         let isProUnlocked: Bool
     }
 
+    private struct LaunchSheetTarget: Identifiable {
+        let id = UUID()
+        let initialHost: Host?
+    }
+
     enum HostScanStatus: Sendable, Equatable {
         case ok(sessionCount: Int)
         case tmuxMissing
@@ -77,7 +82,7 @@ struct AgentsDashboardView: View {
     @State private var scanGeneration = 0
     @State private var killingSession: DiscoveredSession?
     @State private var killError: String?
-    @State private var showingLaunchSheet = false
+    @State private var launchSheetTarget: LaunchSheetTarget?
     @State private var showingPaywall = false
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
@@ -143,10 +148,20 @@ struct AgentsDashboardView: View {
                     }
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
                         AppHaptics.impact(.light)
-                        showingLaunchSheet = true
+                        Task { await scanAllHosts() }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .minTapTarget()
+                    }
+                    .accessibilityLabel("Refresh sessions")
+                    .disabled(hosts.isEmpty || isScanning)
+
+                    Button {
+                        AppHaptics.impact(.light)
+                        launchSheetTarget = LaunchSheetTarget(initialHost: nil)
                     } label: {
                         Image(systemName: "plus")
                     }
@@ -155,10 +170,15 @@ struct AgentsDashboardView: View {
                 }
             }
         }
-        .sheet(isPresented: $showingLaunchSheet) {
-            LaunchAIAgentSheet(initialHost: nil)
-                .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                .tint(palette.accent)
+        .sheet(item: $launchSheetTarget) { target in
+            LaunchAIAgentSheet(
+                initialHost: target.initialHost,
+                onTmuxInstalled: { hostID in
+                    Task { await rescanHost(id: hostID) }
+                }
+            )
+            .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+            .tint(palette.accent)
         }
         .sheet(isPresented: $showingPaywall) {
             ProPaywallView()
@@ -273,7 +293,7 @@ struct AgentsDashboardView: View {
                     } actions: {
                         Button {
                             AppHaptics.impact(.light)
-                            showingLaunchSheet = true
+                            launchSheetTarget = LaunchSheetTarget(initialHost: nil)
                         } label: {
                             Label("Launch AI Agent", systemImage: "plus")
                         }
@@ -384,7 +404,7 @@ struct AgentsDashboardView: View {
         let descriptor = AgentVisuals.agentDescriptor(forSlug: session.agentSlug)
         let tint = AgentVisuals.agentTint(for: descriptor)
         let badge = session.projectSlug.isEmpty ? session.sessionName : session.projectSlug
-        let statusDescription = item.isCached ? "cached" : (session.isAttached ? "attached" : "idle")
+        let statusDescription = item.isCached ? "last known offline" : (session.isAttached ? "attached" : "idle")
         let subtitle: String = {
             if !session.isTermAppManaged && session.sessionName != badge {
                 let prefix = "\(item.hostLabel) · \(session.sessionName)"
@@ -476,6 +496,13 @@ struct AgentsDashboardView: View {
                         .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
                         .truncationMode(.middle)
 
+                    if item.isCached {
+                        Text("Last known · host offline")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+                    }
+
                     if dynamicTypeSize.isAccessibilitySize {
                         HStack(spacing: 6) {
                             if item.isCached {
@@ -527,19 +554,37 @@ struct AgentsDashboardView: View {
         .buttonStyle(.plain)
         .accessibilityLabel(accessibilityDescription)
         .contextMenu {
-            Button("Attach", systemImage: "terminal") {
-                AppHaptics.impact(.light)
-                onAttach(true)
-            }
-            Button("Kill Session", systemImage: "xmark.octagon", role: .destructive) {
-                killingSession = item
+            if item.isCached {
+                Button("Reattach", systemImage: "terminal") {
+                    AppHaptics.impact(.light)
+                    onAttach(true)
+                }
+                Button("Forget", systemImage: "trash", role: .destructive) {
+                    forgetCachedSession(item)
+                }
+            } else {
+                Button("Attach", systemImage: "terminal") {
+                    AppHaptics.impact(.light)
+                    onAttach(true)
+                }
+                Button("Kill Session", systemImage: "xmark.octagon", role: .destructive) {
+                    killingSession = item
+                }
             }
         }
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-            Button(role: .destructive) {
-                killingSession = item
-            } label: {
-                Label("Kill", systemImage: "trash")
+            if item.isCached {
+                Button(role: .destructive) {
+                    forgetCachedSession(item)
+                } label: {
+                    Label("Forget", systemImage: "trash")
+                }
+            } else {
+                Button(role: .destructive) {
+                    killingSession = item
+                } label: {
+                    Label("Kill", systemImage: "trash")
+                }
             }
         }
         .swipeActions(edge: .leading, allowsFullSwipe: true) {
@@ -547,7 +592,7 @@ struct AgentsDashboardView: View {
                 AppHaptics.impact(.light)
                 onAttach(false)
             } label: {
-                Label("Attach", systemImage: "terminal")
+                Label(item.isCached ? "Reattach" : "Attach", systemImage: "terminal")
             }
             .tint(palette.healthy)
         }
@@ -606,7 +651,7 @@ struct AgentsDashboardView: View {
 
                 if dynamicTypeSize.isAccessibilitySize,
                    let host = hosts.first(where: { $0.id == outcome.hostID }) {
-                    connectScanIssueButton(for: host, label: outcome.hostLabel, tint: tint)
+                    scanIssueActionButton(for: host, outcome: outcome, tint: tint)
                         .padding(.top, 4)
                 }
             }
@@ -615,21 +660,33 @@ struct AgentsDashboardView: View {
 
             if !dynamicTypeSize.isAccessibilitySize,
                let host = hosts.first(where: { $0.id == outcome.hostID }) {
-                connectScanIssueButton(for: host, label: outcome.hostLabel, tint: tint)
+                scanIssueActionButton(for: host, outcome: outcome, tint: tint)
             }
         }
         .padding(.vertical, 2)
     }
 
-    private func connectScanIssueButton(for host: Host, label: String, tint: Color) -> some View {
-        Button("Connect") {
-            AppHaptics.impact(.light)
-            connectHost?(host)
+    @ViewBuilder
+    private func scanIssueActionButton(for host: Host, outcome: HostScanOutcome, tint: Color) -> some View {
+        if case .tmuxMissing = outcome.status {
+            Button("Install tmux…") {
+                AppHaptics.impact(.light)
+                launchSheetTarget = LaunchSheetTarget(initialHost: host)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(palette.proBrandAmber)
+            .accessibilityLabel("Install tmux on \(outcome.hostLabel)")
+        } else {
+            Button("Connect") {
+                AppHaptics.impact(.light)
+                connectHost?(host)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .tint(tint)
+            .accessibilityLabel("Connect to \(outcome.hostLabel)")
         }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .tint(tint)
-        .accessibilityLabel("Connect to \(label)")
     }
 
     private func subtitleLine(hostLabel: String, path: String?) -> String {
@@ -664,6 +721,17 @@ struct AgentsDashboardView: View {
         guard let host = hosts.first(where: { $0.id == item.hostID }) else { return }
         let command = TMuxSessionHelper.attachCommand(sessionName: item.session.sessionName)
         runTerminalCommand?(host, command)
+    }
+
+    private func forgetCachedSession(_ item: DiscoveredSession) {
+        AppHaptics.impact(.light)
+        remoteSessions.removeAll { $0.id == item.id }
+        AISessionCacheStore.remove(
+            hostID: item.hostID,
+            sessionName: item.session.sessionName,
+            defaults: sessionManager.cacheDefaults
+        )
+        sessionManager.noteCacheChanged()
     }
 
     private func killSession(_ item: DiscoveredSession) async {
@@ -730,6 +798,7 @@ struct AgentsDashboardView: View {
 
         let targetHostIDs = Set(targets.map(\.id))
         remoteSessions.removeAll { !targetHostIDs.contains($0.hostID) }
+        scanOutcomes.removeAll { !targetHostIDs.contains($0.hostID) }
         if !hasScannedOnce && remoteSessions.isEmpty {
             loadCachedSessionsIfNeeded()
         }
@@ -742,7 +811,7 @@ struct AgentsDashboardView: View {
         }
 
         let maxConcurrentScans = 5
-        let outcomes = await withTaskGroup(of: HostScanOutcome.self) { group in
+        await withTaskGroup(of: HostScanOutcome.self) { group in
             var iterator = targets.makeIterator()
             for _ in 0..<min(maxConcurrentScans, targets.count) {
                 if let target = iterator.next() {
@@ -752,33 +821,52 @@ struct AgentsDashboardView: View {
                 }
             }
 
-            var collected: [HostScanOutcome] = []
-            collected.reserveCapacity(targets.count)
             for await outcome in group {
-                collected.append(outcome)
-                if !Task.isCancelled, let nextTarget = iterator.next() {
+                if Task.isCancelled || generation != scanGeneration {
+                    group.cancelAll()
+                    return
+                }
+                applyStreamingOutcome(outcome)
+                if !Task.isCancelled, generation == scanGeneration, let nextTarget = iterator.next() {
                     group.addTask {
                         await Self.scanHost(nextTarget, knownCommands: knownCommands)
                     }
                 }
             }
-            return collected
         }
 
         guard !Task.isCancelled, generation == scanGeneration else { return }
+        hasScannedOnce = true
+    }
 
-        let discovered = Self.applyScanOutcomes(
-            outcomes,
+    private func rescanHost(id hostID: UUID) async {
+        guard let host = hosts.first(where: { $0.id == hostID }) else { return }
+        let target = AgentHostTarget(host: host, sessionManager: sessionManager, allHosts: hosts)
+        let outcome = await Self.scanHost(target, knownCommands: Self.buildKnownCommands())
+        guard !Task.isCancelled else { return }
+        applyStreamingOutcome(outcome)
+    }
+
+    private func applyStreamingOutcome(_ outcome: HostScanOutcome) {
+        let hostSessions = Self.applyScanOutcomes(
+            [outcome],
             cacheDefaults: sessionManager.cacheDefaults
         )
+        if let existingIndex = scanOutcomes.firstIndex(where: { $0.hostID == outcome.hostID }) {
+            scanOutcomes[existingIndex] = outcome
+        } else {
+            scanOutcomes.append(outcome)
+        }
+
+        var updatedSessions = remoteSessions.filter { $0.hostID != outcome.hostID }
+        updatedSessions.append(contentsOf: hostSessions)
+        remoteSessions = Self.sortedSessions(updatedSessions)
+
         sessionManager.noteCacheChanged()
         WidgetSyncCoordinator.syncAgents(
             liveSessions: sessionManager.sessions,
             cacheDefaults: sessionManager.cacheDefaults
         )
-        remoteSessions = discovered
-        scanOutcomes = outcomes
-        hasScannedOnce = true
     }
 
     static func applyScanOutcomes(

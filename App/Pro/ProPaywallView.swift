@@ -2,7 +2,7 @@ import SwiftUI
 import StoreKit
 import TermUI
 
-/// Apple Pro Dark sheet presenting the hybrid AmberTTY Pro Annual subscription and Lifetime purchase.
+/// Apple Pro sheet presenting the hybrid AmberTTY Pro Annual subscription and Lifetime purchase.
 struct ProPaywallView: View {
     enum PlanChoice: String, CaseIterable, Identifiable, Sendable {
         case annual
@@ -21,6 +21,8 @@ struct ProPaywallView: View {
     @Environment(ProStore.self) private var proStore
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
 
     @State private var selectedPlan: PlanChoice = .annual
@@ -45,22 +47,52 @@ struct ProPaywallView: View {
     }
 
     private var showsAnnualTrialBadge: Bool {
-        proStore.isAnnualTrialEligible || proStore.annualProduct?.subscription?.introductoryOffer != nil
+        Self.showsAnnualTrialBadge(isTrialEligible: proStore.isAnnualTrialEligible)
+    }
+
+    private var isFetchingInitialPlans: Bool {
+        (proStore.isLoading || proStore.isLoadingProducts) && proStore.annualProduct == nil
+    }
+
+    private var shouldPinBottomDock: Bool {
+        !dynamicTypeSize.isAccessibilitySize && verticalSizeClass != .compact
     }
 
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 22) {
+                VStack(spacing: 18) {
                     heroHeader
                     featuresCard
-                    purchaseSection
-                    legalFooter
+
+                    if proStore.isPurchased {
+                        purchasedCard
+                    } else {
+                        testFlightBanner
+
+                        Text(disclosureText)
+                            .font(.caption)
+                            .foregroundStyle(theme.secondaryForegroundColor)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if !shouldPinBottomDock {
+                        dockContent
+                            .padding(.top, 4)
+                    }
                 }
                 .frame(maxWidth: ProDesign.Layout.readableHeroWidth)
                 .padding(.horizontal, 20)
-                .padding(.vertical, 24)
+                .padding(.top, 16)
+                .padding(.bottom, 20)
                 .frame(maxWidth: .infinity)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if shouldPinBottomDock {
+                    frostedBottomDock
+                }
             }
             .background(theme.backgroundColor.ignoresSafeArea())
             .navigationTitle("AmberTTY Pro")
@@ -80,10 +112,11 @@ struct ProPaywallView: View {
             }
             .manageSubscriptionsSheet(isPresented: $showingManageSubscriptions)
         }
+        .tint(palette.proBrandAmber)
     }
 
     private var heroHeader: some View {
-        VStack(spacing: 12) {
+        VStack(spacing: 10) {
             ProSquircleIcon(
                 symbolName: "sparkles",
                 tint: palette.proBrandAmber,
@@ -93,36 +126,55 @@ struct ProPaywallView: View {
             )
 
             VStack(spacing: 6) {
-                HStack(spacing: 8) {
-                    Text("AmberTTY Pro")
-                        .font(.title2.bold())
-                        .foregroundStyle(theme.foregroundColor)
+                heroTitleRow
 
-                    if showsAnnualTrialBadge && !proStore.isPurchased {
-                        Text("7-Day Free Trial")
-                            .font(.caption2.weight(.semibold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .foregroundStyle(palette.proBrandAmber)
-                            .background(palette.badgeFill(for: palette.proBrandAmber), in: Capsule())
-                    }
-                }
-
-                Text("Start with a 7-day free trial or unlock lifetime access. Core SSH terminal, keys, snippets, and iCloud sync stay free forever.")
+                Text(Self.heroSubtitle(isTrialEligible: showsAnnualTrialBadge))
                     .font(.subheadline)
                     .foregroundStyle(theme.secondaryForegroundColor)
                     .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
+    @ViewBuilder
+    private var heroTitleRow: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(spacing: 6) {
+                Text("AmberTTY Pro")
+                    .font(.title2.bold())
+                    .foregroundStyle(theme.foregroundColor)
+                trialPillBadge
+            }
+        } else {
+            HStack(spacing: 8) {
+                Text("AmberTTY Pro")
+                    .font(.title2.bold())
+                    .foregroundStyle(theme.foregroundColor)
+                trialPillBadge
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var trialPillBadge: some View {
+        if showsAnnualTrialBadge && !proStore.isPurchased {
+            Text("7-Day Free Trial")
+                .font(.caption2.weight(.semibold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .foregroundStyle(palette.proBrandAmber)
+                .background(palette.badgeFill(for: palette.proBrandAmber), in: Capsule())
+        }
+    }
+
     private var featuresCard: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 14) {
             featureRow(
                 icon: "sparkles",
                 tint: palette.proBrandAmber,
                 title: "AI Agent Sessions",
-                subtitle: "Launch & reattach Claude Code, agy, Codex & custom CLIs in persistent tmux sessions with Prompt Composer, Photo Attach, Git Diff, Dev Server Preview & alerts."
+                subtitle: "Run Claude Code, Antigravity & Codex in tmux with diffs, previews & alerts."
             )
 
             Divider()
@@ -131,7 +183,7 @@ struct ProPaywallView: View {
                 icon: "folder.fill",
                 tint: .blue,
                 title: "SFTP File Browser",
-                subtitle: "Browse remote directories, preview code and logs, upload, download, rename, and delete files."
+                subtitle: "Browse directories, preview code and logs, and transfer or manage remote files."
             )
 
             Divider()
@@ -149,54 +201,85 @@ struct ProPaywallView: View {
                 icon: "cloud.fill",
                 tint: palette.running,
                 title: "DigitalOcean & Cloudflare",
-                subtitle: "Manage Droplets, 1-tap SSH, sync hosts, edit DNS records, and inspect Zero Trust Tunnels."
+                subtitle: "Manage Droplets, 1-tap SSH, host sync, DNS records, and Zero Trust Tunnels."
             )
         }
-        .padding(18)
+        .padding(16)
         .proSurfaceCard(theme: theme)
     }
 
+    @ViewBuilder
     private func featureRow(
         icon: String,
         tint: Color,
         title: String,
         subtitle: String
     ) -> some View {
-        HStack(alignment: .top, spacing: 14) {
-            ProSquircleIcon(
-                symbolName: icon,
-                tint: tint,
-                size: .row,
-                emphasis: .standard,
-                theme: theme
-            )
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(.headline)
-                    .foregroundStyle(theme.foregroundColor)
-
-                Text(subtitle)
-                    .font(.footnote)
-                    .foregroundStyle(theme.secondaryForegroundColor)
-                    .fixedSize(horizontal: false, vertical: true)
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(alignment: .leading, spacing: 8) {
+                ProSquircleIcon(
+                    symbolName: icon,
+                    tint: tint,
+                    size: .row,
+                    emphasis: .standard,
+                    theme: theme
+                )
+                featureRowText(title: title, subtitle: subtitle)
+            }
+        } else {
+            HStack(alignment: .top, spacing: 12) {
+                ProSquircleIcon(
+                    symbolName: icon,
+                    tint: tint,
+                    size: .row,
+                    emphasis: .standard,
+                    theme: theme
+                )
+                featureRowText(title: title, subtitle: subtitle)
             }
         }
     }
 
-    private var purchaseSection: some View {
-        VStack(spacing: 12) {
-            if proStore.isPurchased {
-                purchasedCard
-            } else {
-                if proStore.isTestFlight {
-                    testFlightNotice("Pro features are unlocked for TestFlight testers.")
-                } else {
-                    #if DEBUG
-                    testFlightNotice("Pro features are unlocked in Debug builds.")
-                    #endif
-                }
+    private func featureRowText(title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(theme.foregroundColor)
 
+            Text(subtitle)
+                .font(.footnote)
+                .foregroundStyle(theme.secondaryForegroundColor)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var frostedBottomDock: some View {
+        dockContent
+            .frame(maxWidth: ProDesign.Layout.readableHeroWidth)
+            .padding(.horizontal, 20)
+            .padding(.top, 10)
+            .padding(.bottom, 6)
+            .frame(maxWidth: .infinity)
+            .background {
+                ZStack {
+                    Rectangle().fill(.ultraThinMaterial)
+                    theme.backgroundColor.opacity(0.72)
+                }
+                .ignoresSafeArea(edges: .bottom)
+            }
+            .overlay(alignment: .top) {
+                Rectangle()
+                    .fill(palette.hairline)
+                    .frame(height: 0.5)
+            }
+    }
+
+    @ViewBuilder
+    private var dockContent: some View {
+        if proStore.isPurchased {
+            legalFooter
+        } else {
+            VStack(spacing: 0) {
                 planSelector
 
                 if let errorMessage = proStore.errorMessage {
@@ -204,73 +287,116 @@ struct ProPaywallView: View {
                         .font(.footnote)
                         .foregroundStyle(palette.critical)
                         .multilineTextAlignment(.center)
+                        .padding(.top, 8)
                 }
 
-                Button {
-                    AppHaptics.impact(.light)
-                    let product = selectedProduct
-                    let productID = selectedPlan.productID
-                    Task {
-                        if let product {
-                            await proStore.purchase(product)
-                        } else {
-                            await proStore.purchase(productID: productID)
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        if proStore.isLoading {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                        Text(purchaseButtonTitle)
-                            .fontWeight(.semibold)
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .tint(palette.proBrandAmber)
-                .disabled(proStore.isLoading)
+                primaryCTAButton
+                    .padding(.top, 10)
 
-                Button {
-                    AppHaptics.impact(.light)
-                    Task { await proStore.restorePurchases() }
-                } label: {
-                    Text("Restore Purchases")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-                .disabled(proStore.isLoading)
-
-                Text(disclosureText)
-                    .font(.caption)
+                Text("No account required · Zero telemetry · Cancel anytime")
+                    .font(.caption2)
                     .foregroundStyle(theme.secondaryForegroundColor)
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 2)
+                    .padding(.top, 6)
+
+                dockFooterActions
             }
         }
     }
 
+    private var primaryCTAButton: some View {
+        Button {
+            AppHaptics.impact(.light)
+            let product = selectedProduct
+            let productID = selectedPlan.productID
+            Task {
+                if let product {
+                    await proStore.purchase(product)
+                } else {
+                    await proStore.purchase(productID: productID)
+                }
+            }
+        } label: {
+            HStack(spacing: 8) {
+                if proStore.isLoading || isFetchingInitialPlans {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(palette.proBrandAmberButtonInk)
+                }
+                Text(purchaseButtonTitle)
+                    .fontWeight(.semibold)
+            }
+            .foregroundStyle(palette.proBrandAmberButtonInk)
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.large)
+        .tint(palette.proBrandAmber)
+        .disabled(proStore.isLoading)
+    }
+
+    private var restorePurchasesButton: some View {
+        Button {
+            AppHaptics.impact(.light)
+            Task { await proStore.restorePurchases() }
+        } label: {
+            Text("Restore Purchases")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(palette.proBrandAmber)
+                .frame(minHeight: ProDesign.Layout.minTapTarget)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(proStore.isLoading)
+    }
+
+    @ViewBuilder
+    private var dockFooterActions: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(spacing: 0) {
+                restorePurchasesButton
+                legalFooter
+            }
+        } else {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    restorePurchasesButton
+                        .fixedSize()
+                    footerSeparator
+                    legalLinksHorizontal(fixedWidth: true)
+                }
+                .font(.caption)
+
+                VStack(spacing: 0) {
+                    restorePurchasesButton
+                    legalFooter
+                }
+            }
+        }
+    }
+
+    private var footerSeparator: some View {
+        Text("·")
+            .foregroundStyle(theme.secondaryForegroundColor)
+            .accessibilityHidden(true)
+    }
+
     private var purchasedCard: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 12) {
-                Image(systemName: "checkmark.seal.fill")
-                    .font(.title3)
-                    .foregroundStyle(palette.healthy)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(Self.purchasedTitle(for: proStore.activePlan))
-                        .font(.headline)
-                        .foregroundStyle(theme.foregroundColor)
-                    Text(Self.purchasedSubtitle(for: proStore.activePlan))
-                        .font(.footnote)
-                        .foregroundStyle(theme.secondaryForegroundColor)
-                        .fixedSize(horizontal: false, vertical: true)
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    VStack(alignment: .leading, spacing: 8) {
+                        purchasedCardContent
+                    }
+                } else {
+                    HStack(spacing: 12) {
+                        purchasedCardContent
+                        Spacer()
+                    }
                 }
-                Spacer()
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(16)
             .background(
                 palette.healthy.opacity(theme.isDark ? 0.14 : 0.10),
@@ -295,8 +421,24 @@ struct ProPaywallView: View {
         }
     }
 
+    @ViewBuilder
+    private var purchasedCardContent: some View {
+        Image(systemName: "checkmark.seal.fill")
+            .font(.title3)
+            .foregroundStyle(palette.healthy)
+        VStack(alignment: .leading, spacing: 2) {
+            Text(Self.purchasedTitle(for: proStore.activePlan))
+                .font(.headline)
+                .foregroundStyle(theme.foregroundColor)
+            Text(Self.purchasedSubtitle(for: proStore.activePlan))
+                .font(.footnote)
+                .foregroundStyle(theme.secondaryForegroundColor)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var planSelector: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             planCard(
                 plan: .annual,
                 title: "Annual",
@@ -304,14 +446,14 @@ struct ProPaywallView: View {
                 prominentPrice: "\(annualPrice) / year",
                 subtitle: Self.annualSubtitle(
                     annualPrice: annualPrice,
-                    isTrialEligible: proStore.isAnnualTrialEligible
+                    isTrialEligible: showsAnnualTrialBadge
                 )
             )
 
             planCard(
                 plan: .lifetime,
                 title: "Lifetime",
-                badge: "Pay Once",
+                badge: "Best Value",
                 prominentPrice: lifetimePrice,
                 subtitle: "One-time purchase · Keep forever"
             )
@@ -326,6 +468,7 @@ struct ProPaywallView: View {
         subtitle: String
     ) -> some View {
         let isSelected = selectedPlan == plan
+        let isBestValue = plan == .lifetime
 
         return Button {
             guard selectedPlan != plan else { return }
@@ -334,7 +477,7 @@ struct ProPaywallView: View {
                 selectedPlan = plan
             }
         } label: {
-            HStack(alignment: .top, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.title3)
                     .foregroundStyle(
@@ -342,42 +485,34 @@ struct ProPaywallView: View {
                             ? palette.proBrandAmber
                             : theme.secondaryForegroundColor.opacity(0.55)
                     )
-                    .padding(.top, 2)
+                    .padding(.top, 1)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text(title)
-                            .font(.headline)
-                            .foregroundStyle(theme.foregroundColor)
-
-                        if let badge {
-                            Text(badge)
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .foregroundStyle(isSelected ? palette.proBrandAmber : theme.secondaryForegroundColor)
-                                .background(
-                                    isSelected
-                                        ? palette.badgeFill(for: palette.proBrandAmber)
-                                        : theme.secondaryForegroundColor.opacity(0.14),
-                                    in: Capsule()
-                                )
+                VStack(alignment: .leading, spacing: 3) {
+                    if dynamicTypeSize.isAccessibilitySize {
+                        VStack(alignment: .leading, spacing: 4) {
+                            planTitleAndBadge(title: title, badge: badge, isSelected: isSelected, isBestValue: isBestValue)
+                            Text(prominentPrice)
+                                .font(.headline.bold().monospacedDigit())
+                                .foregroundStyle(theme.foregroundColor)
+                        }
+                    } else {
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            planTitleAndBadge(title: title, badge: badge, isSelected: isSelected, isBestValue: isBestValue)
+                            Spacer(minLength: 4)
+                            Text(prominentPrice)
+                                .font(.headline.bold().monospacedDigit())
+                                .foregroundStyle(theme.foregroundColor)
                         }
                     }
 
-                    Text(prominentPrice)
-                        .font(.title3.bold().monospacedDigit())
-                        .foregroundStyle(theme.foregroundColor)
-
                     Text(subtitle)
-                        .font(.footnote)
+                        .font(.caption)
                         .foregroundStyle(theme.secondaryForegroundColor)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-
-                Spacer(minLength: 0)
             }
-            .padding(16)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 isSelected ? palette.proBrandAmber.opacity(theme.isDark ? 0.14 : 0.10) : palette.cardFill,
@@ -397,15 +532,43 @@ struct ProPaywallView: View {
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 
-    private var purchaseButtonTitle: String {
-        if proStore.isLoading {
-            return "Loading…"
+    private func planTitleAndBadge(
+        title: String,
+        badge: String?,
+        isSelected: Bool,
+        isBestValue: Bool
+    ) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.headline)
+                .foregroundStyle(theme.foregroundColor)
+
+            if let badge {
+                let highlightBadge = isSelected || isBestValue
+                Text(badge)
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .foregroundStyle(highlightBadge ? palette.proBrandAmber : theme.secondaryForegroundColor)
+                    .background(
+                        highlightBadge
+                            ? palette.badgeFill(for: palette.proBrandAmber)
+                            : theme.secondaryForegroundColor.opacity(0.14),
+                        in: Capsule()
+                    )
+            }
         }
-        return Self.primaryCTATitle(
+    }
+
+    private var purchaseButtonTitle: String {
+        Self.purchaseButtonTitle(
             for: selectedPlan,
             annualPrice: annualPrice,
             lifetimePrice: lifetimePrice,
-            isTrialEligible: proStore.isAnnualTrialEligible
+            isTrialEligible: proStore.isAnnualTrialEligible,
+            isLoading: proStore.isLoading,
+            isLoadingProducts: proStore.isLoadingProducts,
+            annualProductLoaded: proStore.annualProduct != nil
         )
     }
 
@@ -417,8 +580,42 @@ struct ProPaywallView: View {
         )
     }
 
+    nonisolated static func showsAnnualTrialBadge(isTrialEligible: Bool) -> Bool {
+        isTrialEligible
+    }
+
+    nonisolated static func heroSubtitle(isTrialEligible: Bool) -> String {
+        if isTrialEligible {
+            return "Start with a 7-day free trial or unlock lifetime access. Core SSH terminal, keys, snippets, and iCloud sync stay free forever."
+        }
+        return "Choose an annual subscription or one-time lifetime unlock. Core SSH terminal, keys, snippets, and iCloud sync stay free forever."
+    }
+
     nonisolated static func annualSubtitle(annualPrice: String, isTrialEligible: Bool) -> String {
         isTrialEligible ? "7 days free, then \(annualPrice)/year" : "Billed annually"
+    }
+
+    nonisolated static func purchaseButtonTitle(
+        for plan: PlanChoice,
+        annualPrice: String,
+        lifetimePrice: String,
+        isTrialEligible: Bool,
+        isLoading: Bool,
+        isLoadingProducts: Bool,
+        annualProductLoaded: Bool
+    ) -> String {
+        if (isLoading || isLoadingProducts) && !annualProductLoaded {
+            return "Loading plans…"
+        }
+        if isLoading {
+            return "Loading…"
+        }
+        return primaryCTATitle(
+            for: plan,
+            annualPrice: annualPrice,
+            lifetimePrice: lifetimePrice,
+            isTrialEligible: isTrialEligible
+        )
     }
 
     nonisolated static func primaryCTATitle(
@@ -474,6 +671,17 @@ struct ProPaywallView: View {
         }
     }
 
+    @ViewBuilder
+    private var testFlightBanner: some View {
+        if proStore.isTestFlight {
+            testFlightNotice("Pro features are unlocked for TestFlight testers.")
+        } else {
+            #if DEBUG
+            testFlightNotice("Pro features are unlocked in Debug builds.")
+            #endif
+        }
+    }
+
     private func testFlightNotice(_ message: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "checkmark.circle.fill")
@@ -494,22 +702,59 @@ struct ProPaywallView: View {
         )
     }
 
+    @ViewBuilder
     private var legalFooter: some View {
+        if dynamicTypeSize.isAccessibilitySize {
+            VStack(spacing: 0) {
+                legalLinksContent(fixedWidth: false)
+            }
+            .font(.caption)
+            .foregroundStyle(theme.secondaryForegroundColor)
+            .tint(theme.secondaryForegroundColor)
+        } else {
+            legalLinksHorizontal(fixedWidth: false)
+                .font(.caption)
+                .foregroundStyle(theme.secondaryForegroundColor)
+                .tint(theme.secondaryForegroundColor)
+        }
+    }
+
+    private func legalLinksHorizontal(fixedWidth: Bool) -> some View {
         HStack(spacing: 8) {
             if let privacyURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/PRIVACY.md") {
-                Link("Privacy Policy", destination: privacyURL)
+                legalLink("Privacy Policy", destination: privacyURL, fixedWidth: fixedWidth)
             }
 
-            Text("·")
-                .accessibilityHidden(true)
+            footerSeparator
 
             if let termsURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/TERMS.md") {
-                Link("Terms of Use", destination: termsURL)
+                legalLink("Terms of Use", destination: termsURL, fixedWidth: fixedWidth)
             }
         }
-        .font(.caption)
-        .foregroundStyle(theme.secondaryForegroundColor)
-        .tint(theme.secondaryForegroundColor)
-        .padding(.top, 2)
+    }
+
+    @ViewBuilder
+    private func legalLinksContent(fixedWidth: Bool) -> some View {
+        if let privacyURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/PRIVACY.md") {
+            legalLink("Privacy Policy", destination: privacyURL, fixedWidth: fixedWidth)
+        }
+
+        if let termsURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/TERMS.md") {
+            legalLink("Terms of Use", destination: termsURL, fixedWidth: fixedWidth)
+        }
+    }
+
+    @ViewBuilder
+    private func legalLink(_ title: String, destination: URL, fixedWidth: Bool) -> some View {
+        let link = Link(title, destination: destination)
+            .foregroundStyle(theme.secondaryForegroundColor)
+            .tint(theme.secondaryForegroundColor)
+            .frame(minHeight: ProDesign.Layout.minTapTarget)
+            .contentShape(Rectangle())
+        if fixedWidth {
+            link.fixedSize()
+        } else {
+            link
+        }
     }
 }

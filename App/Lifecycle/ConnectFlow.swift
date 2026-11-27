@@ -34,6 +34,7 @@ final class HostConnectionModel {
     private var kiRound = 0
     private var typedPassphrase: String?
     private var savePassphraseOnSuccess = false
+    private var savePasswordOnSuccess = false
     private var decision: CheckedContinuation<HostKeyDecision, Never>?
     private var task: Task<Void, Never>?
     private var connection: SSHConnection?
@@ -143,12 +144,16 @@ final class HostConnectionModel {
         typedPassword = nil
         typedPassphrase = nil
         savePassphraseOnSuccess = false
+        savePasswordOnSuccess = false
         start()
     }
 
     func submitInput(_ request: InputRequest, answers: [String], savePassphrase: Bool = false) {
         switch request.purpose {
-        case .password: typedPassword = answers.first ?? ""; connect()
+        case .password:
+            typedPassword = answers.first ?? ""
+            savePasswordOnSuccess = savePassphrase
+            connect()
         case .passphrase:
             typedPassphrase = answers.first ?? ""
             savePassphraseOnSuccess = savePassphrase
@@ -379,10 +384,12 @@ final class HostConnectionModel {
                 phase = .connected(bridge)
                 handedOff = true  // the connection now belongs to the receiver; teardown must not close it
                 persistTypedPassphrase()
+                persistTypedPassword()
                 connection = nil
                 typedPassword = nil
                 typedPassphrase = nil
                 savePassphraseOnSuccess = false
+                savePasswordOnSuccess = false
                 pendingTrustTarget = nil
                 onConnected?(conn, bridge)
             } catch {
@@ -415,6 +422,13 @@ final class HostConnectionModel {
         let store = KeyStore()
         guard let key = (try? store.list())?.first(where: { $0.id == keyID }) else { return }
         try? store.savePassphrase(phrase, for: key)
+    }
+
+    /// Saves the typed password after a successful connect; a failure here never fails the connection.
+    private func persistTypedPassword() {
+        guard savePasswordOnSuccess, let password = typedPassword, !password.isEmpty else { return }
+        savePasswordOnSuccess = false
+        try? HostSecrets.savePassword(password, for: hostID)
     }
 
     private func showMismatch(stored: String, presented: HostKey, host: String, port: Int, attempt mismatchAttempt: Int) {
@@ -501,6 +515,7 @@ final class HostConnectionModel {
         typedPassword = nil
         typedPassphrase = nil
         savePassphraseOnSuccess = false
+        savePasswordOnSuccess = false
         pendingTrustTarget = nil
         onConnected = nil
         onFailed = nil

@@ -12,6 +12,7 @@ struct AITerminalControlsOverlay: View {
     var onOpenDevPreview: (() -> Void)? = nil
 
     @State private var isComposerExpanded = false
+    @State private var isPhotoPickerPresented = false
     @State private var isUploadingPhoto = false
     @State private var photoUploadError: String?
     @State private var showingGitDiff = false
@@ -59,6 +60,7 @@ struct AITerminalControlsOverlay: View {
                 AIPromptComposerView(
                     prompt: $live.aiPromptDraft,
                     isFieldFocused: $isComposerFocused,
+                    isPhotoPickerPresented: $isPhotoPickerPresented,
                     agentName: live.aiAgentContext?.agent.name,
                     accentTint: accentTint,
                     isConnected: isConnected,
@@ -154,7 +156,7 @@ struct AITerminalControlsOverlay: View {
         .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
             collapseIfTerminalKeyboardActive()
         }
-        .onChange(of: showingGitDiff || showingDevPreview) { _, isPresented in
+        .onChange(of: showingGitDiff || showingDevPreview || isPhotoPickerPresented) { _, isPresented in
             live.hasInlineModalPresented = isPresented
         }
         .onDisappear {
@@ -194,9 +196,9 @@ struct AITerminalControlsOverlay: View {
     }
 
     private func collapseIfTerminalKeyboardActive() {
-        guard isComposerExpanded, !isComposerAwaitingInitialFocus else { return }
+        guard isComposerExpanded, !isComposerAwaitingInitialFocus, !isPhotoPickerPresented else { return }
         DispatchQueue.main.async {
-            guard isComposerExpanded, !isComposerAwaitingInitialFocus, !isComposerFocused else { return }
+            guard isComposerExpanded, !isComposerAwaitingInitialFocus, !isPhotoPickerPresented, !isComposerFocused else { return }
             if live.bar.window != nil {
                 collapseComposer()
             }
@@ -368,6 +370,15 @@ struct AIQuickActionBar: View {
                         }
 
                         actionChip(
+                            title: "Esc",
+                            systemImage: "escape",
+                            tint: nil,
+                            accessibilityLabel: "Escape key, cancels or interrupts prompt"
+                        ) {
+                            onSendText("\u{1B}")
+                        }
+
+                        actionChip(
                             title: "Shift+Tab",
                             systemImage: "arrow.left.to.line",
                             tint: nil,
@@ -485,13 +496,6 @@ struct AIQuickActionBar: View {
                 }
                 Text("Compose")
                     .font(.caption.weight(.semibold))
-                if showDraftBadge {
-                    Text("Draft")
-                        .font(.caption2.weight(.bold))
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 1)
-                        .background(palette.badgeFill(for: accentTint), in: Capsule())
-                }
             }
             .foregroundStyle(isComposerExpanded ? expandedComposeForeground : accentTint)
             .padding(.horizontal, 11)
@@ -519,6 +523,7 @@ struct AIQuickActionBar: View {
 struct AIPromptComposerView: View {
     @Binding var prompt: String
     @FocusState.Binding var isFieldFocused: Bool
+    @Binding var isPhotoPickerPresented: Bool
     let agentName: String?
     let accentTint: Color
     let isConnected: Bool
@@ -533,6 +538,7 @@ struct AIPromptComposerView: View {
     let onDismissComposer: () -> Void
 
     @State private var selectedPhotoItem: PhotosPickerItem?
+    @State private var focusRestoreTask: Task<Void, Never>?
 
     private var palette: ProDesign.Palette {
         ProDesign.Palette(theme: theme)
@@ -582,6 +588,8 @@ struct AIPromptComposerView: View {
 
                     Button {
                         AppHaptics.impact(.light)
+                        focusRestoreTask?.cancel()
+                        focusRestoreTask = nil
                         isFieldFocused = false
                         onDismissComposer()
                     } label: {
@@ -652,7 +660,10 @@ struct AIPromptComposerView: View {
                 }
 
                 HStack(spacing: 10) {
-                    PhotosPicker(selection: $selectedPhotoItem, matching: .images) {
+                    Button {
+                        AppHaptics.impact(.light)
+                        isPhotoPickerPresented = true
+                    } label: {
                         Group {
                             if isUploadingPhoto {
                                 ProgressView()
@@ -668,21 +679,30 @@ struct AIPromptComposerView: View {
                     .controlSize(.regular)
                     .disabled(!canUploadPhoto || isUploadingPhoto)
                     .accessibilityLabel("Attach screenshot or photo via SFTP")
+                    .photosPicker(
+                        isPresented: $isPhotoPickerPresented,
+                        selection: $selectedPhotoItem,
+                        matching: .images
+                    )
 
                     Button {
+                        focusRestoreTask?.cancel()
+                        focusRestoreTask = nil
                         isFieldFocused = false
                         onPaste()
                     } label: {
-                        Label("Paste", systemImage: "doc.on.clipboard")
+                        Label("Insert", systemImage: "arrow.turn.down.left")
                             .font(.subheadline.weight(.medium))
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
                     .disabled(!canSubmit)
-                    .accessibilityLabel("Paste prompt without submitting")
+                    .accessibilityLabel("Insert prompt into terminal without submitting")
 
                     Button {
+                        focusRestoreTask?.cancel()
+                        focusRestoreTask = nil
                         isFieldFocused = false
                         onSend()
                     } label: {
@@ -715,10 +735,37 @@ struct AIPromptComposerView: View {
             AppHaptics.impact(.light)
             onPickPhoto(newItem)
         }
+        .onChange(of: isPhotoPickerPresented) { wasPresented, isPresented in
+            if wasPresented && !isPresented {
+                restoreFocusAfterPickerDismiss()
+            }
+        }
+        .onChange(of: isFieldFocused) { _, focused in
+            if focused {
+                focusRestoreTask?.cancel()
+                focusRestoreTask = nil
+            }
+        }
         .onAppear {
             DispatchQueue.main.async {
                 isFieldFocused = true
             }
+        }
+        .onDisappear {
+            focusRestoreTask?.cancel()
+            focusRestoreTask = nil
+        }
+    }
+
+    private func restoreFocusAfterPickerDismiss() {
+        focusRestoreTask?.cancel()
+        DispatchQueue.main.async {
+            isFieldFocused = true
+        }
+        focusRestoreTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled, !isPhotoPickerPresented, !isFieldFocused else { return }
+            isFieldFocused = true
         }
     }
 }

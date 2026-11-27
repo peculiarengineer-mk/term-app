@@ -150,9 +150,18 @@ struct AuthPromptView: View {
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @State private var answers: [String]
     @State private var savePassphrase = false
+    @State private var savePassword = false
     @FocusState private var focusedIndex: Int?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+
+    private var shouldSaveSecret: Bool {
+        switch request.purpose {
+        case .password: savePassword
+        case .passphrase: savePassphrase
+        case .keyboardInteractive: false
+        }
+    }
 
     private var canSubmit: Bool {
         request.purpose == .keyboardInteractive || !(answers.first ?? "").isEmpty
@@ -237,6 +246,9 @@ struct AuthPromptView: View {
             if request.purpose == .passphrase {
                 Toggle("Save passphrase", isOn: $savePassphrase)
                     .padding(.top, 2)
+            } else if request.purpose == .password {
+                Toggle("Save password", isOn: $savePassword)
+                    .padding(.top, 2)
             }
         }
     }
@@ -272,7 +284,7 @@ struct AuthPromptView: View {
             if index + 1 < request.items.count {
                 focusedIndex = index + 1
             } else if canSubmit {
-                onSubmit(answers, savePassphrase)
+                onSubmit(answers, shouldSaveSecret)
             }
         }
         .padding(.horizontal, 12)
@@ -288,7 +300,7 @@ struct AuthPromptView: View {
         VStack(spacing: 10) {
             Button {
                 AppHaptics.impact(.light)
-                onSubmit(answers, savePassphrase)
+                onSubmit(answers, shouldSaveSecret)
             } label: {
                 Text("Continue")
                     .frame(maxWidth: .infinity)

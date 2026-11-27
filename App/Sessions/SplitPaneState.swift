@@ -31,6 +31,7 @@ final class SplitPaneState {
         }
     }
     var focusedPane: SplitFocus = .primary
+    var focusSequence: UInt64 = 0
 
     var isSplit: Bool {
         secondarySessionID != nil
@@ -320,7 +321,7 @@ struct SplitPanePickerSheet: View {
                 }
             }
             .searchable(text: $search, prompt: "Filter sessions or hosts")
-            .navigationTitle("Pick Session or Host for Split Pane")
+            .navigationTitle("Split Pane")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {

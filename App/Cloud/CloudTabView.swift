@@ -59,7 +59,7 @@ struct CloudTabView: View {
         .sheet(isPresented: $showingPaywall) {
             ProPaywallView()
                 .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
-                .tint(palette.accent)
+                .tint(palette.proBrandAmber)
         }
     }
 
@@ -79,14 +79,10 @@ struct CloudTabView: View {
     private var regularSplitLayout: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                providerPaneHeader(
-                    title: Provider.digitalOcean.rawValue,
-                    symbolName: "drop.fill",
-                    tint: .blue,
-                    isConnected: authState.hasDigitalOceanToken
+                DigitalOceanView(
+                    onOpenTokenSettings: { showingTokensSheet = true },
+                    showsInlineHeaderActions: true
                 )
-                Divider()
-                DigitalOceanView(onOpenTokenSettings: { showingTokensSheet = true })
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 

@@ -67,6 +67,7 @@ struct HostEditorView: View {
     @FocusState private var focusedField: Field?
 
     private var theme: TerminalTheme { TerminalTheme.preset(named: themeName) }
+    private var palette: ProDesign.Palette { ProDesign.Palette(theme: theme) }
     private var portValue: Int? {
         let trimmed = port.trimmingCharacters(in: .whitespacesAndNewlines)
         return Int(trimmed).flatMap { (1...65535).contains($0) ? $0 : nil }
@@ -79,10 +80,34 @@ struct HostEditorView: View {
     private var trimmedUser: String { user.trimmingCharacters(in: .whitespacesAndNewlines) }
     private var trimmedTagInput: String { tagInput.trimmingCharacters(in: .whitespacesAndNewlines) }
 
+    private var hostValidationMessage: String? {
+        if trimmedHost.isEmpty && trimmedUser.isEmpty {
+            return "Enter a hostname and username to save."
+        }
+        if trimmedHost.isEmpty {
+            return "Enter a hostname to save."
+        }
+        if trimmedHost.contains(where: \.isWhitespace) {
+            return "Hostname cannot contain spaces."
+        }
+        if trimmedUser.isEmpty {
+            return "Enter a username to save."
+        }
+        if portValue == nil {
+            return "Port must be between 1 and 65535."
+        }
+        return nil
+    }
+
+    private var authValidationMessage: String? {
+        if auth == "key", (keyID == nil || !keys.contains { $0.id == keyID }) {
+            return "Select or create an SSH key."
+        }
+        return nil
+    }
+
     private var valid: Bool {
-        !trimmedHost.isEmpty && !trimmedHost.contains(where: \.isWhitespace)
-            && !trimmedUser.isEmpty && portValue != nil
-            && (auth != "key" || (keyID != nil && keys.contains { $0.id == keyID }))
+        hostValidationMessage == nil && authValidationMessage == nil
     }
 
     private var existingTagSuggestions: [String] {
@@ -102,46 +127,97 @@ struct HostEditorView: View {
         }
     }
 
+    private var selectedJumpHost: Host? {
+        guard let proxyJumpHostID else { return nil }
+        return eligibleJumpHosts.first(where: { $0.id == proxyJumpHostID })
+            ?? allHosts.first(where: { $0.id == proxyJumpHostID })
+    }
+
+    private var jumpHostWarning: String? {
+        guard let jump = selectedJumpHost else { return nil }
+        let trimmedLabel = jump.label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = trimmedLabel.isEmpty ? jump.hostname : trimmedLabel
+        if jump.authMethod == "keyboardInteractive" {
+            return "\"\(name)\" uses interactive 2FA — Jump Hosts need SSH key auth or a saved password."
+        }
+        if jump.authMethod != "key", HostSecrets.password(for: jump.id) == nil {
+            return "\"\(name)\" has no saved password — Jump Hosts need SSH key auth or a saved password."
+        }
+        return nil
+    }
+
     var body: some View {
         Form {
-            Section("Host") {
+            Section {
                 TextField("Label", text: $label)
                     .focused($focusedField, equals: .label)
+                    .submitLabel(.next)
+                    .onSubmit { focusedField = .hostname }
                 TextField("Hostname", text: $hostname)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .keyboardType(.URL)
                     .focused($focusedField, equals: .hostname)
+                    .submitLabel(.next)
+                    .onSubmit { focusedField = .port }
                 TextField("Port", text: $port)
                     .keyboardType(.numberPad)
                     .focused($focusedField, equals: .port)
+                    .submitLabel(.next)
+                    .onSubmit { focusedField = .user }
                 TextField("User", text: $user)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
                     .focused($focusedField, equals: .user)
+                    .submitLabel(auth == "key" ? .done : .next)
+                    .onSubmit { focusedField = auth == "key" ? nil : .password }
+            } header: {
+                Text("Host")
+            } footer: {
+                if let hostValidationMessage {
+                    Text(hostValidationMessage)
+                }
             }
 
-            Section("Authentication") {
+            Section {
                 Picker("Method", selection: $auth) {
                     Text("Password").tag("password")
                     Text("Key").tag("key")
                     Text("Keyboard-interactive").tag("keyboardInteractive")
                 }
                 if auth == "key" {
-                    Picker("Key", selection: $keyID) {
-                        Text("Select…").tag(UUID?.none)
-                        if let keyID, !keys.contains(where: { $0.id == keyID }) {
-                            Text("Missing Key").tag(UUID?.some(keyID))
+                    if keys.isEmpty {
+                        if isSelectedKeyMissing {
+                            Label(
+                                "The selected key is missing or deleted from this device. Generate or import a key below.",
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        } else {
+                            Label(
+                                "No SSH keys yet — generate or import one below.",
+                                systemImage: "key.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         }
-                        ForEach(keys) { Text($0.name).tag(UUID?.some($0.id)) }
-                    }
-                    if isSelectedKeyMissing {
-                        Label(
-                            "The selected key is missing or deleted from this device. Choose, generate, or import a key.",
-                            systemImage: "exclamationmark.triangle.fill"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(.orange)
+                    } else {
+                        Picker("Key", selection: $keyID) {
+                            Text("Select…").tag(UUID?.none)
+                            if let keyID, !keys.contains(where: { $0.id == keyID }) {
+                                Text("Missing Key").tag(UUID?.some(keyID))
+                            }
+                            ForEach(keys) { Text($0.name).tag(UUID?.some($0.id)) }
+                        }
+                        if isSelectedKeyMissing {
+                            Label(
+                                "The selected key is missing or deleted from this device. Choose, generate, or import a key.",
+                                systemImage: "exclamationmark.triangle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        }
                     }
                     Button {
                         showGenerateKey = true
@@ -156,6 +232,14 @@ struct HostEditorView: View {
                 } else {
                     SecureField("Saved password (optional)", text: $password)
                         .focused($focusedField, equals: .password)
+                        .submitLabel(.done)
+                        .onSubmit { focusedField = nil }
+                }
+            } header: {
+                Text("Authentication")
+            } footer: {
+                if let authValidationMessage {
+                    Text(authValidationMessage)
                 }
             }
 
@@ -248,6 +332,12 @@ struct HostEditorView: View {
                     ForEach(eligibleJumpHosts) { candidate in
                         Text(jumpHostOptionLabel(for: candidate)).tag(UUID?.some(candidate.id))
                     }
+                }
+
+                if let jumpHostWarning {
+                    Label(jumpHostWarning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(palette.warning)
                 }
 
                 Toggle("Forward SSH Agent (-A)", isOn: $forwardAgent)

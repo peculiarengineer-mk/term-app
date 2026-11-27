@@ -1,3 +1,4 @@
+import GameController
 import SwiftUI
 import SwiftData
 import UIKit
@@ -786,13 +787,13 @@ struct SessionTabsView<HostList: View>: View {
                             }
                             .padding(.horizontal, 8)
                         }
-                        .onChange(of: selection) { _, newSelection in
-                            guard let newSelection else { return }
+                        .onChange(of: focusedTabID) { _, newFocusedID in
+                            guard let newFocusedID else { return }
                             if reduceMotion {
-                                proxy.scrollTo(newSelection, anchor: .center)
+                                proxy.scrollTo(newFocusedID, anchor: .center)
                             } else {
                                 withAnimation(.easeInOut(duration: 0.2)) {
-                                    proxy.scrollTo(newSelection, anchor: .center)
+                                    proxy.scrollTo(newFocusedID, anchor: .center)
                                 }
                             }
                         }
@@ -877,20 +878,19 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     private func liveTabChip(for live: LiveSession) -> some View {
-        let isSelected = selection == live.id
+        let isPrimaryPane = selection == live.id
         let isSecondaryPane = isSplitVisible && splitState.secondarySessionID == live.id
+        let isFocusedChip = isSplitVisible ? (focusedTabID == live.id) : isPrimaryPane
+        let isSplitMember = isSplitVisible && (isPrimaryPane || isSecondaryPane)
+
         return HStack(spacing: 4) {
             Button {
-                AppHaptics.impact(.light)
-                selection = live.id
+                selectOrFocusTab(live.id)
             } label: {
                 HStack(spacing: 6) {
                     ConnectionStatusDot(status: live.connectionStatus)
-                    if isSecondaryPane {
-                        Image(systemName: splitState.axis == .horizontal ? "rectangle.righthalf.inset.filled" : "rectangle.bottomhalf.inset.filled")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(theme.accentColor)
-                            .accessibilityHidden(true)
+                    if isSplitMember {
+                        splitTabChipIcon(isPrimary: isPrimaryPane, isFocused: isFocusedChip)
                     }
                     if let ai = live.aiAgentContext {
                         Image(systemName: AgentVisuals.agentSymbol(for: ai.agent))
@@ -900,17 +900,21 @@ struct SessionTabsView<HostList: View>: View {
                     }
                     Text(live.title)
                         .lineLimit(1)
-                        .font(.subheadline.weight(isSelected ? .semibold : .medium))
+                        .font(.subheadline.weight(isFocusedChip ? .semibold : .medium))
                     AgentActivityBadge(state: live.agentActivityState)
                 }
-                .padding(.vertical, isSelected ? 6 : 8)
+                .padding(.vertical, isFocusedChip ? 6 : 8)
             }
             .buttonStyle(.plain)
             .accessibilityLabel(live.title)
-            .accessibilityValue(live.connectionStatus.accessibilityLabel)
-            .accessibilityAddTraits(isSelected ? .isSelected : [])
+            .accessibilityValue(
+                isSplitVisible && isFocusedChip
+                    ? "\(live.connectionStatus.accessibilityLabel), focused pane"
+                    : live.connectionStatus.accessibilityLabel
+            )
+            .accessibilityAddTraits(isFocusedChip ? .isSelected : [])
 
-            if isSelected {
+            if isFocusedChip {
                 Button {
                     requestCloseLive(live)
                 } label: {
@@ -925,22 +929,18 @@ struct SessionTabsView<HostList: View>: View {
             }
         }
         .padding(.leading, 12)
-        .padding(.trailing, isSelected ? 2 : 12)
-        .padding(.vertical, isSelected ? 0 : 1)
-        .foregroundStyle(isSelected ? theme.foregroundColor : theme.secondaryForegroundColor)
+        .padding(.trailing, isFocusedChip ? 2 : 12)
+        .padding(.vertical, isFocusedChip ? 0 : 1)
+        .foregroundStyle(isFocusedChip ? theme.foregroundColor : theme.secondaryForegroundColor)
         .background(
-            isSelected
-                ? theme.accentColor.opacity(theme.isDark ? 0.22 : 0.16)
-                : theme.foregroundColor.opacity(theme.isDark ? 0.08 : 0.06),
+            tabChipBackground(isFocused: isFocusedChip, isSplitMember: isSplitMember),
             in: Capsule()
         )
         .overlay(
             Capsule()
                 .strokeBorder(
-                    isSelected
-                        ? theme.accentColor.opacity(0.45)
-                        : (isSecondaryPane ? theme.accentColor.opacity(0.30) : Color.clear),
-                    lineWidth: 1
+                    tabChipStrokeColor(isFocused: isFocusedChip, isSplitMember: isSplitMember),
+                    lineWidth: isFocusedChip && isSplitVisible ? 1.25 : 1
                 )
         )
         .contextMenu {
@@ -959,37 +959,35 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     private func pendingTabChip(for pending: PendingConnection) -> some View {
-        let isSelected = selection == pending.id
+        let isPrimaryPane = selection == pending.id
         let isSecondaryPane = isSplitVisible && splitState.secondarySessionID == pending.id
+        let isFocusedChip = isSplitVisible ? (focusedTabID == pending.id) : isPrimaryPane
+        let isSplitMember = isSplitVisible && (isPrimaryPane || isSecondaryPane)
         let chipTitle = pending.model.title.isEmpty ? pending.title : pending.model.title
         let dotStatus = pendingStatus(for: pending.model.phase)
         let statusValue = dotStatus == .disconnected ? "Connection error" : "Connecting"
 
         return HStack(spacing: 4) {
             Button {
-                AppHaptics.impact(.light)
-                selection = pending.id
+                selectOrFocusTab(pending.id)
             } label: {
                 HStack(spacing: 6) {
                     ConnectionStatusDot(status: dotStatus)
-                    if isSecondaryPane {
-                        Image(systemName: splitState.axis == .horizontal ? "rectangle.righthalf.inset.filled" : "rectangle.bottomhalf.inset.filled")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(theme.accentColor)
-                            .accessibilityHidden(true)
+                    if isSplitMember {
+                        splitTabChipIcon(isPrimary: isPrimaryPane, isFocused: isFocusedChip)
                     }
                     Text(chipTitle)
                         .lineLimit(1)
-                        .font(.subheadline.weight(isSelected ? .semibold : .medium))
+                        .font(.subheadline.weight(isFocusedChip ? .semibold : .medium))
                 }
-                .padding(.vertical, isSelected ? 6 : 8)
+                .padding(.vertical, isFocusedChip ? 6 : 8)
             }
             .buttonStyle(.plain)
             .accessibilityLabel(chipTitle)
-            .accessibilityValue(statusValue)
-            .accessibilityAddTraits(isSelected ? .isSelected : [])
+            .accessibilityValue(isSplitVisible && isFocusedChip ? "\(statusValue), focused pane" : statusValue)
+            .accessibilityAddTraits(isFocusedChip ? .isSelected : [])
 
-            if isSelected {
+            if isFocusedChip {
                 Button {
                     AppHaptics.impact(.light)
                     cancelPending(pending.id)
@@ -1005,22 +1003,18 @@ struct SessionTabsView<HostList: View>: View {
             }
         }
         .padding(.leading, 12)
-        .padding(.trailing, isSelected ? 2 : 12)
-        .padding(.vertical, isSelected ? 0 : 1)
-        .foregroundStyle(isSelected ? theme.foregroundColor : theme.secondaryForegroundColor)
+        .padding(.trailing, isFocusedChip ? 2 : 12)
+        .padding(.vertical, isFocusedChip ? 0 : 1)
+        .foregroundStyle(isFocusedChip ? theme.foregroundColor : theme.secondaryForegroundColor)
         .background(
-            isSelected
-                ? theme.accentColor.opacity(theme.isDark ? 0.22 : 0.16)
-                : theme.foregroundColor.opacity(theme.isDark ? 0.08 : 0.06),
+            tabChipBackground(isFocused: isFocusedChip, isSplitMember: isSplitMember),
             in: Capsule()
         )
         .overlay(
             Capsule()
                 .strokeBorder(
-                    isSelected
-                        ? theme.accentColor.opacity(0.45)
-                        : (isSecondaryPane ? theme.accentColor.opacity(0.30) : Color.clear),
-                    lineWidth: 1
+                    tabChipStrokeColor(isFocused: isFocusedChip, isSplitMember: isSplitMember),
+                    lineWidth: isFocusedChip && isSplitVisible ? 1.25 : 1
                 )
         )
         .contextMenu {
@@ -1029,6 +1023,38 @@ struct SessionTabsView<HostList: View>: View {
                 cancelPending(pending.id)
             }
         }
+    }
+
+    private func splitTabChipIcon(isPrimary: Bool, isFocused: Bool) -> some View {
+        let symbolName: String = if isPrimary {
+            splitState.axis == .horizontal ? "rectangle.lefthalf.inset.filled" : "rectangle.tophalf.inset.filled"
+        } else {
+            splitState.axis == .horizontal ? "rectangle.righthalf.inset.filled" : "rectangle.bottomhalf.inset.filled"
+        }
+        return Image(systemName: symbolName)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(isFocused ? theme.accentColor : theme.secondaryForegroundColor)
+            .accessibilityHidden(true)
+    }
+
+    private func tabChipBackground(isFocused: Bool, isSplitMember: Bool) -> Color {
+        if isFocused {
+            return theme.accentColor.opacity(theme.isDark ? 0.24 : 0.18)
+        }
+        if isSplitMember {
+            return theme.foregroundColor.opacity(theme.isDark ? 0.12 : 0.08)
+        }
+        return theme.foregroundColor.opacity(theme.isDark ? 0.08 : 0.06)
+    }
+
+    private func tabChipStrokeColor(isFocused: Bool, isSplitMember: Bool) -> Color {
+        if isFocused {
+            return theme.accentColor.opacity(isSplitVisible ? 0.65 : 0.45)
+        }
+        if isSplitMember {
+            return theme.accentColor.opacity(0.26)
+        }
+        return .clear
     }
 
     private func pendingStatus(for phase: HostConnectionModel.Phase) -> LiveSession.ConnectionStatus {
@@ -1147,8 +1173,7 @@ struct SessionTabsView<HostList: View>: View {
     func addTab(_ id: UUID) {
         guard manager.session(id: id) != nil else { return }
         if horizontalSizeClass == .regular, splitState.secondarySessionID == id, selectedLive != nil {
-            splitState.focusedPane = .secondary
-            manager.session(id: id)?.shouldAutoFocus = true
+            focusPane(.secondary, activateTerminal: true)
             return
         }
         manager.show(id, in: windowID) // moves it out of any other window
@@ -1348,6 +1373,11 @@ struct SessionTabsView<HostList: View>: View {
     }
 
     fileprivate func closeCurrent() {
+        if isSplitVisible {
+            AppHaptics.impact(.light)
+            unsplitKeepingOther(closing: splitState.focusedPane)
+            return
+        }
         guard let targetID = focusedTabID ?? selection else { return }
         if let live = windowLiveSessions.first(where: { $0.id == targetID }) {
             requestCloseLive(live)
@@ -1357,14 +1387,27 @@ struct SessionTabsView<HostList: View>: View {
         }
     }
 
+    private func selectOrFocusTab(_ id: UUID) {
+        if horizontalSizeClass == .regular, splitState.secondarySessionID == id, selectedLive != nil {
+            AppHaptics.impact(.light)
+            focusPane(.secondary, activateTerminal: true)
+            return
+        }
+        if horizontalSizeClass == .regular, isSplitVisible, selection == id {
+            AppHaptics.impact(.light)
+            focusPane(.primary, activateTerminal: true)
+            return
+        }
+        if selection != id {
+            AppHaptics.impact(.light)
+            selection = id
+        }
+    }
+
     fileprivate func switchTab(_ index: Int) {
         let entries = tabEntries
         guard entries.indices.contains(index) else { return }
-        let targetID = entries[index].id
-        if selection != targetID {
-            AppHaptics.impact(.light)
-            selection = targetID
-        }
+        selectOrFocusTab(entries[index].id)
     }
 
     private func adjustFontSize(by delta: Double) {
@@ -1525,6 +1568,7 @@ struct SessionTabsView<HostList: View>: View {
             TerminalPane(
                 live: primary,
                 isFocusedPane: isFocused,
+                explicitFocusSequence: splitState.focusSequence,
                 onFocusPane: { focusPane(.primary) },
                 onOpenGitDiff: {
                     focusPane(.primary)
@@ -1553,6 +1597,7 @@ struct SessionTabsView<HostList: View>: View {
                 TerminalPane(
                     live: secondary,
                     isFocusedPane: isFocused,
+                    explicitFocusSequence: splitState.focusSequence,
                     onFocusPane: { focusPane(.secondary) },
                     onOpenGitDiff: {
                         focusPane(.secondary)
@@ -1660,7 +1705,7 @@ struct SessionTabsView<HostList: View>: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(theme.secondaryForegroundColor)
-                    .frame(width: 26, height: 26)
+                    .frame(minWidth: 44, minHeight: 32)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -1668,7 +1713,7 @@ struct SessionTabsView<HostList: View>: View {
         }
         .padding(.leading, 8)
         .padding(.trailing, 2)
-        .frame(height: 26)
+        .frame(minHeight: 32)
         .background(
             isFocused
                 ? theme.accentColor.opacity(theme.isDark ? 0.14 : 0.10)
@@ -1682,13 +1727,24 @@ struct SessionTabsView<HostList: View>: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            focusPane(pane)
+            focusPane(pane, activateTerminal: true)
         }
     }
 
-    private func focusPane(_ pane: SplitPaneState.SplitFocus) {
+    private func focusPane(_ pane: SplitPaneState.SplitFocus, activateTerminal: Bool = false) {
         if splitState.focusedPane != pane {
             splitState.focusedPane = pane
+        }
+        let targetLive = (pane == .primary) ? selectedLive : secondaryLive
+        if let targetLive {
+            if activateTerminal {
+                if GCKeyboard.coalesced != nil {
+                    targetLive.shouldAutoFocus = true
+                }
+                splitState.focusSequence &+= 1
+            }
+        } else {
+            selectedLive?.controller.dismissKeyboard()
         }
     }
 
@@ -1696,7 +1752,12 @@ struct SessionTabsView<HostList: View>: View {
         guard isSplitVisible else { return }
         AppHaptics.impact(.light)
         splitState.toggleFocus()
-        focusedLive?.shouldAutoFocus = true
+        if let live = focusedLive {
+            live.shouldAutoFocus = true
+            splitState.focusSequence &+= 1
+        } else {
+            selectedLive?.controller.dismissKeyboard()
+        }
     }
 
     private func unsplitKeepingOther(closing pane: SplitPaneState.SplitFocus) {

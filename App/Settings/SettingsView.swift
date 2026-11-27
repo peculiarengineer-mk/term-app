@@ -5,6 +5,7 @@ import TermUI
 struct SettingsView: View {
     @Environment(AppLockManager.self) private var appLock
     @Environment(ProStore.self) private var proStore
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @AppStorage("sync.enabled") private var syncEnabled = false
     @AppStorage(AppearanceSettings.themeKey) private var themeName = AppearanceSettings.defaultThemeName
     @AppStorage(AppearanceSettings.fontSizeKey) private var fontSize = AppearanceSettings.defaultFontSize
@@ -269,7 +270,7 @@ struct SettingsView: View {
         .sheet(isPresented: $showingPaywall) {
             ProPaywallView()
                 .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: currentTheme))
-                .tint(currentTheme.accentColor)
+                .tint(palette.proBrandAmber)
         }
     }
 
@@ -342,35 +343,48 @@ struct SettingsView: View {
                 showingPaywall = true
             } label: {
                 HStack(spacing: 12) {
-                    ProSquircleIcon(
-                        symbolName: proStore.isProUnlocked ? "checkmark.seal.fill" : "sparkles",
-                        tint: proStore.isProUnlocked ? palette.healthy : palette.proBrandAmber,
-                        size: .row,
-                        theme: currentTheme
-                    )
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(proStatusTitle)
-                            .font(.headline)
-                            .foregroundStyle(.primary)
-
-                        Text("AI Agents, SFTP, Port Forwarding, DigitalOcean & Cloudflare")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                    if !dynamicTypeSize.isAccessibilitySize {
+                        ProSquircleIcon(
+                            symbolName: proStore.isProUnlocked ? "checkmark.seal.fill" : "sparkles",
+                            tint: proStore.isProUnlocked ? palette.healthy : palette.proBrandAmber,
+                            size: .row,
+                            theme: currentTheme
+                        )
                     }
 
-                    Spacer(minLength: 8)
+                    AdaptiveKeyValueRow(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            if dynamicTypeSize.isAccessibilitySize {
+                                ProSquircleIcon(
+                                    symbolName: proStore.isProUnlocked ? "checkmark.seal.fill" : "sparkles",
+                                    tint: proStore.isProUnlocked ? palette.healthy : palette.proBrandAmber,
+                                    size: .row,
+                                    theme: currentTheme
+                                )
+                                .padding(.bottom, 2)
+                            }
 
-                    if !proStore.isProUnlocked {
-                        Text(
-                            Self.proTrailingPriceText(
-                                annualDisplayPrice: proStore.annualProduct?.displayPrice,
-                                lifetimeDisplayPrice: proStore.lifetimeProduct?.displayPrice
+                            Text(proStatusTitle)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+
+                            Text("AI Agents, SFTP, Port Forwarding, DigitalOcean & Cloudflare")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } trailing: {
+                        if !proStore.isProUnlocked {
+                            Text(
+                                Self.proTrailingPriceText(
+                                    annualDisplayPrice: proStore.annualProduct?.displayPrice,
+                                    lifetimeDisplayPrice: proStore.lifetimeProduct?.displayPrice
+                                )
                             )
-                        )
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(palette.proBrandAmber)
-                        .lineLimit(1)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(palette.proBrandAmber)
+                            .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
+                        }
                     }
 
                     Image(systemName: "chevron.right")

@@ -1,4 +1,7 @@
 import Foundation
+import SwiftUI
+import TermUI
+import UIKit
 import XCTest
 @testable import TermApp
 
@@ -100,6 +103,16 @@ final class ProStoreTests: XCTestCase {
     }
 
     func testPaywallCopyCompliance() {
+        XCTAssertTrue(ProPaywallView.showsAnnualTrialBadge(isTrialEligible: true))
+        XCTAssertFalse(ProPaywallView.showsAnnualTrialBadge(isTrialEligible: false))
+
+        XCTAssertTrue(
+            ProPaywallView.heroSubtitle(isTrialEligible: true).contains("7-day free trial")
+        )
+        XCTAssertFalse(
+            ProPaywallView.heroSubtitle(isTrialEligible: false).localizedCaseInsensitiveContains("trial")
+        )
+
         XCTAssertEqual(
             ProPaywallView.annualSubtitle(annualPrice: "$9.99", isTrialEligible: true),
             "7 days free, then $9.99/year"
@@ -107,6 +120,43 @@ final class ProStoreTests: XCTestCase {
         XCTAssertEqual(
             ProPaywallView.annualSubtitle(annualPrice: "$9.99", isTrialEligible: false),
             "Billed annually"
+        )
+
+        XCTAssertEqual(
+            ProPaywallView.purchaseButtonTitle(
+                for: .annual,
+                annualPrice: "$9.99",
+                lifetimePrice: "$29.99",
+                isTrialEligible: false,
+                isLoading: true,
+                isLoadingProducts: false,
+                annualProductLoaded: false
+            ),
+            "Loading plans…"
+        )
+        XCTAssertEqual(
+            ProPaywallView.purchaseButtonTitle(
+                for: .annual,
+                annualPrice: "$9.99",
+                lifetimePrice: "$29.99",
+                isTrialEligible: false,
+                isLoading: false,
+                isLoadingProducts: true,
+                annualProductLoaded: false
+            ),
+            "Loading plans…"
+        )
+        XCTAssertEqual(
+            ProPaywallView.purchaseButtonTitle(
+                for: .annual,
+                annualPrice: "$9.99",
+                lifetimePrice: "$29.99",
+                isTrialEligible: true,
+                isLoading: true,
+                isLoadingProducts: false,
+                annualProductLoaded: true
+            ),
+            "Loading…"
         )
 
         XCTAssertEqual(
@@ -199,6 +249,39 @@ final class ProStoreTests: XCTestCase {
         XCTAssertEqual(
             SettingsView.proTrailingPriceText(annualDisplayPrice: nil, lifetimeDisplayPrice: nil),
             "From $9.99/yr"
+        )
+    }
+
+    func testProPaletteWCAGContrastAcrossDarkAndLightThemes() throws {
+        let darkPalette = ProDesign.Palette(theme: .appleProDark)
+        let lightPalette = ProDesign.Palette(theme: .light)
+
+        let darkAmber = try rgbComponents(of: darkPalette.proBrandAmber)
+        let darkInk = try rgbComponents(of: darkPalette.proBrandAmberButtonInk)
+        let darkBackground = TerminalTheme.appleProDark.background
+        XCTAssertGreaterThanOrEqual(darkAmber.contrastRatio(with: darkBackground), 4.5)
+        XCTAssertGreaterThanOrEqual(darkAmber.contrastRatio(with: darkInk), 9.0)
+
+        let lightAmber = try rgbComponents(of: lightPalette.proBrandAmber)
+        let lightWarning = try rgbComponents(of: lightPalette.warning)
+        let lightInk = try rgbComponents(of: lightPalette.proBrandAmberButtonInk)
+        let lightBackground = TerminalTheme.light.background
+        XCTAssertEqual(lightAmber, lightWarning)
+        XCTAssertGreaterThanOrEqual(lightAmber.contrastRatio(with: lightBackground), 4.5)
+        XCTAssertGreaterThanOrEqual(lightAmber.contrastRatio(with: lightInk), 4.5)
+    }
+
+    private func rgbComponents(of color: SwiftUI.Color) throws -> TerminalTheme.RGB {
+        var r: CGFloat = 0
+        var g: CGFloat = 0
+        var b: CGFloat = 0
+        var a: CGFloat = 0
+        let resolved = UIColor(color)
+        XCTAssertTrue(resolved.getRed(&r, green: &g, blue: &b, alpha: &a))
+        return TerminalTheme.RGB(
+            UInt8((r * 255).rounded()),
+            UInt8((g * 255).rounded()),
+            UInt8((b * 255).rounded())
         )
     }
 }

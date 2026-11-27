@@ -21,15 +21,16 @@ enum ProDesign {
 
         init(theme: TerminalTheme = .appleProDark) {
             let dark = theme.isDark
+            let amber = dark
+                ? Color(red: 0xFF / 255.0, green: 0x9F / 255.0, blue: 0x0A / 255.0)
+                : Color(red: 0xA8 / 255.0, green: 0x4B / 255.0, blue: 0x00 / 255.0)
             self.isDark = dark
             self.accent = theme.accentColor
-            self.proBrandAmber = TerminalTheme.appleProDark.accentColor
+            self.proBrandAmber = amber
             self.healthy = dark
                 ? Color(red: 0x30 / 255.0, green: 0xD1 / 255.0, blue: 0x58 / 255.0)
                 : Color(red: 0x1E / 255.0, green: 0x8E / 255.0, blue: 0x3E / 255.0)
-            self.warning = dark
-                ? Color(red: 0xFF / 255.0, green: 0x9F / 255.0, blue: 0x0A / 255.0)
-                : Color(red: 0xC9 / 255.0, green: 0x6A / 255.0, blue: 0x00 / 255.0)
+            self.warning = amber
             self.critical = dark
                 ? Color(red: 0xFF / 255.0, green: 0x45 / 255.0, blue: 0x3A / 255.0)
                 : Color(red: 0xD9 / 255.0, green: 0x2B / 255.0, blue: 0x20 / 255.0)
@@ -42,6 +43,12 @@ enum ProDesign {
             self.borderSubtle = dark ? Color.white.opacity(0.12) : Color.black.opacity(0.10)
             self.borderFocus = theme.accentColor.opacity(0.75)
             self.hairline = dark ? Color.white.opacity(0.12) : Color.black.opacity(0.12)
+        }
+
+        var proBrandAmberButtonInk: Color {
+            isDark
+                ? Color(red: 0x12 / 255.0, green: 0x13 / 255.0, blue: 0x18 / 255.0)
+                : .white
         }
 
         func badgeFill(for tint: Color) -> Color {
@@ -354,6 +361,7 @@ struct ProFeatureGateView: View {
                 } label: {
                     Label("Unlock AmberTTY Pro", systemImage: "sparkles")
                         .fontWeight(.semibold)
+                        .foregroundStyle(palette.proBrandAmberButtonInk)
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)

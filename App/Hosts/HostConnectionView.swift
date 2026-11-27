@@ -11,6 +11,8 @@ struct HostConnectionView: View {
 
     @State private var ownedModel: HostConnectionModel?
     @State private var didStart = false
+    @State private var showEditor = false
+    @State private var pendingRetryAfterEdit = false
     @Environment(\.dismiss) private var dismiss
     @Environment(SessionManager.self) private var manager
     @Environment(\.openSessionTab) private var openTab
@@ -144,6 +146,16 @@ struct HostConnectionView: View {
                             .buttonStyle(.borderedProminent)
                             .controlSize(.large)
 
+                            Button {
+                                AppHaptics.impact(.light)
+                                showEditor = true
+                            } label: {
+                                Label("Edit Host", systemImage: "pencil")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.large)
+
                             Button(role: .cancel) {
                                 closeConnection()
                             } label: {
@@ -190,6 +202,23 @@ struct HostConnectionView: View {
                 didStart = false
             }
         }
+        .sheet(isPresented: $showEditor, onDismiss: retryAfterEditIfNeeded) {
+            NavigationStack {
+                HostEditorView(host: host, onSaved: {
+                    pendingRetryAfterEdit = true
+                })
+            }
+            .preferredColorScheme(AppearanceSettings.preferredColorScheme(for: theme))
+            .tint(theme.accentColor)
+        }
+    }
+
+    private func retryAfterEditIfNeeded() {
+        guard pendingRetryAfterEdit else { return }
+        pendingRetryAfterEdit = false
+        guard let model = activeModel else { return }
+        model.refresh(from: host)
+        model.retry()
     }
 
     private var connectingCard: some View {

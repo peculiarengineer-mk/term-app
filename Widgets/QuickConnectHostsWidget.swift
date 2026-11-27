@@ -61,13 +61,15 @@ struct QuickConnectHostsWidget: Widget {
         }
         .configurationDisplayName("Quick Connect")
         .description("Launch an SSH terminal session on your saved hosts in one tap.")
-        .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular])
+        .supportedFamilies([.systemSmall, .systemMedium, .accessoryCircular, .accessoryRectangular])
     }
 }
 
 private struct QuickConnectHostsWidgetView: View {
     @Environment(\.widgetFamily) private var family
     let entry: QuickConnectHostsEntry
+
+    private static let hostsTabURL = URL(string: "termapp://hosts")
 
     var body: some View {
         switch family {
@@ -77,6 +79,9 @@ private struct QuickConnectHostsWidgetView: View {
         case .systemMedium:
             mediumView
                 .containerBackground(WidgetPalette.background, for: .widget)
+        case .accessoryCircular:
+            accessoryCircularView
+                .containerBackground(.clear, for: .widget)
         case .accessoryRectangular:
             accessoryRectangularView
                 .containerBackground(.clear, for: .widget)
@@ -93,6 +98,7 @@ private struct QuickConnectHostsWidgetView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     WidgetSquircleIcon(symbolName: appearance.symbol, tint: appearance.tint, size: 32)
+                        .widgetAccentable()
                     Spacer()
                     if entry.hosts.count > 1 {
                         Text("+\(entry.hosts.count - 1)")
@@ -129,11 +135,13 @@ private struct QuickConnectHostsWidgetView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
                 .background(WidgetPalette.amber.opacity(0.18), in: Capsule())
+                .widgetAccentable()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .widgetURL(TermAppDeepLink.connectHost(hostID: topHost.id).url)
         } else {
             emptyStateView
+                .widgetURL(Self.hostsTabURL)
         }
     }
 
@@ -141,12 +149,14 @@ private struct QuickConnectHostsWidgetView: View {
     private var mediumView: some View {
         if entry.hosts.isEmpty {
             emptyStateView
+                .widgetURL(Self.hostsTabURL)
         } else {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 6) {
                     Image(systemName: "server.rack")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(WidgetPalette.amber)
+                        .widgetAccentable()
                     Text("Quick Connect")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(WidgetPalette.foreground)
@@ -167,6 +177,37 @@ private struct QuickConnectHostsWidgetView: View {
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+    }
+
+    @ViewBuilder
+    private var accessoryCircularView: some View {
+        if let topHost = entry.hosts.first {
+            let appearance = WidgetVisualStyle.hostAppearance(for: topHost)
+            ZStack {
+                AccessoryWidgetBackground()
+                VStack(spacing: 1) {
+                    Image(systemName: appearance.symbol)
+                        .font(.system(size: 16, weight: .semibold))
+                        .widgetAccentable()
+                    Text(topHost.displayName)
+                        .font(.system(size: 9, weight: .semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                        .padding(.horizontal, 4)
+                }
+            }
+            .accessibilityLabel("Connect to \(topHost.displayName)")
+            .widgetURL(TermAppDeepLink.connectHost(hostID: topHost.id).url)
+        } else {
+            ZStack {
+                AccessoryWidgetBackground()
+                Image(systemName: "server.rack")
+                    .font(.system(size: 18, weight: .semibold))
+                    .widgetAccentable()
+            }
+            .accessibilityLabel("Open AmberTTY Hosts")
+            .widgetURL(Self.hostsTabURL)
         }
     }
 
@@ -200,11 +241,13 @@ private struct QuickConnectHostsWidgetView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Label("AmberTTY", systemImage: "terminal.fill")
                     .font(.headline)
+                    .widgetAccentable()
                 Text("Add hosts in AmberTTY")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .widgetURL(Self.hostsTabURL)
         }
     }
 
@@ -212,6 +255,7 @@ private struct QuickConnectHostsWidgetView: View {
         let appearance = WidgetVisualStyle.hostAppearance(for: host)
         return HStack(spacing: 8) {
             WidgetSquircleIcon(symbolName: appearance.symbol, tint: appearance.tint, size: 24)
+                .widgetAccentable()
 
             Text(host.displayName)
                 .font(.caption.weight(.semibold))
@@ -229,6 +273,7 @@ private struct QuickConnectHostsWidgetView: View {
             Image(systemName: "arrow.up.right.circle.fill")
                 .font(.caption)
                 .foregroundStyle(WidgetPalette.amber)
+                .widgetAccentable()
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
@@ -242,6 +287,7 @@ private struct QuickConnectHostsWidgetView: View {
     private var emptyStateView: some View {
         VStack(spacing: 6) {
             WidgetSquircleIcon(symbolName: "server.rack", tint: WidgetPalette.amber, size: 32)
+                .widgetAccentable()
             Text("Add hosts in AmberTTY")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(WidgetPalette.foreground)
