@@ -292,22 +292,22 @@ struct SettingsView: View {
 
             externalLinkRow(
                 title: "Privacy Policy",
-                urlString: "https://github.com/peculiarengineer-mk/term-app/blob/main/PRIVACY.md"
+                urlString: "https://github.com/peculiarengineer-mk/ambertty/blob/main/PRIVACY.md"
             )
 
             externalLinkRow(
                 title: "Terms of Use",
-                urlString: "https://github.com/peculiarengineer-mk/term-app/blob/main/TERMS.md"
+                urlString: "https://github.com/peculiarengineer-mk/ambertty/blob/main/TERMS.md"
             )
 
             externalLinkRow(
                 title: "Support & Feedback",
-                urlString: "https://github.com/peculiarengineer-mk/term-app/blob/main/SUPPORT.md"
+                urlString: "https://github.com/peculiarengineer-mk/ambertty/blob/main/SUPPORT.md"
             )
 
             externalLinkRow(
                 title: "Report an Issue",
-                urlString: "https://github.com/peculiarengineer-mk/term-app/issues"
+                urlString: "https://github.com/peculiarengineer-mk/ambertty/issues"
             )
 
             NavigationLink("Licences", destination: LicencesView())

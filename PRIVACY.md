@@ -51,5 +51,5 @@ All sensitive credentials are stored using Apple's Keychain Services on your dev
 
 AmberTTY is open source under the GNU General Public License v3 (`LICENSE`). You can inspect the source code or ask privacy questions at:
 
-- GitHub Repository: https://github.com/peculiarengineer-mk/term-app
-- Support & Issues: https://github.com/peculiarengineer-mk/term-app/issues
+- GitHub Repository: https://github.com/peculiarengineer-mk/ambertty
+- Support & Issues: https://github.com/peculiarengineer-mk/ambertty/issues

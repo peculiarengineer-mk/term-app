@@ -721,13 +721,13 @@ struct ProPaywallView: View {
 
     private func legalLinksHorizontal(fixedWidth: Bool) -> some View {
         HStack(spacing: 8) {
-            if let privacyURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/PRIVACY.md") {
+            if let privacyURL = URL(string: "https://github.com/peculiarengineer-mk/ambertty/blob/main/PRIVACY.md") {
                 legalLink("Privacy Policy", destination: privacyURL, fixedWidth: fixedWidth)
             }
 
             footerSeparator
 
-            if let termsURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/TERMS.md") {
+            if let termsURL = URL(string: "https://github.com/peculiarengineer-mk/ambertty/blob/main/TERMS.md") {
                 legalLink("Terms of Use", destination: termsURL, fixedWidth: fixedWidth)
             }
         }
@@ -735,11 +735,11 @@ struct ProPaywallView: View {
 
     @ViewBuilder
     private func legalLinksContent(fixedWidth: Bool) -> some View {
-        if let privacyURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/PRIVACY.md") {
+        if let privacyURL = URL(string: "https://github.com/peculiarengineer-mk/ambertty/blob/main/PRIVACY.md") {
             legalLink("Privacy Policy", destination: privacyURL, fixedWidth: fixedWidth)
         }
 
-        if let termsURL = URL(string: "https://github.com/peculiarengineer-mk/term-app/blob/main/TERMS.md") {
+        if let termsURL = URL(string: "https://github.com/peculiarengineer-mk/ambertty/blob/main/TERMS.md") {
             legalLink("Terms of Use", destination: termsURL, fixedWidth: fixedWidth)
         }
     }

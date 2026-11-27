@@ -7,7 +7,8 @@ let package = Package(
     products: [.library(name: "Store", targets: ["Store"])],
     dependencies: [.package(path: "../SSHKit")],
     targets: [
-        .target(name: "Store"),
+        .target(name: "StoreObjC"),
+        .target(name: "Store", dependencies: ["StoreObjC"]),
         .testTarget(name: "StoreTests", dependencies: ["Store", .product(name: "SSHKit", package: "SSHKit")]),
     ],
     swiftLanguageModes: [.v6]

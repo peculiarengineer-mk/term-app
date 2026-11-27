@@ -62,7 +62,8 @@ struct HostEntityQuery: EntityStringQuery {
 
     static func entities(for identifiers: [UUID], defaults: UserDefaults) -> [HostEntity] {
         let snapshotsByID = Dictionary(
-            uniqueKeysWithValues: WidgetSnapshotStore.loadHosts(defaults: defaults).map { ($0.id, $0) }
+            WidgetSnapshotStore.loadHosts(defaults: defaults).map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
         )
         return identifiers.compactMap { snapshotsByID[$0] }.map(HostEntity.init(snapshot:))
     }

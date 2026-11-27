@@ -4,7 +4,7 @@ Need help with AmberTTY, found a bug, or want to request a feature?
 
 ## Getting Help
 
-- **GitHub Issues (Bug Reports & Questions):** https://github.com/peculiarengineer-mk/term-app/issues
+- **GitHub Issues (Bug Reports & Questions):** https://github.com/peculiarengineer-mk/ambertty/issues
   - Please include your iOS/iPadOS version, AmberTTY version (**Settings › About & Legal › Version**), and steps to reproduce.
   - **Security reminder:** Never paste private SSH keys, passphrases, host passwords, or DigitalOcean/Cloudflare API tokens into an issue.
 - **TestFlight Feedback:** If you are testing a TestFlight beta build, you can also send feedback and screenshots directly from the TestFlight app. (TestFlight builds unlock AmberTTY Pro features for testing.)

@@ -41,4 +41,4 @@ To the maximum extent permitted by applicable law, the author and contributors a
 
 These Terms may be updated with future releases. For questions or feedback, please see [`SUPPORT.md`](SUPPORT.md) or open an issue at:
 
-- https://github.com/peculiarengineer-mk/term-app/issues
+- https://github.com/peculiarengineer-mk/ambertty/issues

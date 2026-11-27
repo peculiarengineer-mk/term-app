@@ -80,7 +80,7 @@ enum WidgetSyncCoordinator {
         let cached = AISessionCacheStore.load(defaults: cacheDefaults)
         let hasStoredData = widgetDefaults.data(forKey: WidgetSnapshotStore.agentsStorageKey) != nil
         let existing = hasStoredData ? WidgetSnapshotStore.loadAgents(defaults: widgetDefaults) : []
-        let existingByID = Dictionary(uniqueKeysWithValues: existing.map { ($0.id, $0) })
+        let existingByID = Dictionary(existing.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
         let snapshots = buildAgentSnapshots(
             liveSessions: liveSessions,

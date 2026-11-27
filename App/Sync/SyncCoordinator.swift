@@ -93,8 +93,7 @@ actor SyncCoordinator {
     /// Called whenever sync goes from on to off (Settings, or the CloudKit fallback at launch): the
     /// next sync-on launch re-saves hosts edited from now on. `disabledAt` is recorded only after a
     /// completed re-save; otherwise older hosts may never have been exported and all are re-saved.
-    static func syncTurnedOff() {
-        let defaults = UserDefaults.standard
+    static func syncTurnedOff(defaults: UserDefaults = .standard) {
         if defaults.bool(forKey: resaveKey) {
             defaults.set(Date(), forKey: disabledAtKey)
         }

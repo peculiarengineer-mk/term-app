@@ -768,7 +768,7 @@ struct AgentsDashboardView: View {
 
     private func loadCachedSessionsIfNeeded() {
         guard !hasScannedOnce else { return }
-        let hostsByID = Dictionary(uniqueKeysWithValues: hosts.map { ($0.id, $0) })
+        let hostsByID = Dictionary(hosts.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let cached = AISessionCacheStore.load(defaults: sessionManager.cacheDefaults)
         let hydrated = cached.compactMap { entry -> DiscoveredSession? in
             guard entry.isAISession, let host = hostsByID[entry.hostID] else { return nil }
