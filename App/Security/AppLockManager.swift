@@ -110,7 +110,7 @@ final class AppLockManager {
         authError = nil
 
         switch await evaluateDeviceOwnerAuthentication(
-            reason: "Unlock TermApp to access your SSH sessions and keys.",
+            reason: "Unlock AmberTTY to access your SSH sessions and keys.",
             failureMessage: "Authentication failed. Tap Unlock to try again."
         ) {
         case .succeeded:
@@ -196,7 +196,7 @@ final class AppLockManager {
     private static func userFriendlyMessage(for error: LAError) -> String {
         switch error.code {
         case .passcodeNotSet:
-            "Set a device passcode or enroll Face ID in iOS Settings to unlock TermApp."
+            "Set a device passcode or enroll Face ID in iOS Settings to unlock AmberTTY."
         case .biometryNotAvailable, .biometryNotEnrolled:
             "Biometric authentication is unavailable. Use your device passcode or configure it in iOS Settings."
         case .biometryLockout:
@@ -248,7 +248,7 @@ struct AppLockOverlayView: View {
                 )
 
                 VStack(spacing: 6) {
-                    Text("TermApp Locked")
+                    Text("AmberTTY Locked")
                         .font(.title2.bold())
                         .foregroundStyle(theme.foregroundColor)
 

@@ -262,7 +262,7 @@ private struct ActiveAgentsWidgetView: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(WidgetPalette.foreground)
                 .multilineTextAlignment(.center)
-            Text("Tap to launch in TermApp")
+            Text("Tap to launch in AmberTTY")
                 .font(.caption2)
                 .foregroundStyle(WidgetPalette.secondary)
                 .multilineTextAlignment(.center)

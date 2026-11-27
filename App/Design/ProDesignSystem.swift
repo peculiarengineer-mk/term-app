@@ -352,7 +352,7 @@ struct ProFeatureGateView: View {
                     AppHaptics.impact(.light)
                     onUnlock()
                 } label: {
-                    Label("Unlock TermApp Pro", systemImage: "sparkles")
+                    Label("Unlock AmberTTY Pro", systemImage: "sparkles")
                         .fontWeight(.semibold)
                         .frame(maxWidth: .infinity)
                 }

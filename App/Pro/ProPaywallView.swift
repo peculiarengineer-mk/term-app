@@ -2,7 +2,7 @@ import SwiftUI
 import StoreKit
 import TermUI
 
-/// Apple Pro Dark sheet presenting the hybrid TermApp Pro Annual subscription and Lifetime purchase.
+/// Apple Pro Dark sheet presenting the hybrid AmberTTY Pro Annual subscription and Lifetime purchase.
 struct ProPaywallView: View {
     enum PlanChoice: String, CaseIterable, Identifiable, Sendable {
         case annual
@@ -63,7 +63,7 @@ struct ProPaywallView: View {
                 .frame(maxWidth: .infinity)
             }
             .background(theme.backgroundColor.ignoresSafeArea())
-            .navigationTitle("TermApp Pro")
+            .navigationTitle("AmberTTY Pro")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -94,7 +94,7 @@ struct ProPaywallView: View {
 
             VStack(spacing: 6) {
                 HStack(spacing: 8) {
-                    Text("TermApp Pro")
+                    Text("AmberTTY Pro")
                         .font(.title2.bold())
                         .foregroundStyle(theme.foregroundColor)
 
@@ -462,15 +462,15 @@ struct ProPaywallView: View {
     nonisolated static func purchasedSubtitle(for plan: ProStore.ActivePlan) -> String {
         switch plan {
         case .lifetime:
-            "One-time purchase · Thank you for supporting TermApp."
+            "One-time purchase · Thank you for supporting AmberTTY."
         case .annual(let expirationDate):
             if let expirationDate {
-                "Renews \(expirationDate.formatted(date: .abbreviated, time: .omitted)) · Thank you for supporting TermApp."
+                "Renews \(expirationDate.formatted(date: .abbreviated, time: .omitted)) · Thank you for supporting AmberTTY."
             } else {
-                "Active annual subscription · Thank you for supporting TermApp."
+                "Active annual subscription · Thank you for supporting AmberTTY."
             }
         case .none:
-            "Thank you for supporting TermApp."
+            "Thank you for supporting AmberTTY."
         }
     }
 

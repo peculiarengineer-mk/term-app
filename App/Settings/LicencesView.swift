@@ -17,7 +17,7 @@ struct LicencesView: View {
     var body: some View {
         Form {
             Section {
-                Text("term-app is free software, licensed under the GNU General Public License version 3.")
+                Text("AmberTTY is free software, licensed under the GNU General Public License version 3.")
                 if let url = URL(string: "https://github.com/peculiarengineer-mk/term-app") {
                     Link("https://github.com/peculiarengineer-mk/term-app", destination: url)
                 }

@@ -160,7 +160,7 @@ struct CloudTabView: View {
         ProFeatureGateView(
             symbolName: "cloud.fill",
             title: "Cloud Infrastructure",
-            subtitle: "Manage DigitalOcean Droplets, Cloudflare DNS records, and Zero Trust Tunnels directly from TermApp.",
+            subtitle: "Manage DigitalOcean Droplets, Cloudflare DNS records, and Zero Trust Tunnels directly from AmberTTY.",
             features: [
                 ProFeatureItem(
                     icon: "drop.fill",

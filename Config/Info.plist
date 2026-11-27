@@ -2,10 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleDisplayName</key>
+	<string>AmberTTY</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>TermApp connects to SSH servers and development machines on your local network.</string>
+	<string>AmberTTY connects to SSH servers and development machines on your local network.</string>
 	<key>NSFaceIDUsageDescription</key>
-	<string>TermApp uses Face ID to lock access to your SSH sessions and keys.</string>
+	<string>AmberTTY uses Face ID to lock access to your SSH sessions and keys.</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>UIApplicationSceneManifest</key>

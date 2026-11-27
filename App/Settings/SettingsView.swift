@@ -231,7 +231,7 @@ struct SettingsView: View {
             } header: {
                 Text("Security")
             } footer: {
-                Text("Locks TermApp on launch and when returning from the background. Terminal screens are always blurred in the App Switcher.")
+                Text("Locks AmberTTY on launch and when returning from the background. Terminal screens are always blurred in the App Switcher.")
             }
 
             Section {
@@ -336,7 +336,7 @@ struct SettingsView: View {
     }
 
     private var proSection: some View {
-        Section("TermApp Pro") {
+        Section("AmberTTY Pro") {
             Button {
                 AppHaptics.impact(.light)
                 showingPaywall = true

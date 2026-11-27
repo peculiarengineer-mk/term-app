@@ -266,7 +266,7 @@ struct AITerminalControlsOverlay: View {
                     .foregroundStyle(amber)
                     .accessibilityHidden(true)
 
-                Text("No tmux · This agent session will end if you close TermApp.")
+                Text("No tmux · This agent session will end if you close AmberTTY.")
                     .font(.caption.weight(.medium))
                     .foregroundStyle(theme.foregroundColor)
                     .fixedSize(horizontal: false, vertical: true)

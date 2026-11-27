@@ -2,7 +2,7 @@ import Foundation
 import Observation
 import StoreKit
 
-/// Manages StoreKit 2 entitlements and purchases for TermApp Pro (Annual subscription and Lifetime unlock).
+/// Manages StoreKit 2 entitlements and purchases for AmberTTY Pro (Annual subscription and Lifetime unlock).
 @MainActor @Observable
 final class ProStore {
     nonisolated static let annualProductID = "com.peculiarengineer.termapp.pro.annual"
@@ -172,7 +172,7 @@ final class ProStore {
             lifetimeProduct = loaded.first { $0.id == Self.lifetimeProductID } ?? lifetimeProduct
             await refreshTrialEligibility()
             guard let target = cachedProduct(for: productID) else {
-                errorMessage = "TermApp Pro is currently unavailable. Please try again later."
+                errorMessage = "AmberTTY Pro is currently unavailable. Please try again later."
                 return
             }
             await performPurchase(target)
@@ -194,7 +194,7 @@ final class ProStore {
             if isPurchased {
                 AppHaptics.notify(.success)
             } else {
-                errorMessage = "No previous TermApp Pro purchase was found."
+                errorMessage = "No previous AmberTTY Pro purchase was found."
             }
         } catch {
             errorMessage = "Could not restore purchases: \(error.localizedDescription)"

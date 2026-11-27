@@ -152,6 +152,18 @@ final class ProStoreTests: XCTestCase {
 
         XCTAssertEqual(ProPaywallView.purchasedTitle(for: .lifetime), "Pro Unlocked (Lifetime)")
         XCTAssertEqual(ProPaywallView.purchasedTitle(for: .annual(expirationDate: nil)), "Pro Unlocked (Annual)")
+        XCTAssertEqual(
+            ProPaywallView.purchasedSubtitle(for: .lifetime),
+            "One-time purchase · Thank you for supporting AmberTTY."
+        )
+        XCTAssertEqual(
+            ProPaywallView.purchasedSubtitle(for: .annual(expirationDate: nil)),
+            "Active annual subscription · Thank you for supporting AmberTTY."
+        )
+        XCTAssertEqual(
+            ProPaywallView.purchasedSubtitle(for: .none),
+            "Thank you for supporting AmberTTY."
+        )
     }
 
     func testSettingsProStatusAndPriceFormatting() {

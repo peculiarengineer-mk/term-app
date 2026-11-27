@@ -273,7 +273,7 @@ struct LaunchAIAgentSheet: View {
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
 
-                    Text("Without tmux, your agent session will die if you close TermApp or lose connection.")
+                    Text("Without tmux, your agent session will die if you close AmberTTY or lose connection.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -707,7 +707,7 @@ struct LaunchAIAgentSheet: View {
             .disabled(selectedHost == nil)
         } footer: {
             if isTmuxKnownMissing {
-                Text("Running without tmux: closing TermApp or losing connection will terminate this agent.")
+                Text("Running without tmux: closing AmberTTY or losing connection will terminate this agent.")
             }
         }
     }

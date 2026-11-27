@@ -198,9 +198,9 @@ private struct QuickConnectHostsWidgetView: View {
             .widgetURL(TermAppDeepLink.connectHost(hostID: topHost.id).url)
         } else {
             VStack(alignment: .leading, spacing: 2) {
-                Label("TermApp", systemImage: "terminal.fill")
+                Label("AmberTTY", systemImage: "terminal.fill")
                     .font(.headline)
-                Text("Add hosts in TermApp")
+                Text("Add hosts in AmberTTY")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -242,7 +242,7 @@ private struct QuickConnectHostsWidgetView: View {
     private var emptyStateView: some View {
         VStack(spacing: 6) {
             WidgetSquircleIcon(symbolName: "server.rack", tint: WidgetPalette.amber, size: 32)
-            Text("Add hosts in TermApp")
+            Text("Add hosts in AmberTTY")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(WidgetPalette.foreground)
                 .multilineTextAlignment(.center)

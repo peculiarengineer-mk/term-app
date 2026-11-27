@@ -88,7 +88,7 @@ enum WidgetVisualStyle {
     }
 }
 
-/// Frosted continuous-corner squircle icon matching TermApp's `ProSquircleIcon`.
+/// Frosted continuous-corner squircle icon matching AmberTTY's `ProSquircleIcon`.
 struct WidgetSquircleIcon: View {
     let symbolName: String
     let tint: Color

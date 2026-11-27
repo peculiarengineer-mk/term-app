@@ -46,7 +46,7 @@ struct HostEntity: AppEntity, Identifiable, Hashable, Sendable {
     }
 }
 
-/// Queries saved SSH hosts from `WidgetSnapshotStore` so Siri & Shortcuts work even when TermApp is closed.
+/// Queries saved SSH hosts from `WidgetSnapshotStore` so Siri & Shortcuts work even when AmberTTY is closed.
 struct HostEntityQuery: EntityStringQuery {
     func entities(for identifiers: [UUID]) async throws -> [HostEntity] {
         Self.entities(for: identifiers, defaults: WidgetSnapshotStore.sharedDefaults())
@@ -106,10 +106,10 @@ enum AIAgentAppEnum: String, AppEnum, CaseIterable, Sendable {
     ]
 }
 
-/// Opens TermApp and connects an interactive SSH terminal tab to the selected host.
+/// Opens AmberTTY and connects an interactive SSH terminal tab to the selected host.
 struct ConnectHostIntent: AppIntent {
     static let title: LocalizedStringResource = "Connect to Host"
-    static let description = IntentDescription("Opens TermApp and starts an SSH session on the chosen host.")
+    static let description = IntentDescription("Opens AmberTTY and starts an SSH session on the chosen host.")
     static let openAppWhenRun: Bool = true
 
     @Parameter(title: "Host")
@@ -134,10 +134,10 @@ struct ConnectHostIntent: AppIntent {
     }
 }
 
-/// Opens TermApp and launches or reattaches an AI coding agent in `tmux` on the selected host.
+/// Opens AmberTTY and launches or reattaches an AI coding agent in `tmux` on the selected host.
 struct LaunchAIAgentIntent: AppIntent {
     static let title: LocalizedStringResource = "Launch AI Agent"
-    static let description = IntentDescription("Opens TermApp and launches an AI coding agent in tmux on the chosen host.")
+    static let description = IntentDescription("Opens AmberTTY and launches an AI coding agent in tmux on the chosen host.")
     static let openAppWhenRun: Bool = true
 
     @Parameter(title: "Agent")
@@ -166,10 +166,10 @@ struct LaunchAIAgentIntent: AppIntent {
     }
 }
 
-/// Opens TermApp and reattaches the most recently open AI agent session, or opens the Agents tab if none is cached.
+/// Opens AmberTTY and reattaches the most recently open AI agent session, or opens the Agents tab if none is cached.
 struct ResumeAgentIntent: AppIntent {
     static let title: LocalizedStringResource = "Resume AI Agent"
-    static let description = IntentDescription("Reattaches your most recent AI agent tmux session in TermApp.")
+    static let description = IntentDescription("Reattaches your most recent AI agent tmux session in AmberTTY.")
     static let openAppWhenRun: Bool = true
 
     init() {}
@@ -197,7 +197,7 @@ struct ResumeAgentIntent: AppIntent {
     }
 }
 
-/// Exposes natural Siri & Shortcuts phrases for TermApp SSH and AI Agent workflows.
+/// Exposes natural Siri & Shortcuts phrases for AmberTTY SSH and AI Agent workflows.
 struct TermAppShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
         AppShortcut(
