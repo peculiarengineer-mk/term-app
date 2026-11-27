@@ -2,18 +2,43 @@ import Foundation
 import Observation
 import StoreKit
 
-/// Manages StoreKit 2 entitlements and purchases for the one-time TermApp Pro unlock.
+/// Manages StoreKit 2 entitlements and purchases for TermApp Pro (Annual subscription and Lifetime unlock).
 @MainActor @Observable
 final class ProStore {
-    static let productID = "com.peculiarengineer.termapp.pro"
+    nonisolated static let annualProductID = "com.peculiarengineer.termapp.pro.annual"
+    nonisolated static let lifetimeProductID = "com.peculiarengineer.termapp.pro"
+    nonisolated static let proProductID = lifetimeProductID
+    nonisolated static let allProductIDs = [annualProductID, lifetimeProductID]
 
-    private(set) var product: Product?
-    private(set) var isPurchased = false
+    enum ActivePlan: Equatable, Sendable {
+        case none
+        case annual(expirationDate: Date?)
+        case lifetime
+    }
+
+    struct EntitlementCandidate: Equatable, Sendable {
+        let productID: String
+        let revocationDate: Date?
+        let expirationDate: Date?
+    }
+
+    private(set) var annualProduct: Product?
+    private(set) var lifetimeProduct: Product?
+    private(set) var isAnnualTrialEligible = false
+    private(set) var activePlan: ActivePlan = .none
     private(set) var isTestFlight = false
     private(set) var isLoadingProducts = false
     private(set) var isPurchasing = false
     private(set) var isRestoring = false
     private(set) var errorMessage: String?
+
+    var isPurchased: Bool {
+        activePlan != .none
+    }
+
+    var product: Product? {
+        lifetimeProduct ?? annualProduct
+    }
 
     var isLoading: Bool {
         isPurchasing || isRestoring
@@ -52,11 +77,13 @@ final class ProStore {
         defer { isLoadingProducts = false }
 
         do {
-            let products = try await Product.products(for: [Self.productID])
-            product = products.first
+            let products = try await Product.products(for: Self.allProductIDs)
+            annualProduct = products.first { $0.id == Self.annualProductID }
+            lifetimeProduct = products.first { $0.id == Self.lifetimeProductID }
+            await refreshTrialEligibility()
         } catch {
             if reportErrors {
-                errorMessage = "Could not load App Store product: \(error.localizedDescription)"
+                errorMessage = "Could not load App Store products: \(error.localizedDescription)"
             }
         }
     }
@@ -75,51 +102,80 @@ final class ProStore {
 
     func refreshEntitlements() async {
         await refreshAppEnvironment()
-        var entitled = false
+        var candidates: [EntitlementCandidate] = []
         for await result in Transaction.currentEntitlements {
             guard case .verified(let transaction) = result else { continue }
-            if transaction.productID == Self.productID && transaction.revocationDate == nil {
-                entitled = true
-                break
-            }
+            candidates.append(
+                EntitlementCandidate(
+                    productID: transaction.productID,
+                    revocationDate: transaction.revocationDate,
+                    expirationDate: transaction.expirationDate
+                )
+            )
         }
-        isPurchased = entitled
+        activePlan = Self.resolveActivePlan(from: candidates)
+        await refreshTrialEligibility()
     }
 
-    func purchase() async {
+    nonisolated static func resolveActivePlan(
+        from candidates: [EntitlementCandidate],
+        now: Date = Date()
+    ) -> ActivePlan {
+        var resolved: ActivePlan = .none
+        for candidate in candidates {
+            guard candidate.revocationDate == nil else { continue }
+            if candidate.productID == lifetimeProductID {
+                return .lifetime
+            }
+            if candidate.productID == annualProductID {
+                if let expirationDate = candidate.expirationDate, expirationDate <= now {
+                    continue
+                }
+                switch resolved {
+                case .none:
+                    resolved = .annual(expirationDate: candidate.expirationDate)
+                case .annual(let existingExpiration):
+                    if let newExpiration = candidate.expirationDate,
+                       existingExpiration.map({ newExpiration > $0 }) ?? true {
+                        resolved = .annual(expirationDate: newExpiration)
+                    }
+                case .lifetime:
+                    return .lifetime
+                }
+            }
+        }
+        return resolved
+    }
+
+    func purchase(_ product: Product) async {
+        guard !isLoading else { return }
+        isPurchasing = true
+        errorMessage = nil
+        defer { isPurchasing = false }
+        await performPurchase(product)
+    }
+
+    func purchase(productID: String) async {
         guard !isLoading else { return }
         isPurchasing = true
         errorMessage = nil
         defer { isPurchasing = false }
 
-        do {
-            let targetProduct: Product
-            if let existing = product {
-                targetProduct = existing
-            } else {
-                let loaded = try await Product.products(for: [Self.productID])
-                product = loaded.first
-                guard let first = loaded.first else {
-                    errorMessage = "TermApp Pro is currently unavailable. Please try again later."
-                    return
-                }
-                targetProduct = first
-            }
+        if let cached = cachedProduct(for: productID) {
+            await performPurchase(cached)
+            return
+        }
 
-            let result = try await targetProduct.purchase()
-            switch result {
-            case .success(let verification):
-                await handle(verificationResult: verification, reportUnverifiedError: true)
-                if isPurchased {
-                    AppHaptics.notify(.success)
-                }
-            case .userCancelled:
-                break
-            case .pending:
-                errorMessage = "Purchase is pending approval."
-            @unknown default:
-                break
+        do {
+            let loaded = try await Product.products(for: Self.allProductIDs)
+            annualProduct = loaded.first { $0.id == Self.annualProductID } ?? annualProduct
+            lifetimeProduct = loaded.first { $0.id == Self.lifetimeProductID } ?? lifetimeProduct
+            await refreshTrialEligibility()
+            guard let target = cachedProduct(for: productID) else {
+                errorMessage = "TermApp Pro is currently unavailable. Please try again later."
+                return
             }
+            await performPurchase(target)
         } catch {
             errorMessage = "Purchase failed: \(error.localizedDescription)"
             AppHaptics.notify(.error)
@@ -150,6 +206,44 @@ final class ProStore {
         errorMessage = nil
     }
 
+    private func cachedProduct(for productID: String) -> Product? {
+        switch productID {
+        case Self.annualProductID: annualProduct
+        case Self.lifetimeProductID: lifetimeProduct
+        default: nil
+        }
+    }
+
+    private func performPurchase(_ targetProduct: Product) async {
+        do {
+            let result = try await targetProduct.purchase()
+            switch result {
+            case .success(let verification):
+                await handle(verificationResult: verification, reportUnverifiedError: true)
+                if isPurchased {
+                    AppHaptics.notify(.success)
+                }
+            case .userCancelled:
+                break
+            case .pending:
+                errorMessage = "Purchase is pending approval."
+            @unknown default:
+                break
+            }
+        } catch {
+            errorMessage = "Purchase failed: \(error.localizedDescription)"
+            AppHaptics.notify(.error)
+        }
+    }
+
+    private func refreshTrialEligibility() async {
+        guard let subscription = annualProduct?.subscription else {
+            isAnnualTrialEligible = false
+            return
+        }
+        isAnnualTrialEligible = await subscription.isEligibleForIntroOffer
+    }
+
     private func loadInitialState() async {
         await refreshEntitlements()
         await loadProducts(reportErrors: false)
@@ -171,7 +265,7 @@ final class ProStore {
     ) async {
         switch verificationResult {
         case .verified(let transaction):
-            guard transaction.productID == Self.productID else { return }
+            guard Self.allProductIDs.contains(transaction.productID) else { return }
             await transaction.finish()
             await refreshEntitlements()
         case .unverified(_, let error):

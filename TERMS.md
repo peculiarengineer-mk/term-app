@@ -1,6 +1,6 @@
 # TermApp Terms of Use
 
-*Last updated: November 25, 2026*
+*Last updated: November 27, 2026*
 
 By downloading or using **TermApp**, you agree to these Terms of Use. If you downloaded TermApp from the Apple App Store, Apple's Standard Licensed Application End User License Agreement (EULA) also applies.
 
@@ -8,12 +8,14 @@ By downloading or using **TermApp**, you agree to these Terms of Use. If you dow
 
 TermApp is open-source software licensed under the **GNU General Public License v3 (GPLv3)** (see [`LICENSE`](LICENSE) in the repository). Third-party open-source components retain their respective licenses, viewable in **Settings › About & Legal › Licences**.
 
-## 2. TermApp Pro (In-App Purchase)
+## 2. TermApp Pro (In-App Purchases & Subscription)
 
 - TermApp's core SSH terminal, key management, command snippets, and iCloud sync are free.
-- **TermApp Pro** is a **one-time, non-consumable in-app purchase** (`com.peculiarengineer.termapp.pro`) that unlocks Pro features (AI Agent Sessions, SFTP File Browser, Local Port Forwarding, and DigitalOcean & Cloudflare integrations). There is no recurring subscription.
+- **TermApp Pro** unlocks Pro features (AI Agent Sessions, SFTP File Browser, Local Port Forwarding, and DigitalOcean & Cloudflare integrations) and is offered via two plans:
+  - **TermApp Pro Annual** (`com.peculiarengineer.termapp.pro.annual`): An **auto-renewable annual subscription** ($9.99/year, or local App Store equivalent) that includes a **7-day free trial** for eligible new subscribers. Payment is charged to your Apple Account upon confirmation of purchase (or at the end of the free trial period). Your subscription **automatically renews** at the annual price unless cancelled at least **24 hours before the end of the current period**. You can manage or cancel your subscription at any time in your **App Store Account Settings** (or via **Manage Subscription** inside the TermApp Pro sheet). Any unused portion of a free trial period is forfeited when you purchase a subscription or upgrade.
+  - **TermApp Pro Lifetime** (`com.peculiarengineer.termapp.pro`): A **one-time, non-consumable in-app purchase** ($29.99, or local App Store equivalent) with no recurring subscription. If you later purchase Lifetime while on an active Annual subscription, be sure to cancel your Annual subscription in your App Store Account Settings if you do not want it to renew.
 - All purchases, billing, taxes, and refunds are handled exclusively by Apple through the App Store under Apple Media Services Terms and Conditions.
-- You may restore an eligible previous purchase on devices signed in with the same Apple Account using **Restore Purchases** inside the TermApp Pro sheet.
+- You may restore an eligible previous purchase or active subscription on devices signed in with the same Apple Account using **Restore Purchases** inside the TermApp Pro sheet.
 
 ## 3. Your Responsibilities & Remote Operations
 

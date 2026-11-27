@@ -35,17 +35,47 @@ struct SettingsView: View {
     }
 
     private var proStatusTitle: String {
-        if proStore.isPurchased {
-            return "Pro Unlocked"
+        Self.proStatusTitle(for: proStore.activePlan, isTestFlight: proStore.isTestFlight)
+    }
+
+    nonisolated static func proStatusTitle(
+        for activePlan: ProStore.ActivePlan,
+        isTestFlight: Bool,
+        isDebugBuild: Bool = {
+            #if DEBUG
+            return true
+            #else
+            return false
+            #endif
+        }()
+    ) -> String {
+        switch activePlan {
+        case .lifetime:
+            return "Pro Unlocked (Lifetime)"
+        case .annual:
+            return "Pro Unlocked (Annual)"
+        case .none:
+            if isTestFlight {
+                return "Pro Unlocked (TestFlight)"
+            }
+            if isDebugBuild {
+                return "Pro Unlocked (Debug)"
+            }
+            return "Upgrade to Pro"
         }
-        if proStore.isTestFlight {
-            return "Pro Unlocked (TestFlight)"
+    }
+
+    nonisolated static func proTrailingPriceText(
+        annualDisplayPrice: String?,
+        lifetimeDisplayPrice: String?
+    ) -> String {
+        if let annualDisplayPrice {
+            return "From \(annualDisplayPrice)/yr"
         }
-        #if DEBUG
-        return "Pro Unlocked (Debug)"
-        #else
-        return "Upgrade to Pro"
-        #endif
+        if let lifetimeDisplayPrice {
+            return lifetimeDisplayPrice
+        }
+        return "From $9.99/yr"
     }
 
     var body: some View {
@@ -331,10 +361,16 @@ struct SettingsView: View {
 
                     Spacer(minLength: 8)
 
-                    if !proStore.isProUnlocked, let price = proStore.product?.displayPrice {
-                        Text(price)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(palette.proBrandAmber)
+                    if !proStore.isProUnlocked {
+                        Text(
+                            Self.proTrailingPriceText(
+                                annualDisplayPrice: proStore.annualProduct?.displayPrice,
+                                lifetimeDisplayPrice: proStore.lifetimeProduct?.displayPrice
+                            )
+                        )
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(palette.proBrandAmber)
+                        .lineLimit(1)
                     }
 
                     Image(systemName: "chevron.right")
