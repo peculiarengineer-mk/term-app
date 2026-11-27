@@ -182,6 +182,103 @@ final class AIAgentTests: XCTestCase {
         XCTAssertTrue(capped.unicodeScalars.allSatisfy { allowed.contains($0) })
     }
 
+    func testNextUniqueSessionName() {
+        // No collision returns base session name.
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: []
+            ),
+            "termapp-ai-claude-term-app"
+        )
+
+        // Unrelated sessions do not trigger numbering.
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: ["termapp-ai-agy-term-app", "termapp-ai-claude-other"]
+            ),
+            "termapp-ai-claude-term-app"
+        )
+
+        // Collisions increment -2, -3, ... and fill first unused slot.
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: ["termapp-ai-claude-term-app"]
+            ),
+            "termapp-ai-claude-term-app-2"
+        )
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: [
+                    "termapp-ai-claude-term-app",
+                    "termapp-ai-claude-term-app-2",
+                ]
+            ),
+            "termapp-ai-claude-term-app-3"
+        )
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: [
+                    "termapp-ai-claude-term-app",
+                    "termapp-ai-claude-term-app-3",
+                ]
+            ),
+            "termapp-ai-claude-term-app-2"
+        )
+
+        // Custom suffix is sanitized (lowercased, punctuation collapsed, maxLength 16) and incremented on collision.
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: ["termapp-ai-claude-term-app"],
+                customSuffix: "  Bug Fix #1! "
+            ),
+            "termapp-ai-claude-term-app-bug-fix-1"
+        )
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: [
+                    "termapp-ai-claude-term-app",
+                    "termapp-ai-claude-term-app-bugfix",
+                ],
+                customSuffix: "bugfix"
+            ),
+            "termapp-ai-claude-term-app-bugfix-2"
+        )
+
+        // Blank or punctuation-only custom suffix falls back to base naming.
+        XCTAssertEqual(
+            TMuxSessionHelper.nextUniqueSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: ["termapp-ai-claude-term-app"],
+                customSuffix: "   ---!!!  "
+            ),
+            "termapp-ai-claude-term-app-2"
+        )
+
+        // Overlong custom suffix is capped at 16 characters without trailing hyphen.
+        let longSuffixName = TMuxSessionHelper.nextUniqueSessionName(
+            agentSlug: "agy",
+            workingDirectory: "~/repo",
+            existingNames: [],
+            customSuffix: "abcdefghijklmno-pqrstuv"
+        )
+        XCTAssertEqual(longSuffixName, "termapp-ai-agy-repo-abcdefghijklmno")
+    }
+
     // MARK: - Command Generation
 
     func testLaunchOrAttachCommand() {
@@ -237,6 +334,51 @@ final class AIAgentTests: XCTestCase {
             try process.run()
             process.waitUntilExit()
             XCTAssertEqual(process.terminationStatus, 0, "\(shellPath) -n failed on breakoutAttempt")
+        }
+        #endif
+    }
+
+    func testLaunchOrAttachCommandForceNewSession() throws {
+        let claude = AIAgentDescriptor(builtIn: .claude)
+        let cmd = TMuxSessionHelper.launchOrAttachCommand(
+            agent: claude,
+            workingDirectory: "~/projects/my app",
+            extraArgs: "--model sonnet",
+            sessionName: "termapp-ai-claude-my-app",
+            forceNewSession: true
+        )
+
+        XCTAssertFalse(cmd.contains("\n"))
+        XCTAssertFalse(cmd.contains("\r"))
+        XCTAssertFalse(cmd.contains("tmux new-session -A"))
+        XCTAssertTrue(cmd.contains("_base='termapp-ai-claude-my-app'; _target=\"$_base\"; _n=2;"))
+        XCTAssertTrue(cmd.contains("while tmux has-session -t \"=$_target\" 2>/dev/null; do _target=\"${_base}-${_n}\"; _n=$((_n + 1)); done;"))
+        XCTAssertTrue(cmd.contains("tmux new-session -s \"$_target\" -c \"$HOME\"/'projects/my app'"))
+        XCTAssertTrue(cmd.contains("claude --model sonnet"))
+
+        // Special characters and quote breakouts stay safely single-quoted in _base.
+        let special = TMuxSessionHelper.launchOrAttachCommand(
+            agent: claude,
+            workingDirectory: "/opt/$(evil)",
+            sessionName: "odd'name$(id)",
+            forceNewSession: true
+        )
+        XCTAssertFalse(special.contains("\n"))
+        XCTAssertFalse(special.contains("\r"))
+        XCTAssertFalse(special.contains("tmux new-session -A"))
+        XCTAssertTrue(special.contains("_base='odd'\\''name$(id)';"))
+        XCTAssertTrue(special.contains("tmux new-session -s \"$_target\" -c '/opt/$(evil)'"))
+
+        #if os(macOS)
+        for shellPath in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            for candidateCmd in [cmd, special] {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: shellPath)
+                process.arguments = ["-n", "-c", candidateCmd]
+                try process.run()
+                process.waitUntilExit()
+                XCTAssertEqual(process.terminationStatus, 0, "\(shellPath) -n failed on forceNewSession command")
+            }
         }
         #endif
     }

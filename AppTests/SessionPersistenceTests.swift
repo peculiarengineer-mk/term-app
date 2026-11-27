@@ -236,6 +236,109 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertTrue(afterMissing.isEmpty)
         XCTAssertTrue(AISessionCacheStore.load(defaults: defaults).isEmpty)
     }
+
+    func testLaunchSheetParallelSessionResolutionAndIndependentTracking() {
+        let (defaults, cleanup) = makeIsolatedDefaults()
+        defer { cleanup() }
+
+        let hostID = UUID()
+        let otherHostID = UUID()
+        let manager = SessionManager(cacheDefaults: defaults)
+        let claude = AIAgentDescriptor(builtIn: .claude)
+
+        // Cached session on same host and an identically named session on a different host.
+        AISessionCacheStore.upsert(
+            CachedAISession(
+                hostID: otherHostID,
+                hostLabel: "Other Host",
+                sessionName: "termapp-ai-claude-term-app-2",
+                agentSlug: "claude",
+                projectSlug: "term-app",
+                currentPath: "~/projects/term-app",
+                wasOpenInApp: false
+            ),
+            defaults: defaults
+        )
+
+        let firstContext = AIAgentLaunchContext(
+            agent: claude,
+            sessionName: "termapp-ai-claude-term-app",
+            workingDirectory: "~/projects/term-app",
+            hostID: hostID
+        )
+        let firstStub = StubSession()
+        _ = manager.open(
+            hostID: hostID,
+            title: "Claude Code · Prod Box",
+            session: firstStub,
+            bridge: SessionBridge(session: firstStub),
+            aiAgentContext: firstContext
+        )
+
+        // Known names for hostID only include sessions on hostID, ignoring otherHostID.
+        let known = LaunchAIAgentSheet.knownSessionNames(
+            for: hostID,
+            openSessions: manager.sessions,
+            cacheDefaults: defaults
+        )
+        XCTAssertEqual(known, ["termapp-ai-claude-term-app"])
+
+        // New Session mode automatically advances to -2 when base session exists.
+        XCTAssertEqual(
+            LaunchAIAgentSheet.resolveSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: known,
+                customSuffix: nil,
+                reattachExisting: false
+            ),
+            "termapp-ai-claude-term-app-2"
+        )
+
+        // Custom session label appends cleanly in New Session mode.
+        XCTAssertEqual(
+            LaunchAIAgentSheet.resolveSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: known,
+                customSuffix: "bugfix",
+                reattachExisting: false
+            ),
+            "termapp-ai-claude-term-app-bugfix"
+        )
+
+        // Reattach Existing always uses the deterministic base session name.
+        XCTAssertEqual(
+            LaunchAIAgentSheet.resolveSessionName(
+                agentSlug: "claude",
+                workingDirectory: "~/projects/term-app",
+                existingNames: known,
+                customSuffix: "bugfix",
+                reattachExisting: true
+            ),
+            "termapp-ai-claude-term-app"
+        )
+
+        // Opening the second parallel session keeps both live and cached independently.
+        let secondContext = AIAgentLaunchContext(
+            agent: claude,
+            sessionName: "termapp-ai-claude-term-app-2",
+            workingDirectory: "~/projects/term-app",
+            hostID: hostID
+        )
+        let secondStub = StubSession()
+        _ = manager.open(
+            hostID: hostID,
+            title: "Claude Code · Prod Box",
+            session: secondStub,
+            bridge: SessionBridge(session: secondStub),
+            aiAgentContext: secondContext
+        )
+
+        XCTAssertEqual(manager.sessions.count, 2)
+        let cachedNames = Set(AISessionCacheStore.load(defaults: defaults).filter { $0.hostID == hostID }.map(\.sessionName))
+        XCTAssertEqual(cachedNames, ["termapp-ai-claude-term-app", "termapp-ai-claude-term-app-2"])
+    }
 }
 
 private final class StubSession: Session, @unchecked Sendable {

@@ -154,6 +154,29 @@ public enum TMuxSessionHelper {
         return "\(sessionPrefix)\(safeAgent)-\(projectSlug)"
     }
 
+    /// Builds a unique, `tmux`-safe session name by appending an optional sanitized label and `-2`, `-3`, ... on collisions.
+    public static func nextUniqueSessionName(
+        agentSlug: String,
+        workingDirectory: String,
+        existingNames: Set<String>,
+        customSuffix: String? = nil
+    ) -> String {
+        let base = sessionName(agentSlug: agentSlug, workingDirectory: workingDirectory)
+        let safeSuffix = customSuffix.map { sanitizeSlug($0, maxLength: 16, fallback: "") } ?? ""
+        let candidate = safeSuffix.isEmpty ? base : "\(base)-\(safeSuffix)"
+        if !existingNames.contains(candidate) {
+            return candidate
+        }
+        var suffixNumber = 2
+        while true {
+            let numbered = "\(candidate)-\(suffixNumber)"
+            if !existingNames.contains(numbered) {
+                return numbered
+            }
+            suffixNumber += 1
+        }
+    }
+
     /// Expands a leading `~` / `~/` safely into `"$HOME"` while single-quoting literal path suffixes.
     public static func shellPathExpression(for path: String) -> String {
         let cleaned = stripControlNewlines(path)
@@ -250,11 +273,14 @@ public enum TMuxSessionHelper {
     /// Prepends common CLI tool directories to `PATH` if not already present, handles `~/` expansion
     /// safely, drops to `$SHELL` if the agent exits so diagnostics remain visible, and prints a clear
     /// fallback message before running directly if `tmux` is not installed on the host.
+    /// When `forceNewSession` is `true`, probes `tmux has-session` and increments `-2`, `-3`, ...
+    /// so a brand-new parallel session is always created without reattaching to an existing one.
     public static func launchOrAttachCommand(
         agent: AIAgentDescriptor,
         workingDirectory: String,
         extraArgs: String = "",
-        sessionName: String? = nil
+        sessionName: String? = nil,
+        forceNewSession: Bool = false
     ) -> String {
         let resolvedName: String = {
             if let sessionName {
@@ -295,7 +321,14 @@ public enum TMuxSessionHelper {
             "tmux is not installed on this host. Install tmux for persistent AI sessions - running directly in this shell."
         )
 
-        return "\(guardedPathExport); if command -v tmux >/dev/null 2>&1; then tmux new-session -A -s \(quotedSession) -c \(dirExpr) \(quotedInnerCmd); else printf '%s\\n' \(missingTmuxNotice); cd -- \(dirExpr) && sh -lc \(shellQuote(fallbackScript)); fi"
+        let tmuxStep: String
+        if forceNewSession {
+            tmuxStep = "_base=\(quotedSession); _target=\"$_base\"; _n=2; while tmux has-session -t \"=$_target\" 2>/dev/null; do _target=\"${_base}-${_n}\"; _n=$((_n + 1)); done; tmux new-session -s \"$_target\" -c \(dirExpr) \(quotedInnerCmd)"
+        } else {
+            tmuxStep = "tmux new-session -A -s \(quotedSession) -c \(dirExpr) \(quotedInnerCmd)"
+        }
+
+        return "\(guardedPathExport); if command -v tmux >/dev/null 2>&1; then \(tmuxStep); else printf '%s\\n' \(missingTmuxNotice); cd -- \(dirExpr) && sh -lc \(shellQuote(fallbackScript)); fi"
     }
 
     /// Builds a POSIX command to attach to an existing `tmux` session.

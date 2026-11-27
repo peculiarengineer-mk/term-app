@@ -22,6 +22,8 @@ struct LaunchAIAgentSheet: View {
     @State private var selectedAgentID: String = BuiltInAIAgent.claude.id
     @State private var workingDirectory: String = "~"
     @State private var extraArgs: String = ""
+    @State private var reattachExisting: Bool = false
+    @State private var sessionLabel: String = ""
     @State private var favorites: [String] = []
     @State private var recents: [String] = []
     @State private var showingFolderPicker = false
@@ -73,8 +75,60 @@ struct LaunchAIAgentSheet: View {
         favorites.contains(normalizedWorkingDirectory)
     }
 
-    private var computedSessionName: String {
-        TMuxSessionHelper.sessionName(agentSlug: selectedAgent.slug, workingDirectory: normalizedWorkingDirectory)
+    private var resolvedSessionName: String {
+        _ = sessionManager.cacheRevision
+        return Self.resolveSessionName(
+            agentSlug: selectedAgent.slug,
+            workingDirectory: normalizedWorkingDirectory,
+            existingNames: Self.knownSessionNames(
+                for: selectedHost?.id,
+                openSessions: sessionManager.sessions,
+                cacheDefaults: sessionManager.cacheDefaults
+            ),
+            customSuffix: sessionLabel,
+            reattachExisting: reattachExisting
+        )
+    }
+
+    static func knownSessionNames(
+        for hostID: UUID?,
+        openSessions: [LiveSession],
+        cacheDefaults: UserDefaults = .standard
+    ) -> Set<String> {
+        guard let hostID else { return [] }
+        var names = Set<String>()
+        for live in openSessions where live.hostID == hostID {
+            if let sessionName = live.aiAgentContext?.sessionName, !sessionName.isEmpty {
+                names.insert(sessionName)
+            }
+        }
+        for cached in AISessionCacheStore.load(defaults: cacheDefaults) where cached.hostID == hostID {
+            if !cached.sessionName.isEmpty {
+                names.insert(cached.sessionName)
+            }
+        }
+        return names
+    }
+
+    static func resolveSessionName(
+        agentSlug: String,
+        workingDirectory: String,
+        existingNames: Set<String>,
+        customSuffix: String?,
+        reattachExisting: Bool
+    ) -> String {
+        if reattachExisting {
+            return TMuxSessionHelper.sessionName(
+                agentSlug: agentSlug,
+                workingDirectory: workingDirectory
+            )
+        }
+        return TMuxSessionHelper.nextUniqueSessionName(
+            agentSlug: agentSlug,
+            workingDirectory: workingDirectory,
+            existingNames: existingNames,
+            customSuffix: customSuffix
+        )
     }
 
     private var isTmuxKnownMissing: Bool {
@@ -569,6 +623,33 @@ struct LaunchAIAgentSheet: View {
 
     private var optionsSection: some View {
         Section {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Session")
+                    .foregroundStyle(.secondary)
+
+                Picker("Session", selection: $reattachExisting) {
+                    Text("New Session").tag(false)
+                    Text("Reattach Existing").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: reattachExisting) { _, _ in
+                    AppHaptics.impact(.light)
+                }
+            }
+            .padding(.vertical, 2)
+
+            if !reattachExisting {
+                HStack(spacing: 10) {
+                    Text("Session Label")
+                        .foregroundStyle(.secondary)
+                    TextField("optional (e.g. bugfix, ui)", text: $sessionLabel)
+                        .font(.system(.subheadline, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+
             HStack(spacing: 10) {
                 Text("Extra Flags")
                     .foregroundStyle(.secondary)
@@ -583,7 +664,7 @@ struct LaunchAIAgentSheet: View {
                 Text("tmux Session")
                     .foregroundStyle(.secondary)
             } trailing: {
-                Text(computedSessionName)
+                Text(resolvedSessionName)
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 1)
@@ -592,12 +673,18 @@ struct LaunchAIAgentSheet: View {
         } header: {
             Text("Session Options")
         } footer: {
-            Text(
-                isTmuxKnownMissing
-                    ? "tmux is not installed, so this agent will run directly in your shell without background persistence."
-                    : "Relaunching in the same project directory reattaches to this persistent tmux session."
-            )
+            Text(optionsFooterText)
         }
+    }
+
+    private var optionsFooterText: String {
+        if isTmuxKnownMissing {
+            return "tmux is not installed, so this agent will run directly in your shell without background persistence."
+        }
+        if reattachExisting {
+            return "Reattaches to the existing persistent tmux session for this agent and directory, or starts it if none exists."
+        }
+        return "Starts a new persistent tmux session so you can run multiple agents in parallel."
     }
 
     private var launchButtonSection: some View {
@@ -851,7 +938,7 @@ struct LaunchAIAgentSheet: View {
 
         let dir = normalizedWorkingDirectory
         let agent = selectedAgent
-        let sessionName = computedSessionName
+        let sessionName = resolvedSessionName
         let trimmedExtra = extraArgs.trimmingCharacters(in: .whitespacesAndNewlines)
 
         HostProjectStore.recordRecent(dir, for: host.id)
@@ -861,7 +948,8 @@ struct LaunchAIAgentSheet: View {
             agent: agent,
             workingDirectory: dir,
             extraArgs: trimmedExtra,
-            sessionName: sessionName
+            sessionName: sessionName,
+            forceNewSession: !reattachExisting
         )
         let context = AIAgentLaunchContext(
             agent: agent,
